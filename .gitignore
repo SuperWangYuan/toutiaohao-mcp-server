@@ -1,0 +1,33 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+toutiaohao-mcp-server
+toutiaohao-server
+
+# Test binary
+*.test
+
+# Output & Logs
+*.out
+*.log
+*.png
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Cookie files
+cookies.json
+cookies_*.json
+
+# OS
+.DS_Store
+Thumbs.db

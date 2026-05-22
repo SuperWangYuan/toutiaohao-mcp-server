@@ -1,0 +1,209 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/example/toutiaohao-mcp-server/toutiaohao"
+)
+
+// handleLoginArgsValidation 校验登录参数，返回 nil 表示通过
+func handleLoginArgsValidation(args map[string]interface{}) *MCPToolResult {
+	username, _ := args["username"].(string)
+	password, _ := args["password"].(string)
+
+	if err := toutiaohao.ValidateLoginRequest(username, password); err != nil {
+		return NewErrorResult(err.Error())
+	}
+	return nil
+}
+
+// handleLogin 处理登录请求
+func (s *AppServer) handleLogin(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	if errResult := handleLoginArgsValidation(args); errResult != nil {
+		return errResult
+	}
+
+	username, _ := args["username"].(string)
+	password, _ := args["password"].(string)
+
+	result, err := s.toutiaoService.LoginWithCredentials(ctx, username, password)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleCheckLoginStatus 处理登录状态检查
+func (s *AppServer) handleCheckLoginStatus(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	result, err := s.toutiaoService.CheckLoginStatus(ctx)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleDeleteCookies 处理删除 Cookie
+func (s *AppServer) handleDeleteCookies(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	if err := s.toutiaoService.DeleteCookies(ctx); err != nil {
+		return NewErrorResult(err.Error())
+	}
+	return NewTextResult(`{"success": true, "message": "Cookies deleted"}`)
+}
+
+// handlePublishMicroPost 处理微头条发布
+func (s *AppServer) handlePublishMicroPost(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	content, _ := args["content"].(string)
+	topic, _ := args["topic"].(string)
+
+	var images []string
+	if imgs, ok := args["images"].([]string); ok {
+		images = imgs
+	}
+
+	if err := toutiaohao.ValidateMicroPost(content, images, topic); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	if err := s.toutiaoService.PublishMicroPost(ctx, content, images, topic); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	return NewTextResult(`{"success": true, "message": "Micro post published"}`)
+}
+
+// handleSaveMicroPostDraft 处理微头条草稿保存
+func (s *AppServer) handleSaveMicroPostDraft(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	content, _ := args["content"].(string)
+	topic, _ := args["topic"].(string)
+
+	var images []string
+	if imgs, ok := args["images"].([]string); ok {
+		images = imgs
+	}
+
+	if err := toutiaohao.ValidateMicroPost(content, images, topic); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	if err := s.toutiaoService.SaveMicroPostDraft(ctx, content, images, topic); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	return NewTextResult(`{"success": true, "message": "Draft saved"}`)
+}
+
+// handlePublishArticle 处理文章发布
+func (s *AppServer) handlePublishArticle(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	title, _ := args["title"].(string)
+	content, _ := args["content"].(string)
+
+	opts := &toutiaohao.ArticleOptions{}
+	if imgs, ok := args["images"].([]string); ok {
+		opts.Images = imgs
+	}
+	if tags, ok := args["tags"].([]string); ok {
+		opts.Tags = tags
+	}
+	if cat, ok := args["category"].(string); ok {
+		opts.Category = cat
+	}
+	if cover, ok := args["cover_image"].(string); ok {
+		opts.CoverImage = cover
+	}
+	if orig, ok := args["original"].(bool); ok {
+		opts.Original = orig
+	}
+	if fiction, ok := args["fiction"].(bool); ok {
+		opts.Fiction = fiction
+	}
+
+	if err := toutiaohao.ValidateArticle(title, content, opts); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	if err := s.toutiaoService.PublishArticle(ctx, title, content, opts); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	return NewTextResult(`{"success": true, "message": "Article published"}`)
+}
+
+// handleGetArticleList 处理文章列表查询
+func (s *AppServer) handleGetArticleList(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	params := toutiaohao.NewArticleListParams(args)
+	if err := toutiaohao.ValidateArticleListStatus(params.Status); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	result, err := s.toutiaoService.GetArticleList(ctx, params)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleDeleteArticle 处理文章删除
+func (s *AppServer) handleDeleteArticle(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	articleID, _ := args["article_id"].(string)
+	if err := toutiaohao.ValidateDeleteArticle(articleID); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	if err := s.toutiaoService.DeleteArticle(ctx, articleID); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	return NewTextResult(`{"success": true, "message": "Article deleted"}`)
+}
+
+// handleGetAccountOverview 处理账户概览
+func (s *AppServer) handleGetAccountOverview(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	result, err := s.toutiaoService.GetAccountOverview(ctx)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleGetArticleStats 处理文章统计
+func (s *AppServer) handleGetArticleStats(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	articleID, _ := args["article_id"].(string)
+	if err := toutiaohao.ValidateArticleStats(articleID); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	result, err := s.toutiaoService.GetArticleStats(ctx, articleID)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleGenerateReport 处理报告生成
+func (s *AppServer) handleGenerateReport(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	reportType, _ := args["report_type"].(string)
+	reportType = toutiaohao.NormalizeReportType(reportType)
+
+	if err := toutiaohao.ValidateReportType(reportType); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	result, err := s.toutiaoService.GenerateReport(ctx, reportType)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
