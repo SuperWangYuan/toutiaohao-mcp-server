@@ -86,16 +86,23 @@ func GetAccountOverview(ctx context.Context, page *rod.Page, cookieStore cookies
 		return nil, fmt.Errorf("等待页面加载失败: %w", err)
 	}
 
+	// 检查并处理登录状态 (包含扫码等待)
+	if err := EnsureLogin(page, cookieStore); err != nil {
+		return nil, err
+	}
+
+	// 再次导航到首页以确保处于已登录的状态渲染
+	if err := page.Navigate(configs.Homepage); err != nil {
+		return nil, fmt.Errorf("导航到首页失败: %w", err)
+	}
+	_ = page.Timeout(10 * time.Second).WaitLoad()
+
 	// 等待页面渲染完成
 	time.Sleep(3 * time.Second)
 
-	// 检查是否被重定向到登录页
 	info, err := page.Info()
 	if err != nil {
 		return nil, fmt.Errorf("获取页面信息失败: %w", err)
-	}
-	if strings.Contains(info.URL, "login") || strings.Contains(info.URL, "auth") {
-		return nil, fmt.Errorf("未登录或会话已过期，被重定向到登录页: %s", info.URL)
 	}
 	log.Infof("当前页面 URL: %s", info.URL)
 
@@ -370,11 +377,19 @@ func GenerateReport(ctx context.Context, reportType string, page *rod.Page, cook
 	}, nil
 }
 
+
 // injectBrowserCookies 将 cookieStore 中的 Cookie 注入到 rod 浏览器页面中
+// 如果没有可用 Cookie，会直接导航到目标页面（自动跳转到登录页供用户手动登录）
 func injectBrowserCookies(page *rod.Page, cookieStore cookies.Cookier) error {
 	data, err := cookieStore.LoadCookies()
 	if err != nil || data == nil {
-		return fmt.Errorf("no cookies available, please login first")
+		log.Warn("无可用 Cookie，直接导航到头条后台（将自动跳转到登录页）")
+		// 直接导航到目标域名，没登录会自动跳转登录页
+		if err := page.Navigate("https://mp.toutiao.com"); err != nil {
+			return fmt.Errorf("导航到头条域名失败: %w", err)
+		}
+		time.Sleep(2 * time.Second)
+		return nil
 	}
 
 	type cookieEntry struct {

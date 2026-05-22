@@ -80,7 +80,7 @@ func (a *LoginAction) Login(ctx context.Context, username, password string) (*Lo
 	}
 
 	// 保存 Cookie
-	if err := a.saveBrowserCookies(); err != nil {
+	if err := SaveBrowserCookies(a.page, a.cookieStore); err != nil {
 		log.Warnf("Failed to save cookies: %v", err)
 	}
 
@@ -137,9 +137,9 @@ func (a *LoginAction) waitForLoginSuccess(ctx context.Context) error {
 	return fmt.Errorf("login timeout after %v", timeout)
 }
 
-// saveBrowserCookies 从浏览器保存 Cookie
-func (a *LoginAction) saveBrowserCookies() error {
-	browserCookies, err := a.page.Cookies(nil)
+// SaveBrowserCookies 从当前浏览器页面保存 Cookie 到本地
+func SaveBrowserCookies(page *rod.Page, store cookies.Cookier) error {
+	browserCookies, err := page.Cookies(nil)
 	if err != nil {
 		return fmt.Errorf("failed to get cookies: %w", err)
 	}
@@ -172,7 +172,54 @@ func (a *LoginAction) saveBrowserCookies() error {
 		return fmt.Errorf("failed to marshal cookies: %w", err)
 	}
 
-	return a.cookieStore.SaveCookies(data)
+	return store.SaveCookies(data)
+}
+
+// EnsureLogin 确保当前页面处于已登录状态。
+// 如果发现未登录或会话已过期跳转到登录页，它将通过日志提醒用户，并等待用户手动在弹出的浏览器上扫码登录。
+// 只要用户在 5 分钟超时时间内扫码登录成功，它将自动捕获新 Cookie 并保存，之后继续之前的操作。
+func EnsureLogin(page *rod.Page, cookieStore cookies.Cookier) error {
+	info, err := page.Info()
+	if err != nil {
+		return fmt.Errorf("failed to get page info: %w", err)
+	}
+
+	if strings.Contains(info.URL, "login") || strings.Contains(info.URL, "auth") {
+		log.Warn("=================================================================")
+		log.Warn("【安全提示】检测到当前未登录或会话已失效！")
+		log.Warn("请在弹出的 Chrome 浏览器窗口中，及时使用手机完成扫码登录...")
+		log.Warn("=================================================================")
+
+		timeout := 300 * time.Second
+		interval := 1 * time.Second
+		deadline := time.Now().Add(timeout)
+
+		for time.Now().Before(deadline) {
+			currentInfo, err := page.Info()
+			if err == nil {
+				// 头条号的首页或发布页一般是 mp.toutiao.com/profile 或是 mp.toutiao.com/profile_v4/xxx
+				if IsLoginSuccessURL(currentInfo.URL) || 
+				   (!strings.Contains(currentInfo.URL, "login") && !strings.Contains(currentInfo.URL, "auth") && strings.Contains(currentInfo.URL, "mp.toutiao.com")) {
+					log.Info("检测到扫码登录成功！")
+					
+					// 延迟一秒等待 Cookie 完全写入浏览器内存
+					time.Sleep(1 * time.Second)
+					
+					// 自动回写 Cookie 到本地
+					if err := SaveBrowserCookies(page, cookieStore); err != nil {
+						log.Warnf("自动保存新 Cookie 失败: %v", err)
+					} else {
+						log.Info("新 Cookie 已成功保存，继续执行原自动化操作。")
+					}
+					return nil
+				}
+			}
+			time.Sleep(interval)
+		}
+		return fmt.Errorf("扫码登录超时（已等待 5 分钟），请重新运行并及时扫码")
+	}
+
+	return nil
 }
 
 // CheckLoginStatus 检查登录状态（通过 HTTP 请求）

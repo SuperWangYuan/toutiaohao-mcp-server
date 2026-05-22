@@ -65,11 +65,17 @@ func (a *MicroPostAction) Publish(ctx context.Context, content string, images []
 	}
 	time.Sleep(2 * time.Second)
 
-	// 检查是否被重定向到登录页
-	info, _ := a.page.Info()
-	if info != nil && (strings.Contains(info.URL, "login") || strings.Contains(info.URL, "auth")) {
-		return fmt.Errorf("not logged in, redirected to: %s", info.URL)
+	// 检查并处理登录状态 (包含扫码等待)
+	if err := EnsureLogin(a.page, a.cookieStore); err != nil {
+		return err
 	}
+
+	// 重新导航到微头条发布页以确保页面处于已登录下的正确渲染
+	if err := a.page.Navigate(configs.PublishMicro); err != nil {
+		return fmt.Errorf("failed to navigate: %w", err)
+	}
+	_ = a.page.Timeout(15 * time.Second).WaitLoad()
+	time.Sleep(2 * time.Second)
 
 	// 查找编辑器并输入内容
 	if err := a.inputContent(fullContent); err != nil {

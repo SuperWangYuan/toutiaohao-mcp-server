@@ -70,11 +70,17 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 	}
 	time.Sleep(3 * time.Second)
 
-	// 检查登录状态
-	info, _ := a.page.Info()
-	if info != nil && (strings.Contains(info.URL, "login") || strings.Contains(info.URL, "auth")) {
-		return fmt.Errorf("not logged in, redirected to: %s", info.URL)
+	// 检查并处理登录状态 (包含扫码等待)
+	if err := EnsureLogin(a.page, a.cookieStore); err != nil {
+		return err
 	}
+
+	// 重新导航到发布页以确保页面处于已登录下的正确渲染
+	if err := a.page.Navigate(configs.PublishArticle); err != nil {
+		return fmt.Errorf("failed to navigate: %w", err)
+	}
+	_ = a.page.Timeout(15 * time.Second).WaitLoad()
+	time.Sleep(3 * time.Second)
 
 	// 输入标题
 	if err := a.inputTitle(title); err != nil {

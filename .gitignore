@@ -5,6 +5,7 @@
 *.so
 *.dylib
 toutiaohao-mcp-server
+toutiao-mcp-server
 toutiaohao-server
 
 # Test binary

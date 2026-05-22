@@ -1,10 +1,8 @@
 package toutiaohao
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -33,11 +31,6 @@ func TestPublishArticleManual(t *testing.T) {
 	// 设置环境变量以便内部 browser 加载根目录下的 cookies.json
 	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
 
-	// 这个测试需要本地有有效的 cookies.json 并且处于联网状态
-	if _, err := os.Stat("../cookies.json"); os.IsNotExist(err) {
-		t.Skip("跳过集成测试：未找到 cookies.json")
-	}
-
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 	log.Info("开始图文插图集成测试...")
 
@@ -62,73 +55,20 @@ func TestPublishArticleManual(t *testing.T) {
 	}
 	time.Sleep(3 * time.Second)
 
-	// 检查是否被重定向到登录页
-	info, _ := page.Info()
-	if info != nil && (strings.Contains(info.URL, "login") || strings.Contains(info.URL, "auth")) {
-		log.Warn("检测到当前未登录或 Cookie 已失效！")
-		log.Warn("==================================================================")
-		log.Warn("请在弹出的 Chrome 浏览器窗口中手动完成扫码登录或账号密码登录。")
-		log.Warn("脚本将自动监测登录状态，登录成功后会自动保存 Cookie 并继续执行。")
-		log.Warn("==================================================================")
-
-		// 轮询等待登录成功
-		loginTimeout := 300 * time.Second
-		deadline := time.Now().Add(loginTimeout)
-		loggedIn := false
-		for time.Now().Before(deadline) {
-			currentInfo, err := page.Info()
-			if err == nil && IsLoginSuccessURL(currentInfo.URL) {
-				log.Info("检测到登录成功！")
-				loggedIn = true
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-
-		if !loggedIn {
-			t.Fatalf("等待手动登录超时（5分钟），测试失败。")
-		}
-
-		// 登录成功，保存最新的 Cookie
-		log.Info("正在保存最新的 Cookie 到 cookies.json...")
-		browserCookies, err := page.Cookies(nil)
-		if err != nil {
-			t.Fatalf("获取浏览器 Cookie 失败: %v", err)
-		}
-
-		var entries []map[string]interface{}
-		for _, c := range browserCookies {
-			entry := map[string]interface{}{
-				"name":     c.Name,
-				"value":    c.Value,
-				"domain":   c.Domain,
-				"path":     c.Path,
-				"expires":  int64(c.Expires),
-				"httpOnly": c.HTTPOnly,
-				"secure":   c.Secure,
-			}
-			entries = append(entries, entry)
-		}
-
-		// 序列化
-		importJSON, err := json.Marshal(entries)
-		if err != nil {
-			t.Fatalf("序列化 Cookie 失败: %v", err)
-		}
-		if err := store.SaveCookies(importJSON); err != nil {
-			t.Fatalf("保存 Cookie 失败: %v", err)
-		}
-		log.Info("Cookie 保存成功，正在重新导航回发文页面...")
-
-		// 再次导航回发文页面
-		if err := page.Navigate("https://mp.toutiao.com/profile_v4/graphic/publish"); err != nil {
-			t.Fatalf("重新导航失败: %v", err)
-		}
-		if err := page.WaitLoad(); err != nil {
-			t.Fatalf("重新导航等待加载失败: %v", err)
-		}
-		time.Sleep(3 * time.Second)
+	// 检查并处理登录状态 (包含扫码等待)
+	if err := EnsureLogin(page, store); err != nil {
+		t.Fatalf("登录校验/扫码失败: %v", err)
 	}
+
+	// 重新导航回发文页面以确保正确渲染
+	log.Info("重新导航至发文页面...")
+	if err := page.Navigate("https://mp.toutiao.com/profile_v4/graphic/publish"); err != nil {
+		t.Fatalf("重新导航失败: %v", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		t.Fatalf("重新导航等待加载失败: %v", err)
+	}
+	time.Sleep(3 * time.Second)
 
 	// 输入标题
 	log.Info("正在输入测试标题...")
