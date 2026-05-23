@@ -33,10 +33,16 @@ type ArticleListResponse struct {
 
 // ArticleItem 文章条目
 type ArticleItem struct {
-	ArticleID  string `json:"article_id"`
-	Title      string `json:"title"`
-	Status     string `json:"status"`
-	CreateTime string `json:"create_time"`
+	ArticleID     string      `json:"article_id"`
+	ID            string      `json:"id"`
+	Title         string      `json:"title"`
+	Status        interface{} `json:"status"`
+	CreateTime    interface{} `json:"create_time"`
+	ReadCount     int         `json:"go_detail_count_v2"`
+	CommentCount  int         `json:"comment_count"`
+	DiggCount     int         `json:"digg_count"`
+	ImpressionCount int       `json:"impression_count"`
+	ArticleURL    string      `json:"article_url"`
 }
 
 // NewArticleListParams 创建文章列表参数（含默认值）
@@ -105,6 +111,13 @@ func GetArticleList(ctx context.Context, params *ArticleListParams, cookieStore 
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	// 设置 article_id（优先用 id 字段，回退到 pgc_id）
+	for i := range resp.Data.Articles {
+		if resp.Data.Articles[i].ID != "" {
+			resp.Data.Articles[i].ArticleID = resp.Data.Articles[i].ID
+		}
 	}
 
 	return &ArticleListResponse{

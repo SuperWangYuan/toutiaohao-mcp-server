@@ -313,16 +313,54 @@ func GetAccountOverview(ctx context.Context, page *rod.Page, cookieStore cookies
 	}, nil
 }
 
-// GetArticleStats 获取文章统计（仍然使用 HTTP API 方式）
+// GetArticleStats 获取文章统计（优先通过文章列表获取，避免废弃 API 的 404 报错）
 func GetArticleStats(ctx context.Context, articleID string, cookieStore cookies.Cookier) (*ArticleStats, error) {
 	if err := ValidateArticleStats(articleID); err != nil {
 		return nil, err
 	}
 
+	log.Infof("正在通过获取文章列表匹配 article_id = %s 的统计数据...", articleID)
+
+	// 最多查询 2 页列表，每页 50 篇（覆盖最近 100 篇文章）
+	for page := 1; page <= 2; page++ {
+		params := &ArticleListParams{
+			Page:     page,
+			PageSize: 50,
+			Status:   "all",
+		}
+		listResp, err := GetArticleList(ctx, params, cookieStore)
+		if err != nil {
+			log.Warnf("通过文章列表获取统计时发生错误（第 %d 页）: %v", page, err)
+			break
+		}
+		if listResp == nil || len(listResp.Articles) == 0 {
+			break
+		}
+
+		for _, item := range listResp.Articles {
+			if item.ArticleID == articleID {
+				log.Infof("在文章列表中成功匹配到 article_id = %s", articleID)
+				return &ArticleStats{
+					ArticleID:    item.ArticleID,
+					ReadCount:    item.ReadCount,
+					LikeCount:    item.DiggCount,
+					CommentCount: item.CommentCount,
+					ShareCount:   0, // 列表不返回具体的 share_count，默认赋 0
+				}, nil
+			}
+		}
+
+		if len(listResp.Articles) < 50 {
+			break // 无更多文章
+		}
+	}
+
+	// 退路：如果没在近 100 篇文章中匹配到，则尝试原先的 API 接口
+	log.Warnf("在最近的列表中未找到匹配的 article_id = %s，尝试原 API 请求...", articleID)
 	url := fmt.Sprintf("%s?article_id=%s", configs.ArticleStatsAPI, articleID)
 	body, err := doAuthenticatedGet(ctx, url, cookieStore)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch article stats (and not found in latest article list): %w", err)
 	}
 
 	var resp struct {
@@ -334,7 +372,7 @@ func GetArticleStats(ctx context.Context, articleID string, cookieStore cookies.
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("failed to parse stats response: %w", err)
 	}
 
 	return &ArticleStats{
