@@ -139,42 +139,101 @@ func (a *MicroPostAction) uploadImages(images []string) error {
 		cleanups = append(cleanups, cleanup)
 	}
 
-	// 2. 先尝试直接找到 file input
-	fileInput, err := a.page.Timeout(2 * time.Second).Element(`input[type='file']`)
-	if err == nil && fileInput != nil {
-		fileInput = fileInput.CancelTimeout()
-		for _, img := range localImages {
-			if err := fileInput.SetFiles([]string{img}); err != nil {
-				log.Warnf("上传图片失败 (%s): %v", img, err)
-			}
-			time.Sleep(3 * time.Second)
-		}
-		return nil
-	}
-
-	// 3. 找不到 file input，尝试点击上传按钮
+	// 2. 物理点击“图片”按钮以激活微头条图片上传弹窗
 	btnEl, sel, err := findElement(a.page, 3*time.Second, uploadButtonSelectors)
 	if err != nil {
-		return fmt.Errorf("no upload element found: %w", err)
+		return fmt.Errorf("未找到图片上传按钮: %w", err)
 	}
 	log.Infof("Found upload button using selector: %s", sel)
 	// 使用 JS 点击以防止 physical Click 导致的协程挂起阻塞
 	_, _ = btnEl.Eval(`() => this.click()`)
 	time.Sleep(2 * time.Second)
 
-	// 点击按钮后再找 file input
-	fileInput, err = a.page.Timeout(3 * time.Second).Element(`input[type='file']`)
-	if err != nil || fileInput == nil {
-		return fmt.Errorf("file input not found after clicking upload button")
+	// 3. 寻找上传弹窗中激活的 file input（优先在按钮祖先节点范围内寻找，防范误抓全局其它隐藏的 file input）
+	var fileInput *rod.Element
+	curr := btnEl
+	for k := 0; k < 5; k++ {
+		parent, err := curr.Parent()
+		if err != nil || parent == nil {
+			break
+		}
+		curr = parent
+		el, err := curr.Element(`input[type='file']`)
+		if err == nil && el != nil {
+			fileInput = el
+			log.Infof("在上传按钮向上第 %d 层的祖先节点中匹配到了微头条专用的 file input", k+1)
+			break
+		}
+	}
+
+	// 兜底：若局部未找到，再全局查找
+	if fileInput == nil {
+		log.Warn("在上传按钮局部区域内未找到 file input，尝试全局寻找...")
+		el, err := a.page.Timeout(3 * time.Second).Element(`input[type='file']`)
+		if err == nil && el != nil {
+			fileInput = el
+		}
+	}
+
+	if fileInput == nil {
+		return fmt.Errorf("点击上传按钮后未找到 file input 控件")
 	}
 	fileInput = fileInput.CancelTimeout()
 
-	for _, img := range localImages {
-		if err := fileInput.SetFiles([]string{img}); err != nil {
-			log.Warnf("上传图片失败 (%s): %v", img, err)
-		}
-		time.Sleep(3 * time.Second)
+	// 4. 一次性上传所有图片（防止多次 SetFiles 产生文件覆盖）
+	log.Infof("正在向 file input 设置全部 %d 张图片...", len(localImages))
+	if err := fileInput.SetFiles(localImages); err != nil {
+		return fmt.Errorf("fileInput.SetFiles 失败: %w", err)
 	}
+
+	// 5. 等待图片上传在弹窗中渲染完成
+	log.Info("等待图片上传并生成缩略图...")
+	time.Sleep(5 * time.Second)
+
+	// 6. 点击弹窗右下角的“确定”按钮以完成插入，循环检测直到弹窗成功关闭
+	log.Info("正在循环寻找并点击图片弹窗的“确定”按钮...")
+	confirmed := false
+	for k := 0; k < 10; k++ {
+		res, errEval := a.page.Eval(`() => {
+			// 精确寻找可见的“确定”或“确认”按钮
+			let elements = Array.from(document.querySelectorAll('button, span, div, a'));
+			let btn = elements.find(el => {
+				let text = el.textContent ? el.textContent.trim() : '';
+				let isBtnLike = el.tagName === 'BUTTON' || 
+				                el.classList.contains('byte-btn') || 
+				                el.classList.contains('semi-button') || 
+				                el.getAttribute('role') === 'button';
+				// 按钮必须可见，且文本为确切的“确定”或“确认”
+				return (text === '确定' || text === '确认') && isBtnLike && el.offsetWidth > 0;
+			});
+			if (btn) {
+				btn.click();
+				return true; // 找到并触发点击
+			}
+			return false; // 未找到，可能弹窗已关闭
+		}`)
+
+		if errEval != nil {
+			log.Warnf("在图片弹窗中检测/点击确定按钮时发生 JS 错误: %v", errEval)
+		} else if res != nil {
+			if !res.Value.Bool() {
+				// 返回 false 代表页面已无可见的“确定”按钮，弹窗已成功关闭
+				log.Info("页面已无可见的图片确定按钮，确定弹窗成功关闭")
+				confirmed = true
+				break
+			} else {
+				log.Infof("已定位到确定按钮并触发点击 (尝试次数: %d/10)...", k+1)
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	if !confirmed {
+		return fmt.Errorf("未能成功确认并关闭图片上传弹窗（确定按钮在 10 秒内未消失，可能是上传卡死或按钮无效）")
+	}
+
+	log.Info("图片已成功确认并插入微头条编辑框")
+	time.Sleep(2 * time.Second)
 	return nil
 }
 
