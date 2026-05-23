@@ -120,33 +120,59 @@ func (a *MicroPostAction) uploadImages(images []string) error {
 		`//span[contains(text(), '图片')]/ancestor::button`,
 	}
 
-	// 先尝试直接找到 file input
+	// 1. 处理图片路径（将本地相对路径规范为绝对路径，或自动下载 HTTP/HTTPS 网络图片）
+	var localImages []string
+	var cleanups []func()
+	defer func() {
+		// 在全部上传动作完成后统一释放/清理临时下载的图片文件
+		for _, cleanup := range cleanups {
+			cleanup()
+		}
+	}()
+
+	for _, img := range images {
+		localPath, cleanup, err := downloadImageToTemp(img)
+		if err != nil {
+			return fmt.Errorf("准备图片失败 (%s): %w", img, err)
+		}
+		localImages = append(localImages, localPath)
+		cleanups = append(cleanups, cleanup)
+	}
+
+	// 2. 先尝试直接找到 file input
 	fileInput, err := a.page.Timeout(2 * time.Second).Element(`input[type='file']`)
 	if err == nil && fileInput != nil {
-		for _, img := range images {
-			_ = fileInput.SetFiles([]string{img})
+		fileInput = fileInput.CancelTimeout()
+		for _, img := range localImages {
+			if err := fileInput.SetFiles([]string{img}); err != nil {
+				log.Warnf("上传图片失败 (%s): %v", img, err)
+			}
 			time.Sleep(3 * time.Second)
 		}
 		return nil
 	}
 
-	// 找不到 file input，尝试点击上传按钮
+	// 3. 找不到 file input，尝试点击上传按钮
 	btnEl, sel, err := findElement(a.page, 3*time.Second, uploadButtonSelectors)
 	if err != nil {
 		return fmt.Errorf("no upload element found: %w", err)
 	}
 	log.Infof("Found upload button using selector: %s", sel)
-	_ = btnEl.Click(proto.InputMouseButtonLeft, 1)
-	time.Sleep(1 * time.Second)
+	// 使用 JS 点击以防止 physical Click 导致的协程挂起阻塞
+	_, _ = btnEl.Eval(`() => this.click()`)
+	time.Sleep(2 * time.Second)
 
 	// 点击按钮后再找 file input
 	fileInput, err = a.page.Timeout(3 * time.Second).Element(`input[type='file']`)
 	if err != nil || fileInput == nil {
 		return fmt.Errorf("file input not found after clicking upload button")
 	}
+	fileInput = fileInput.CancelTimeout()
 
-	for _, img := range images {
-		_ = fileInput.SetFiles([]string{img})
+	for _, img := range localImages {
+		if err := fileInput.SetFiles([]string{img}); err != nil {
+			log.Warnf("上传图片失败 (%s): %v", img, err)
+		}
 		time.Sleep(3 * time.Second)
 	}
 	return nil

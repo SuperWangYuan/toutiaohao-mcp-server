@@ -3,7 +3,6 @@ package toutiaohao
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -515,11 +514,11 @@ func (a *ArticlePublishAction) focusEditorEnd(el *rod.Element) {
 
 // insertImageAtCursor 在编辑器当前光标处插入图片，模拟点击工具栏并上传
 func (a *ArticlePublishAction) insertImageAtCursor(imagePath string) error {
-	absPath, errAbs := filepath.Abs(imagePath)
-	if errAbs != nil {
-		log.Warnf("获取图片绝对路径失败: %v，将使用原路径 %s", errAbs, imagePath)
-		absPath = imagePath
+	absPath, cleanup, err := downloadImageToTemp(imagePath)
+	if err != nil {
+		return fmt.Errorf("准备图片文件失败 (%s): %w", imagePath, err)
 	}
+	defer cleanup()
 	log.Infof("开始在编辑器中插入图片: %s (绝对路径: %s)", imagePath, absPath)
 
 	// 1. 隐藏可能造成遮挡的页面元素
@@ -582,6 +581,7 @@ func (a *ArticlePublishAction) insertImageAtCursor(imagePath string) error {
 	if err != nil {
 		return fmt.Errorf("未找到图片上传的文件输入控件(file input): %w", err)
 	}
+	fileInput = fileInput.CancelTimeout()
 
 	if err := fileInput.SetFiles([]string{absPath}); err != nil {
 		return fmt.Errorf("文件输入控件设置路径失败: %w", err)
@@ -747,6 +747,13 @@ func (a *ArticlePublishAction) dismissObstacles() {
 
 func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover bool) error {
 	log.Infof("Uploading %d cover images...", len(coverPaths))
+	var cleanups []func()
+	defer func() {
+		for _, cleanup := range cleanups {
+			cleanup()
+		}
+	}()
+
 	for i, path := range coverPaths {
 		// 如果是自适应封面，且该位置的封面槽已自动填入了图片，则跳过上传
 		if isAutoCover {
@@ -757,7 +764,13 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			}
 		}
 
-		log.Infof("Uploading cover %d: %s", i+1, path)
+		localPath, cleanup, err := downloadImageToTemp(path)
+		if err != nil {
+			return fmt.Errorf("准备封面图片失败 (%s): %w", path, err)
+		}
+		cleanups = append(cleanups, cleanup)
+
+		log.Infof("Uploading cover %d: %s (本地路径: %s)", i+1, path, localPath)
 		
 		// 隐藏可能造成遮挡的页面元素
 		a.dismissObstacles()
@@ -859,8 +872,9 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 		if err != nil {
 			return fmt.Errorf("file input not found for image %d: %w", i+1, err)
 		}
+		fileInput = fileInput.CancelTimeout()
 		
-		if err := fileInput.SetFiles([]string{path}); err != nil {
+		if err := fileInput.SetFiles([]string{localPath}); err != nil {
 			return fmt.Errorf("failed to set file path for image %d: %w", i+1, err)
 		}
 		

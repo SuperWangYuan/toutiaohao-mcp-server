@@ -1,13 +1,97 @@
 package toutiaohao
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
 	log "github.com/sirupsen/logrus"
 )
+
+// downloadImageToTemp 将图片（本地路径或 HTTP 网络 URL）规范化。
+// 如果是网络图片，下载到本地临时文件；如果是本地相对路径，转换为绝对路径。
+// 返回本地绝对路径、清理函数（在上传结束后调用）以及可能发生的错误。
+func downloadImageToTemp(imgURL string) (string, func(), error) {
+	// 1. 如果是本地路径，转换为绝对路径
+	if !strings.HasPrefix(imgURL, "http://") && !strings.HasPrefix(imgURL, "https://") {
+		absPath, err := filepath.Abs(imgURL)
+		if err != nil {
+			log.Warnf("获取本地图片绝对路径失败: %s, err: %v", imgURL, err)
+			return imgURL, func() {}, nil
+		}
+		// 校验文件是否存在
+		if _, err := os.Stat(absPath); os.IsNotExist(err) {
+			return "", func() {}, fmt.Errorf("本地图片不存在: %s (绝对路径: %s)", imgURL, absPath)
+		}
+		return absPath, func() {}, nil
+	}
+
+	// 2. 如果是网络图片，发起 HTTP 下载
+	log.Infof("检测到网络图片 URL，正在下载到临时目录: %s", imgURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", imgURL, nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("创建下载请求失败: %w", err)
+	}
+
+	// 模拟浏览器头部以防止某些图床防盗链拒绝下载
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("下载网络图片失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("下载图片失败，HTTP 状态码: %d", resp.StatusCode)
+	}
+
+	// 识别图片文件类型后缀
+	ext := ".jpg"
+	lowerURL := strings.ToLower(imgURL)
+	if strings.Contains(lowerURL, ".png") {
+		ext = ".png"
+	} else if strings.Contains(lowerURL, ".gif") {
+		ext = ".gif"
+	} else if strings.Contains(lowerURL, ".webp") {
+		ext = ".webp"
+	} else if strings.Contains(lowerURL, ".jpeg") {
+		ext = ".jpeg"
+	}
+
+	// 创建临时文件
+	tempFile, err := os.CreateTemp("", "toutiaohao-download-img-*"+ext)
+	if err != nil {
+		return "", nil, fmt.Errorf("创建临时图片文件失败: %w", err)
+	}
+	defer tempFile.Close()
+
+	_, err = io.Copy(tempFile, resp.Body)
+	if err != nil {
+		_ = os.Remove(tempFile.Name())
+		return "", nil, fmt.Errorf("保存临时图片数据失败: %w", err)
+	}
+
+	tempPath := tempFile.Name()
+	log.Infof("网络图片成功下载至本地临时路径: %s", tempPath)
+
+	cleanup := func() {
+		_ = os.Remove(tempPath)
+		log.Infof("已清理网络图片临时文件: %s", tempPath)
+	}
+
+	return tempPath, cleanup, nil
+}
 
 func findElement(page *rod.Page, timeout time.Duration, selectors []string) (*rod.Element, string, error) {
 	var lastErr error

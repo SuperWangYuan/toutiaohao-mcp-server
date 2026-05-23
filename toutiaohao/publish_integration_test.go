@@ -129,3 +129,86 @@ func TestPublishArticleManual(t *testing.T) {
 	_ = page.MustScreenshot("../scratch_save_draft_result.png")
 	log.Info("测试完成")
 }
+
+func TestPublishMicroManual(t *testing.T) {
+	// 动态创建测试插图目录与 dummy 临时图片文件
+	testdataDir := "./testdata_micro"
+	testImagePath := filepath.Join(testdataDir, "test_micro_image.png")
+	if err := os.MkdirAll(testdataDir, 0755); err != nil {
+		t.Fatalf("创建临时测试目录失败: %v", err)
+	}
+	// 写入伪 PNG 数据
+	dummyPNG := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82")
+	if err := os.WriteFile(testImagePath, dummyPNG, 0644); err != nil {
+		t.Fatalf("创建临时测试图片失败: %v", err)
+	}
+	// 提供一个网络图片 URL
+	webImageURL := "https://www.baidu.com/img/flexible/logo/pc/index.png"
+
+	defer func() {
+		_ = os.RemoveAll(testdataDir)
+	}()
+
+	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
+
+	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+	log.Info("开始微头条配图集成测试...")
+
+	cookiePath := "../cookies.json"
+	store := cookies.NewFileCookieStore(cookiePath)
+
+	b := browser.NewBrowser(false)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	a := NewMicroPostAction(page, store)
+
+	log.Info("正在导航到微头条发布页面...")
+	if err := page.Navigate("https://mp.toutiao.com/profile_v4/weitoutiao/publish?from=toutiao_pc"); err != nil {
+		t.Fatalf("导航失败: %v", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		t.Fatalf("等待加载失败: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	// 检查并处理登录状态 (包含扫码等待)
+	if err := EnsureLogin(page, store); err != nil {
+		t.Fatalf("登录校验/扫码失败: %v", err)
+	}
+
+	// 重新导航回微头条页面确保处于登录后的正常状态
+	log.Info("重新导航至微头条页面...")
+	if err := page.Navigate("https://mp.toutiao.com/profile_v4/weitoutiao/publish?from=toutiao_pc"); err != nil {
+		t.Fatalf("重新导航失败: %v", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		t.Fatalf("重新导航等待加载失败: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	// 输入正文
+	log.Info("正在输入测试正文...")
+	content := "这是一条微头条配图测试内容。包含一张本地动态生成的图片和一张从网络下载的百度 Logo 图片，旨在全面验证本地与网络图片在微头条发布流下的上传功能。"
+	if err := a.inputContent(content); err != nil {
+		t.Fatalf("输入正文失败: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	// 上传图片（包含本地路径和 HTTP URL）
+	log.Info("正在上传配图（本地与网络）...")
+	images := []string{testImagePath, webImageURL}
+	if err := a.uploadImages(images); err != nil {
+		t.Fatalf("上传配图失败: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	// 截图保存以供人工检查
+	screenshotPath := "../scratch_micro_publish_result.png"
+	_ = page.MustScreenshot(screenshotPath)
+	log.Infof("已保存微头条测试截图至: %s", screenshotPath)
+
+	log.Info("微头条配图发布测试完成")
+}
