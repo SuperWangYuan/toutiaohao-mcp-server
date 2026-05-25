@@ -2,7 +2,7 @@ package configs
 
 // 内容限制
 const (
-	MaxTitleLength      = 100
+	MaxTitleLength      = 30
 	MaxContentLength    = 50000
 	MaxWeitoutiaoLength = 2000
 	MaxImagesPerPost    = 9

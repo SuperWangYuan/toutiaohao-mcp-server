@@ -21,8 +21,8 @@ func TestConfigURLsNotEmpty(t *testing.T) {
 }
 
 func TestContentLimits(t *testing.T) {
-	if MaxTitleLength != 100 {
-		t.Errorf("MaxTitleLength = %d, want 100", MaxTitleLength)
+	if MaxTitleLength != 30 {
+		t.Errorf("MaxTitleLength = %d, want 30", MaxTitleLength)
 	}
 	if MaxWeitoutiaoLength != 2000 {
 		t.Errorf("MaxWeitoutiaoLength = %d, want 2000", MaxWeitoutiaoLength)

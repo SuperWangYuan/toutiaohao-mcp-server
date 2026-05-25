@@ -183,6 +183,14 @@ func (a *ArticlePublishAction) inputTitle(title string) error {
 		return fmt.Errorf("title input not found: %w", err)
 	}
 	log.Infof("Found title input using selector: %s", sel)
+
+	// 如果标题超出了头条 30 字的限制，自动进行截断以防止被前端表单验证拦截导致发布按钮锁死
+	if utf8.RuneCountInString(title) > 30 {
+		runes := []rune(title)
+		title = string(runes[:30])
+		log.Warnf("【标题限制】文章标题超出了今日头条 30 字上限，已自动截断为: %s", title)
+	}
+
 	return inputTextWithFallback(el, title)
 }
 
@@ -1245,7 +1253,11 @@ func (a *ArticlePublishAction) setOriginal() {
 	res, err := a.page.Timeout(5 * time.Second).Eval(`() => {` + SafeScrollJS + `
 		let target = document.querySelector('.pgc-declare-original-checkbox') ||
 		             document.querySelector('input[name="original"]') ||
-		             Array.from(document.querySelectorAll('span')).find(el => el.textContent && el.textContent.trim() === '原创');
+		             document.querySelector('input[value="original"]') ||
+		             Array.from(document.querySelectorAll('span, label, p')).find(el => {
+		                 let text = el.textContent ? el.textContent.trim() : '';
+		                 return (text === '声明原创' || text === '原创') && el.children.length === 0;
+		             });
 		if (target) {
 			let label = target.closest('label') || target;
 			scrollIntoViewSafe(label);
@@ -1374,6 +1386,16 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	var clickedConfirm bool
 	var lastJSResult string
 	for i := 0; i < 20; i++ {
+		// 优先检测是否已经成功跳转，如果已经跳转，直接代表发布完成！
+		info, errInfo := a.page.Info()
+		if errInfo == nil && info != nil {
+			if !strings.Contains(info.URL, "/graphic/publish") {
+				log.Infof("检测到页面已完成跳转（当前 URL: %s），直接判定发布成功，跳过二次确认", info.URL)
+				clickedConfirm = true
+				break
+			}
+		}
+
 		res, err := a.page.Eval(`() => {
 			// 查找所有可见按钮
 			let buttons = Array.from(document.querySelectorAll('button'));

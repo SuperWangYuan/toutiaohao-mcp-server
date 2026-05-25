@@ -61,6 +61,9 @@ var ArticleCoverUploadSelectors = []string{
 	`button[class*='upload']`,
 	`//button[contains(., '上传')]`,
 	`//div[contains(., '上传') and contains(@class, 'upload')]`,
+	`//div[contains(text(), '替换')]`,
+	`//span[contains(text(), '替换')]`,
+	`//span[contains(text(), '编辑')]`,
 }
 
 var ArticlePublishButtonSelectors = []string{
