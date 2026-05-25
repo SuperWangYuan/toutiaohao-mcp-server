@@ -64,6 +64,8 @@ var ArticleCoverUploadSelectors = []string{
 }
 
 var ArticlePublishButtonSelectors = []string{
+	`//button[contains(., '预览并发布')]`,
+	`button[class*='publish-btn-last']`,
 	ArticlePublishButton,
 	`button[class*='publish']`,
 	`//button[normalize-space()='发布']`,

@@ -43,7 +43,7 @@ func (s *ToutiaoService) DeleteCookies(ctx context.Context) error {
 }
 
 // PublishMicroPost 发布微头条
-func (s *ToutiaoService) PublishMicroPost(ctx context.Context, content string, images []string, topic string) error {
+func (s *ToutiaoService) PublishMicroPost(ctx context.Context, content string, images []string, topic string, publishTime interface{}) error {
 	if err := toutiaohao.ValidateMicroPost(content, images, topic); err != nil {
 		return err
 	}
@@ -55,7 +55,7 @@ func (s *ToutiaoService) PublishMicroPost(ctx context.Context, content string, i
 	defer page.Close()
 
 	action := toutiaohao.NewMicroPostAction(page, s.cookieStore)
-	return action.Publish(ctx, content, images, topic)
+	return action.Publish(ctx, content, images, topic, publishTime)
 }
 
 // SaveMicroPostDraft 保存微头条草稿

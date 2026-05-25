@@ -38,14 +38,15 @@ type DeleteCookiesArgs struct{}
 
 // PublishArticleArgs 文章发布参数
 type PublishArticleArgs struct {
-	Title      string   `json:"title" jsonschema_description:"文章标题（最多100字）"`
-	Content    string   `json:"content" jsonschema_description:"文章正文内容。支持：1. 纯文本内容。2. 包含插图的内容：使用 Markdown 格式的图片标签 '![图片描述](本地绝对路径)' 插入本地图片。系统会自动提取图片，按顺序逐个上传并在对应的段落位置插入。例如：'第一段内容。\\n\\n![插图](/path/to/img.png)\\n\\n第二段内容。'"`
-	Images     []string `json:"images,omitempty" jsonschema_description:"封面图片备选或文章关联图片路径列表"`
-	Tags       []string `json:"tags,omitempty" jsonschema_description:"标签列表（如活动话题：移动云智能新空间）"`
-	Category   string   `json:"category,omitempty" jsonschema_description:"文章分类（如科技）"`
-	CoverImage string   `json:"cover_image,omitempty" jsonschema_description:"封面图片路径"`
-	Original   bool     `json:"original,omitempty" jsonschema_description:"是否声明原创"`
-	Fiction    bool     `json:"fiction,omitempty" jsonschema_description:"是否声明作品取材网络、虚构演绎以防范版权/姓名权争议"`
+	Title       string      `json:"title" jsonschema_description:"文章标题（最多100字）"`
+	Content     string      `json:"content" jsonschema_description:"文章正文内容。支持：1. 纯文本内容。2. 包含插图的内容：使用 Markdown 格式 of 图片标签 '![图片描述](本地绝对路径)' 插入本地图片。系统会自动提取图片，按顺序逐个上传并在对应的段落位置插入。例如：'第一段内容。\\n\\n![插图](/path/to/img.png)\\n\\n第二段内容。'"`
+	Images      []string    `json:"images,omitempty" jsonschema_description:"封面图片备选或文章关联图片路径列表"`
+	Tags        []string    `json:"tags,omitempty" jsonschema_description:"标签列表（如活动话题：移动云智能新空间）"`
+	Category    string      `json:"category,omitempty" jsonschema_description:"文章分类（如科技）"`
+	CoverImage  string      `json:"cover_image,omitempty" jsonschema_description:"封面图片路径"`
+	Original    bool        `json:"original,omitempty" jsonschema_description:"是否声明原创"`
+	Fiction     bool        `json:"fiction,omitempty" jsonschema_description:"是否声明作品取材网络、虚构演绎以防范版权/姓名权争议"`
+	PublishTime interface{} `json:"publish_time,omitempty" jsonschema_description:"定时发布时间（支持 Unix 时间戳或 YYYY-MM-DD HH:mm 格式的字符串）"`
 }
 
 // GetArticleListArgs 文章列表参数
@@ -75,9 +76,10 @@ type GetAccountOverviewArgs struct{}
 
 // PublishMicroPostArgs 微头条发布参数
 type PublishMicroPostArgs struct {
-	Content string   `json:"content" jsonschema_description:"微头条正文内容（最多2000字）"`
-	Images  []string `json:"images,omitempty" jsonschema_description:"图片路径列表（最多9张，支持本地路径和HTTP URL）"`
-	Topic   string   `json:"topic,omitempty" jsonschema_description:"话题标签（如：AI工具）"`
+	Content     string      `json:"content" jsonschema_description:"微头条正文内容（最多2000字）"`
+	Images      []string    `json:"images,omitempty" jsonschema_description:"图片路径列表（最多9张，支持本地路径和HTTP URL）"`
+	Topic       string      `json:"topic,omitempty" jsonschema_description:"话题标签（如：AI工具）"`
+	PublishTime interface{} `json:"publish_time,omitempty" jsonschema_description:"定时发布时间（支持 Unix 时间戳或 YYYY-MM-DD HH:mm 格式的字符串）"`
 }
 
 // SaveMicroDraftArgs 微头条草稿保存参数
@@ -155,9 +157,10 @@ func registerMicroTools(server *mcp.Server, appServer *AppServer) {
 	}, withPanicRecovery("publish_micro_post",
 		func(ctx context.Context, req *mcp.CallToolRequest, args PublishMicroPostArgs) (*mcp.CallToolResult, any, error) {
 			argsMap := map[string]interface{}{
-				"content": args.Content,
-				"images":  args.Images,
-				"topic":   args.Topic,
+				"content":      args.Content,
+				"images":       args.Images,
+				"topic":        args.Topic,
+				"publish_time": args.PublishTime,
 			}
 			result := appServer.handlePublishMicroPost(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
@@ -193,14 +196,15 @@ func registerArticleTools(server *mcp.Server, appServer *AppServer) {
 	}, withPanicRecovery("publish_article",
 		func(ctx context.Context, req *mcp.CallToolRequest, args PublishArticleArgs) (*mcp.CallToolResult, any, error) {
 			argsMap := map[string]interface{}{
-				"title":       args.Title,
-				"content":     args.Content,
-				"images":      args.Images,
-				"tags":        args.Tags,
-				"category":    args.Category,
-				"cover_image": args.CoverImage,
-				"original":    args.Original,
-				"fiction":     args.Fiction,
+				"title":        args.Title,
+				"content":      args.Content,
+				"images":       args.Images,
+				"tags":         args.Tags,
+				"category":     args.Category,
+				"cover_image":  args.CoverImage,
+				"original":     args.Original,
+				"fiction":      args.Fiction,
+				"publish_time": args.PublishTime,
 			}
 			result := appServer.handlePublishArticle(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil

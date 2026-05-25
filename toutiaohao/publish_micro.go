@@ -41,7 +41,7 @@ func NewMicroPostAction(page *rod.Page, cookieStore cookies.Cookier) *MicroPostA
 }
 
 // Publish 发布微头条
-func (a *MicroPostAction) Publish(ctx context.Context, content string, images []string, topic string) error {
+func (a *MicroPostAction) Publish(ctx context.Context, content string, images []string, topic string, publishTime interface{}) error {
 	if err := ValidateMicroPost(content, images, topic); err != nil {
 		return err
 	}
@@ -86,6 +86,22 @@ func (a *MicroPostAction) Publish(ctx context.Context, content string, images []
 	if len(images) > 0 {
 		if err := a.uploadImages(images); err != nil {
 			log.Warnf("Image upload failed: %v", err)
+		}
+	}
+
+	// 今日头条微头条网页端不支持定时发布，此处仅打印警告并忽略
+	if publishTime != nil {
+		hasTime := false
+		switch t := publishTime.(type) {
+		case string:
+			if t != "" {
+				hasTime = true
+			}
+		case int, int64, float64:
+			hasTime = true
+		}
+		if hasTime {
+			log.Warn("今日头条微头条网页端不支持定时发布功能，定时发布参数已被忽略")
 		}
 	}
 

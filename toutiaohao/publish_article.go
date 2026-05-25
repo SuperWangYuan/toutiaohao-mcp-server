@@ -17,12 +17,13 @@ import (
 
 // ArticleOptions 文章发布可选参数
 type ArticleOptions struct {
-	Images     []string `json:"images,omitempty"`
-	Tags       []string `json:"tags,omitempty"`
-	Category   string   `json:"category,omitempty"`
-	CoverImage string   `json:"cover_image,omitempty"`
-	Original   bool     `json:"original,omitempty"`
-	Fiction    bool     `json:"fiction,omitempty"`
+	Images      []string    `json:"images,omitempty"`
+	Tags        []string    `json:"tags,omitempty"`
+	Category    string      `json:"category,omitempty"`
+	CoverImage  string      `json:"cover_image,omitempty"`
+	Original    bool        `json:"original,omitempty"`
+	Fiction     bool        `json:"fiction,omitempty"`
+	PublishTime interface{} `json:"publish_time,omitempty"`
 }
 
 // ValidateArticle 校验文章参数
@@ -168,7 +169,7 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 	time.Sleep(1 * time.Second)
 
 	// 点击发布
-	if err := a.clickPublish(); err != nil {
+	if err := a.clickPublish(opts); err != nil {
 		return fmt.Errorf("failed to publish: %w", err)
 	}
 
@@ -1351,7 +1352,7 @@ func (a *ArticlePublishAction) setFictionDeclaration() {
 	}`)
 }
 
-func (a *ArticlePublishAction) clickPublish() error {
+func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	if err := clickFirst(a.page, 3*time.Second, ArticlePublishButtonSelectors, "publish button"); err != nil {
 		return err
 	}
@@ -1361,6 +1362,13 @@ func (a *ArticlePublishAction) clickPublish() error {
 	time.Sleep(1 * time.Second) // 稍微等一秒再截图，防止截到空白
 	_ = a.page.MustScreenshot(screenshotPath)
 	log.Infof("Saved first-click screenshot to: %s", screenshotPath)
+
+	// 如果需要定时发布，在确认发布前设置定时发布时间
+	if opts != nil && opts.PublishTime != nil {
+		if err := setPublishTime(a.page, opts.PublishTime); err != nil {
+			log.Warnf("设置定时发布时间失败: %v", err)
+		}
+	}
 
 	// 轮询等待二次确认弹窗中的“确认发布”按钮并进行点击，最多等待 10 秒
 	var clickedConfirm bool

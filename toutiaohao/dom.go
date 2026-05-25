@@ -314,7 +314,7 @@ func waitForPublishResult(page *rod.Page, timeout time.Duration) error {
 			el, err := page.Timeout(200 * time.Millisecond).ElementX(sel)
 			if err == nil && el != nil {
 				visibleText, _ := el.Text()
-				_ = page.MustScreenshot("./screenshot_err.png")
+				safeScreenshot(page, "./screenshot_err.png")
 				log.Warnf("发布失败，页面有错误提示，已保存截图到 screenshot_err.png")
 				return fmt.Errorf("发布失败，页面提示: %s", visibleText)
 			}
@@ -324,7 +324,7 @@ func waitForPublishResult(page *rod.Page, timeout time.Duration) error {
 	}
 
 	// 超时——发布很可能没有成功
-	_ = page.MustScreenshot("./screenshot_timeout.png")
+	safeScreenshot(page, "./screenshot_timeout.png")
 	log.Warn("发布检测超时，已保存截图到 screenshot_timeout.png")
 	return fmt.Errorf("发布结果检测超时（%v），页面仍停留在发布页，未检测到成功跳转或提示", timeout)
 }
@@ -436,5 +436,239 @@ function scrollIntoViewSafe(el) {
 	});
 }
 `
+
+// parsePublishTime 解析并标准化定时发布时间，返回 "YYYY-MM-DD HH:mm" 的字符串格式。
+func parsePublishTime(publishTime interface{}) (string, error) {
+	if publishTime == nil {
+		return "", nil
+	}
+
+	var targetTime time.Time
+
+	switch v := publishTime.(type) {
+	case string:
+		val := strings.TrimSpace(v)
+		if val == "" {
+			return "", nil
+		}
+		// 尝试解析各种常见时间格式
+		formats := []string{
+			"2006-01-02 15:04:05",
+			"2006-01-02 15:04",
+			"2006/01/02 15:04:05",
+			"2006/01/02 15:04",
+			time.RFC3339,
+		}
+		var parsed bool
+		for _, f := range formats {
+			if t, err := time.ParseInLocation(f, val, time.Local); err == nil {
+				targetTime = t
+				parsed = true
+				break
+			}
+		}
+		if !parsed {
+			return "", fmt.Errorf("无法解析的发布时间字符串: %s. 支持的格式: YYYY-MM-DD HH:mm:ss 或 YYYY-MM-DD HH:mm", val)
+		}
+
+	case int:
+		targetTime = time.Unix(int64(v), 0)
+	case int64:
+		targetTime = time.Unix(v, 0)
+	case float64:
+		targetTime = time.Unix(int64(v), 0)
+	default:
+		return "", fmt.Errorf("不支持的发布时间类型: %T. 仅支持 Unix 时间戳或格式化时间字符串", publishTime)
+	}
+
+	// 打印警告以辅助调试，但不强行中断发文
+	now := time.Now()
+	minTime := now.Add(2 * time.Hour)
+	maxTime := now.Add(30 * 24 * time.Hour)
+	if targetTime.Before(minTime) || targetTime.After(maxTime) {
+		log.Warnf("【时间提示】定时发布时间 %s 可能不符合头条平台要求。头条通常要求在“当前时间+2小时 到 30天内”之间。当前时间：%s", 
+			targetTime.Format("2006-01-02 15:04"), now.Format("2006-01-02 15:04"))
+	}
+
+	return targetTime.Format("2006-01-02 15:04"), nil
+}
+
+// setPublishTime 浏览器自动化设置定时发布时间
+func setPublishTime(page *rod.Page, publishTime interface{}) error {
+	timeStr, err := parsePublishTime(publishTime)
+	if err != nil {
+		return err
+	}
+	if timeStr == "" {
+		return nil
+	}
+
+	log.Infof("检测到定时发布选项，目标时间: %s", timeStr)
+
+	// 1. 定位并点击“定时发布”单选标签
+	scheduleRadioSelectors := []string{
+		`//span[contains(text(), '定时发布')]`,
+		`//label[contains(., '定时发布')]`,
+		`//span[contains(text(), '定时')]/preceding-sibling::span/input[@type='radio']`,
+		`[class*='radio'] input[value='1']`, // 有时头条定时发布单选框 value 为 1
+	}
+
+	log.Info("正在勾选“定时发布”单选按钮...")
+	elRadio, selRadio, err := findElement(page, 5*time.Second, scheduleRadioSelectors)
+	if err != nil {
+		safeScreenshot(page, "./screenshot_publish_time_radio_error.png")
+		htmlVal, _ := page.Eval(`() => document.body.innerHTML`)
+		if htmlVal != nil {
+			_ = os.WriteFile("./dom_dump_radio.html", []byte(htmlVal.Value.Str()), 0644)
+			log.Warn("已保存 DOM Dump 至 ./dom_dump_radio.html")
+		}
+		return fmt.Errorf("未找到“定时发布”按钮/选项: %w (已保存调试截图至 screenshot_publish_time_radio_error.png 并保存 DOM Dump 至 ./dom_dump_radio.html)", err)
+	}
+	log.Infof("已找到定时发布按钮，使用选择器: %s，正在执行 JS 点击...", selRadio)
+
+	// 滚动并触发 JS 点击
+	_, _ = elRadio.Eval(`() => {` + SafeScrollJS + `
+		scrollIntoViewSafe(this);
+		this.click();
+	}`)
+	time.Sleep(2000 * time.Millisecond) // 等待时间选择弹窗渲染出来
+
+	// 2. 定位日期时间输入框并填入时间
+	timeInputSelectors := []string{
+		`input[placeholder*='选择日期']`,
+		`input[placeholder*='请选择']`,
+		`input[class*='datepicker']`,
+		`.byte-datepicker input`,
+		`.semi-datepicker input`,
+	}
+
+	log.Info("正在定位日期时间输入框...")
+	elInput, selInput, err := findElement(page, 5*time.Second, timeInputSelectors)
+	if err != nil {
+		safeScreenshot(page, "./screenshot_publish_time_error.png")
+		res, _ := page.Eval(`() => {
+			let inputs = Array.from(document.querySelectorAll('input')).map(el => ({
+				type: el.type,
+				placeholder: el.placeholder,
+				className: el.className,
+				value: el.value,
+				visible: el.offsetWidth > 0
+			}));
+			
+			let schedTextEls = Array.from(document.querySelectorAll('*')).filter(el => {
+				let childNodes = Array.from(el.childNodes);
+				let directText = childNodes.filter(n => n.nodeType === Node.TEXT_NODE).map(n => n.textContent.trim()).join('');
+				return (directText === '定时发布' || directText === '立即发布') && el.offsetWidth > 0;
+			}).map(el => {
+				let path = [];
+				let curr = el;
+				for (let i = 0; i < 4; i++) {
+					if (curr) {
+						path.push({
+							tagName: curr.tagName,
+							className: curr.className,
+							outerHTML: curr.outerHTML.substring(0, 250)
+						});
+						curr = curr.parentElement;
+					}
+				}
+				return path;
+			});
+			
+			let modals = Array.from(document.querySelectorAll('.semi-modal, .byte-modal, [class*="modal"], [class*="dialog"], [class*="popover"], [class*="datepicker"], [class*="popup"]')).filter(el => el.offsetWidth > 0).map(el => ({
+				className: el.className,
+				tagName: el.tagName,
+				outerHTML: el.outerHTML.substring(0, 1000)
+			}));
+
+			let dateRelated = Array.from(document.querySelectorAll('*')).filter(el => {
+				let text = el.innerText ? el.innerText.trim() : '';
+				let hasDateText = text.includes('选择') || text.includes('日期') || text.includes('时间') || text.includes('请选择');
+				return hasDateText && el.offsetWidth > 0 && el.offsetHeight > 0 && el.children.length < 5;
+			}).map(el => ({
+				tagName: el.tagName,
+				className: el.className,
+				text: el.innerText.substring(0, 60),
+				outerHTML: el.outerHTML.substring(0, 200)
+			}));
+			
+			let redErrors = Array.from(document.querySelectorAll('*')).filter(el => {
+				let style = window.getComputedStyle(el);
+				let isRed = style.color === 'rgb(240, 65, 66)' || style.color === 'red' || (el.className && typeof el.className === 'string' && el.className.includes('error'));
+				return isRed && el.offsetWidth > 0 && el.offsetHeight > 0 && el.innerText.trim().length > 0 && el.children.length === 0;
+			}).map(el => el.innerText.trim());
+			
+			return { inputs, schedTextEls, modals, dateRelated, redErrors };
+		}`)
+		if res != nil {
+			log.Warnf("调试信息: %s", res.Value.String())
+		}
+		htmlVal, _ := page.Eval(`() => document.body.innerHTML`)
+		if htmlVal != nil {
+			_ = os.WriteFile("./dom_dump.html", []byte(htmlVal.Value.Str()), 0644)
+			log.Warn("已保存 DOM Dump 至 ./dom_dump.html")
+		}
+		return fmt.Errorf("未找到日期时间输入框: %w (已保存调试截图至 screenshot_publish_time_error.png 并保存 DOM Dump 至 ./dom_dump.html)", err)
+	}
+	log.Infof("已找到日期时间输入框，选择器: %s", selInput)
+
+	// 先清空并输入时间
+	_ = elInput.SelectAllText()
+	if err := elInput.Input(timeStr); err != nil {
+		return fmt.Errorf("向日期时间输入框输入时间失败: %w", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	// 3. 点击时间面板上的“确定”按钮以关闭面板并使输入生效
+	log.Info("正在确认日期时间选择面板...")
+	
+	// 首先尝试在输入框里敲击 Enter 键
+	_, _ = elInput.Eval(`() => {
+		this.focus();
+		const enterEvent = new KeyboardEvent('keydown', {
+			key: 'Enter',
+			code: 'Enter',
+			keyCode: 13,
+			which: 13,
+			bubbles: true
+		});
+		this.dispatchEvent(enterEvent);
+		const changeEvent = new Event('change', { bubbles: true });
+		this.dispatchEvent(changeEvent);
+	}`)
+	time.Sleep(500 * time.Millisecond)
+
+	// 另外在 DOM 查找确定按钮并点击
+	confirmSelectors := []string{
+		`//button[contains(text(), '确定')]`,
+		`//span[contains(text(), '确定')]/ancestor::button`,
+		`.byte-datepicker-btn-confirm`,
+		`button[class*='confirm']`,
+	}
+
+	if elConfirm, _, errConfirm := findElement(page, 2*time.Second, confirmSelectors); errConfirm == nil && elConfirm != nil {
+		_, _ = elConfirm.Eval(`() => this.click()`)
+		time.Sleep(1000 * time.Millisecond)
+	}
+
+	// 校验时间是否填入成功
+	val, errVal := elInput.Eval(`() => this.value`)
+	if errVal == nil && val != nil {
+		log.Infof("日期时间设置成功，当前输入框内值: %s", val.Value.Str())
+	}
+
+	return nil
+}
+
+// safeScreenshot 安全截图，捕获可能因浏览器关闭/断连导致的 panic，不影响后续错误返回
+func safeScreenshot(page *rod.Page, path string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warnf("截图失败并捕获异常 (通常是浏览器连接已断开): %v", r)
+		}
+	}()
+	_ = page.MustScreenshot(path)
+}
+
 
 

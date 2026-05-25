@@ -70,14 +70,15 @@ func (s *AppServer) apiDeleteCookies(c *gin.Context) {
 // apiPublishArticle 发布文章 API
 func (s *AppServer) apiPublishArticle(c *gin.Context) {
 	var req struct {
-		Title      string   `json:"title"`
-		Content    string   `json:"content"`
-		Images     []string `json:"images"`
-		Tags       []string `json:"tags"`
-		Category   string   `json:"category"`
-		CoverImage string   `json:"cover_image"`
-		Original   bool     `json:"original"`
-		Fiction    bool     `json:"fiction"`
+		Title       string      `json:"title"`
+		Content     string      `json:"content"`
+		Images      []string    `json:"images"`
+		Tags        []string    `json:"tags"`
+		Category    string      `json:"category"`
+		CoverImage  string      `json:"cover_image"`
+		Original    bool        `json:"original"`
+		Fiction     bool        `json:"fiction"`
+		PublishTime interface{} `json:"publish_time"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
@@ -87,6 +88,7 @@ func (s *AppServer) apiPublishArticle(c *gin.Context) {
 	opts := &toutiaohao.ArticleOptions{
 		Images: req.Images, Tags: req.Tags, Category: req.Category,
 		CoverImage: req.CoverImage, Original: req.Original, Fiction: req.Fiction,
+		PublishTime: req.PublishTime,
 	}
 	if err := s.toutiaoService.PublishArticle(c.Request.Context(), req.Title, req.Content, opts); err != nil {
 		respondError(c, http.StatusInternalServerError, err.Error())
@@ -98,16 +100,17 @@ func (s *AppServer) apiPublishArticle(c *gin.Context) {
 // apiPublishMicroPost 发布微头条 API
 func (s *AppServer) apiPublishMicroPost(c *gin.Context) {
 	var req struct {
-		Content string   `json:"content"`
-		Images  []string `json:"images"`
-		Topic   string   `json:"topic"`
+		Content     string      `json:"content"`
+		Images      []string    `json:"images"`
+		Topic       string      `json:"topic"`
+		PublishTime interface{} `json:"publish_time"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if err := s.toutiaoService.PublishMicroPost(c.Request.Context(), req.Content, req.Images, req.Topic); err != nil {
+	if err := s.toutiaoService.PublishMicroPost(c.Request.Context(), req.Content, req.Images, req.Topic, req.PublishTime); err != nil {
 		respondError(c, http.StatusInternalServerError, err.Error())
 		return
 	}

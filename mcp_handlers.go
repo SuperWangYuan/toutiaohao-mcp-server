@@ -59,6 +59,7 @@ func (s *AppServer) handleDeleteCookies(ctx context.Context, args map[string]int
 func (s *AppServer) handlePublishMicroPost(ctx context.Context, args map[string]interface{}) *MCPToolResult {
 	content, _ := args["content"].(string)
 	topic, _ := args["topic"].(string)
+	publishTime := args["publish_time"]
 
 	var images []string
 	if imgs, ok := args["images"].([]string); ok {
@@ -69,7 +70,7 @@ func (s *AppServer) handlePublishMicroPost(ctx context.Context, args map[string]
 		return NewErrorResult(err.Error())
 	}
 
-	if err := s.toutiaoService.PublishMicroPost(ctx, content, images, topic); err != nil {
+	if err := s.toutiaoService.PublishMicroPost(ctx, content, images, topic, publishTime); err != nil {
 		return NewErrorResult(err.Error())
 	}
 
@@ -120,6 +121,9 @@ func (s *AppServer) handlePublishArticle(ctx context.Context, args map[string]in
 	}
 	if fiction, ok := args["fiction"].(bool); ok {
 		opts.Fiction = fiction
+	}
+	if publishTime, ok := args["publish_time"]; ok {
+		opts.PublishTime = publishTime
 	}
 
 	if err := toutiaohao.ValidateArticle(title, content, opts); err != nil {
