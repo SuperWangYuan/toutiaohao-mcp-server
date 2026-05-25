@@ -839,46 +839,51 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 
 		// 点击“上传图片”按钮
 		uploadEl, sel, err := findElement(a.page, 3*time.Second, ArticleCoverUploadSelectors)
+		var clickUploadFailed bool
 		if err != nil {
-			// 保存发生错误时的截图以进行分析
-			_ = a.page.MustScreenshot("screenshot_upload_error.png")
-			log.Warnf("Upload error screenshot saved to screenshot_upload_error.png")
-			return fmt.Errorf("upload button not found for image %d: %w", i+1, err)
-		}
-		log.Infof("Found cover upload using selector: %s", sel)
-
-		// 对“上传图片”按钮进行安全滚动和物理点击
-		_, _ = uploadEl.Eval(`() => {` + SafeScrollJS + `
-			scrollIntoViewSafe(this);
-			this.classList.add('mcp-target-to-click');
-		}`)
-		time.Sleep(500 * time.Millisecond)
-
-		clickUploadEl, err := a.page.Timeout(3 * time.Second).Element(".mcp-target-to-click")
-		if err == nil {
-			ptUpload, errPt := clickUploadEl.Interactable()
-			if errPt == nil {
-				log.Infof("Clicking upload button at point (%f, %f)", ptUpload.X, ptUpload.Y)
-				_ = a.page.Mouse.MoveTo(*ptUpload)
-				_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
-				_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-			} else {
-				log.Warnf("Failed to get interactable point for upload button, fallback to direct click: %v", errPt)
-				_ = clickUploadEl.Click(proto.InputMouseButtonLeft, 1)
-			}
+			log.Warnf("【封面上传】未找到封面上传按钮 (image %d): %v。将尝试直接寻找并写入 file input 控件作为兜底...", i+1, err)
+			clickUploadFailed = true
 		} else {
-			_ = uploadEl.Click(proto.InputMouseButtonLeft, 1)
-		}
-		time.Sleep(1000 * time.Millisecond)
+			log.Infof("Found cover upload using selector: %s", sel)
 
-		// 清理临时标记
-		_, _ = a.page.Eval(`() => {
-			document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
-		}`)
+			// 对“上传图片”按钮进行安全滚动和物理点击
+			_, _ = uploadEl.Eval(`() => {` + SafeScrollJS + `
+				scrollIntoViewSafe(this);
+				this.classList.add('mcp-target-to-click');
+			}`)
+			time.Sleep(500 * time.Millisecond)
+
+			clickUploadEl, err := a.page.Timeout(3 * time.Second).Element(".mcp-target-to-click")
+			if err == nil {
+				ptUpload, errPt := clickUploadEl.Interactable()
+				if errPt == nil {
+					log.Infof("Clicking upload button at point (%f, %f)", ptUpload.X, ptUpload.Y)
+					_ = a.page.Mouse.MoveTo(*ptUpload)
+					_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+					_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+				} else {
+					log.Warnf("Failed to get interactable point for upload button, fallback to direct click: %v", errPt)
+					_ = clickUploadEl.Click(proto.InputMouseButtonLeft, 1)
+				}
+			} else {
+				_ = uploadEl.Click(proto.InputMouseButtonLeft, 1)
+			}
+			time.Sleep(1000 * time.Millisecond)
+
+			// 清理临时标记
+			_, _ = a.page.Eval(`() => {
+				document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
+			}`)
+		}
 
 		// 设置文件路径
 		fileInput, err := a.page.Timeout(3 * time.Second).Element(`input[type='file']`)
 		if err != nil {
+			if clickUploadFailed {
+				safeScreenshot(a.page, "screenshot_upload_error.png")
+				log.Warnf("Upload error screenshot saved to screenshot_upload_error.png")
+				return fmt.Errorf("upload button not found and file input not found for image %d: %w", i+1, err)
+			}
 			return fmt.Errorf("file input not found for image %d: %w", i+1, err)
 		}
 		fileInput = fileInput.CancelTimeout()
