@@ -167,6 +167,38 @@ func (s *AppServer) apiDeleteArticle(c *gin.Context) {
 	respondSuccess(c, nil)
 }
 
+// apiUpdateArticle 修改文章 API
+func (s *AppServer) apiUpdateArticle(c *gin.Context) {
+	var req struct {
+		ArticleID   string      `json:"article_id"`
+		Title       string      `json:"title"`
+		Content     string      `json:"content"`
+		Images      []string    `json:"images"`
+		Tags        []string    `json:"tags"`
+		Category    string      `json:"category"`
+		CoverImage  string      `json:"cover_image"`
+		Original    bool        `json:"original"`
+		Fiction     bool        `json:"fiction"`
+		PublishTime interface{} `json:"publish_time"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	opts := &toutiaohao.ArticleOptions{
+		Images: req.Images, Tags: req.Tags, Category: req.Category,
+		CoverImage: req.CoverImage, Original: req.Original, Fiction: req.Fiction,
+		PublishTime: req.PublishTime,
+	}
+	if err := s.toutiaoService.UpdateArticle(c.Request.Context(), req.ArticleID, req.Title, req.Content, opts); err != nil {
+		respondError(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respondSuccess(c, nil)
+}
+
+
 // apiGetAccountOverview 账户概览 API
 func (s *AppServer) apiGetAccountOverview(c *gin.Context) {
 	result, err := s.toutiaoService.GetAccountOverview(c.Request.Context())

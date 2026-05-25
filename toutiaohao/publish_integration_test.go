@@ -1,8 +1,10 @@
 package toutiaohao
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,3 +235,68 @@ func TestPublishMicroManual(t *testing.T) {
 
 	log.Info("微头条配图发布测试完成")
 }
+
+func TestUpdateArticleManual(t *testing.T) {
+	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
+	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+	log.Info("开始修改/更新文章集成测试...")
+
+	cookiePath := "../cookies.json"
+	store := cookies.NewFileCookieStore(cookiePath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	// 1. 获取文章列表，拿到最近的一篇文章 ID
+	params := &ArticleListParams{
+		Status:   "all",
+		Page:     1,
+		PageSize: 10,
+	}
+	resp, err := GetArticleList(ctx, params, store)
+	if err != nil {
+		t.Fatalf("获取文章列表失败: %v", err)
+	}
+	if len(resp.Articles) == 0 {
+		t.Skip("没有检测到文章，跳过修改测试")
+	}
+
+	targetArticle := resp.Articles[0]
+	articleID := targetArticle.ArticleID
+	log.Infof("检测到最近的文章 ID: %s, 标题: %s", articleID, targetArticle.Title)
+
+	// 2. 启动浏览器
+	b := browser.NewBrowser(true)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	a := NewArticlePublishAction(page, store)
+
+	// 3. 执行修改
+	newTitle := targetArticle.Title
+	if !strings.HasPrefix(newTitle, "[修改测试]") {
+		newTitle = "[修改测试]" + newTitle
+	} else {
+		newTitle = strings.TrimPrefix(newTitle, "[修改测试]")
+		if newTitle == "" {
+			newTitle = "移动云智能新空间：开启AI算力与模型服务的新篇章"
+		}
+	}
+
+	newContent := "【修改测试】今日头条自动化更新功能已成功运行！\n\n" +
+		"这是一次自动化的修改文章集成测试。测试自动更新了文章的标题和这一段正文内容，并验证了页面加载、输入与保存发布的整个流程。"
+
+	log.Infof("准备将文章 %s 的标题修改为: %s", articleID, newTitle)
+
+	opts := &ArticleOptions{}
+
+	// 调用 a.Update
+	if err := a.Update(ctx, articleID, newTitle, newContent, opts); err != nil {
+		t.Fatalf("修改文章失败: %v", err)
+	}
+
+	log.Info("修改/更新文章集成测试成功！")
+}
+

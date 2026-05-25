@@ -49,6 +49,18 @@ type PublishArticleArgs struct {
 	PublishTime interface{} `json:"publish_time,omitempty" jsonschema_description:"定时发布时间（支持 Unix 时间戳或 YYYY-MM-DD HH:mm 格式的字符串）"`
 }
 
+// UpdateArticleArgs 文章修改参数
+type UpdateArticleArgs struct {
+	ArticleID   string      `json:"article_id" jsonschema_description:"要修改的文章或草稿的 ID (即 URL 中的 pgc_id)"`
+	Title       string      `json:"title,omitempty" jsonschema_description:"修改后的文章标题（最多100字，不修改则留空）"`
+	Content     string      `json:"content,omitempty" jsonschema_description:"修改后的文章正文内容。支持：1. 纯文本内容。2. 包含插图的内容：使用 Markdown 格式 of 图片标签 '![图片描述](本地绝对路径)' 插入本地图片。不修改则留空。"`
+	Images      []string    `json:"images,omitempty" jsonschema_description:"封面图片备选或文章关联图片路径列表"`
+	CoverImage  string      `json:"cover_image,omitempty" jsonschema_description:"封面图片路径"`
+	Original    bool        `json:"original,omitempty" jsonschema_description:"是否声明原创"`
+	Fiction     bool        `json:"fiction,omitempty" jsonschema_description:"是否声明作品取材网络、虚构演绎以防范版权/姓名权争议"`
+	PublishTime interface{} `json:"publish_time,omitempty" jsonschema_description:"定时发布时间（支持 Unix 时间戳或 YYYY-MM-DD HH:mm 格式的字符串）"`
+}
+
 // GetArticleListArgs 文章列表参数
 type GetArticleListArgs struct {
 	Page     int    `json:"page,omitempty" jsonschema_description:"页码（默认1）"`
@@ -207,6 +219,28 @@ func registerArticleTools(server *mcp.Server, appServer *AppServer) {
 				"publish_time": args.PublishTime,
 			}
 			result := appServer.handlePublishArticle(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "update_article",
+		Description: "修改今日头条已发表的文章或草稿。需要提供 `article_id`。如果标题、正文等字段不传入，则保留原内容。如果修改了正文，也会自动按规则重新排版及可选重新设置封面。",
+		Annotations: &mcp.ToolAnnotations{
+			DestructiveHint: boolPtr(true),
+		},
+	}, withPanicRecovery("update_article",
+		func(ctx context.Context, req *mcp.CallToolRequest, args UpdateArticleArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"article_id":   args.ArticleID,
+				"title":        args.Title,
+				"content":      args.Content,
+				"images":       args.Images,
+				"cover_image":  args.CoverImage,
+				"original":     args.Original,
+				"fiction":      args.Fiction,
+				"publish_time": args.PublishTime,
+			}
+			result := appServer.handleUpdateArticle(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
 		}))
 }

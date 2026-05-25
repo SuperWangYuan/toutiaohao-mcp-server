@@ -123,8 +123,61 @@ func inputText(el *rod.Element, text string) error {
 	if tagName != nil {
 		switch tagName.Value.Str() {
 		case "input", "textarea":
+			// 定义设置 React 状态值的 JS 模板
+			reactSetJSTemplate := `(el, val) => {
+				try {
+					let setter = null;
+					let prototype = Object.getPrototypeOf(el);
+					while (prototype) {
+						const desc = Object.getOwnPropertyDescriptor(prototype, 'value');
+						if (desc && desc.set) {
+							setter = desc.set;
+							break;
+						}
+						prototype = Object.getPrototypeOf(prototype);
+					}
+					if (setter) {
+						setter.call(el, val);
+					} else {
+						el.value = val;
+					}
+					const tracker = el._valueTracker;
+					if (tracker) {
+						tracker.setValue(val);
+					}
+				} catch(e) {
+					el.value = val;
+				}
+				el.dispatchEvent(new Event('input', {bubbles: true}));
+				el.dispatchEvent(new Event('change', {bubbles: true}));
+			}`
+
+			// 1. 先使用 React value setter 机制将输入框清空并同步 React state
+			_, errEval := el.Eval(`val => {
+				const setter = ` + reactSetJSTemplate + `;
+				setter(this, val);
+			}`, "")
+			if errEval != nil {
+				log.Warnf("React clear value failed: %v", errEval)
+			}
+
+			// 2. 模拟原生物理按键输入
 			_ = el.SelectAllText()
-			return el.Input(text)
+			err := el.Input(text)
+			if err == nil {
+				// 检查输入后的值是否成功写入
+				val, evalErr := el.Eval(`() => this.value || ''`)
+				if evalErr == nil && val != nil && strings.TrimSpace(val.Value.Str()) == text {
+					return nil
+				}
+			}
+
+			// 3. 兜底 Fallback：使用 React value setter 机制强行注入并同步 React state
+			_, err = el.Eval(`val => {
+				const setter = ` + reactSetJSTemplate + `;
+				setter(this, val);
+			}`, text)
+			return err
 		}
 	}
 

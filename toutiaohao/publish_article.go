@@ -43,6 +43,21 @@ func ValidateArticle(title, content string, opts *ArticleOptions) error {
 	return nil
 }
 
+// ValidateUpdateArticle 校验修改文章参数
+func ValidateUpdateArticle(articleID, title, content string, opts *ArticleOptions) error {
+	if strings.TrimSpace(articleID) == "" {
+		return fmt.Errorf("article_id is required")
+	}
+	if title != "" && utf8.RuneCountInString(title) > configs.MaxTitleLength {
+		return fmt.Errorf("title exceeds %d characters limit", configs.MaxTitleLength)
+	}
+	if content != "" && utf8.RuneCountInString(content) > configs.MaxContentLength {
+		return fmt.Errorf("content exceeds %d characters limit", configs.MaxContentLength)
+	}
+	return nil
+}
+
+
 // ArticlePublishAction 文章发布操作
 type ArticlePublishAction struct {
 	page        *rod.Page
@@ -1467,4 +1482,131 @@ func truncateStr(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "..."
+}
+
+// Update 修改/更新已有文章
+func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, title, content string, opts *ArticleOptions) error {
+	if strings.TrimSpace(articleID) == "" {
+		return fmt.Errorf("articleID is required for update")
+	}
+
+	// 1. 拼接修改已有文章的 URL 并导航
+	editURL := fmt.Sprintf("https://mp.toutiao.com/profile_v4/graphic/publish?pgc_id=%s", articleID)
+	log.Infof("正在导航到文章编辑页面: %s", editURL)
+	if err := a.page.Navigate(editURL); err != nil {
+		return fmt.Errorf("failed to navigate to edit page: %w", err)
+	}
+	if err := a.page.WaitLoad(); err != nil {
+		return fmt.Errorf("failed to wait for edit page load: %w", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	// 2. 确保已登录
+	if err := EnsureLogin(a.page, a.cookieStore); err != nil {
+		return err
+	}
+
+	// 再次导航到编辑页以防刚才扫码弹窗影响
+	if err := a.page.Navigate(editURL); err != nil {
+		return fmt.Errorf("failed to navigate to edit page: %w", err)
+	}
+	_ = a.page.Timeout(15 * time.Second).WaitLoad()
+	time.Sleep(3 * time.Second)
+
+	// 3. 修改标题
+	if title != "" {
+		log.Infof("正在修改标题为: %s", title)
+		if err := a.inputTitle(title); err != nil {
+			return fmt.Errorf("failed to input updated title: %w", err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	// 4. 修改正文
+	if content != "" {
+		log.Info("正在修改正文内容...")
+		if err := a.inputContent(content); err != nil {
+			return fmt.Errorf("failed to input updated content: %w", err)
+		}
+		time.Sleep(1 * time.Second)
+
+		if err := a.verifyContent(); err != nil {
+			log.Warnf("正文内容更新验证警告: %v", err)
+		}
+
+		// 解析新正文里的所有图片并进行必要的自适应封面图分配
+		blocks := parseContentBlocks(content)
+		var inlineImages []string
+		for _, b := range blocks {
+			if b.Type == "image" && b.Value != "" {
+				inlineImages = append(inlineImages, b.Value)
+			}
+		}
+
+		// 只有在显式重新指定了封面参数，或者自适应模式需要的情况下，我们才更新封面
+		var targetCoverMode string
+		var targetCovers []string
+		var isAutoCover bool
+
+		if opts != nil && (opts.CoverImage != "" || len(opts.Images) > 0) {
+			if len(opts.Images) >= 3 {
+				targetCoverMode = "三图"
+				targetCovers = opts.Images[:3]
+			} else {
+				targetCoverMode = "单图"
+				coverImg := opts.CoverImage
+				if coverImg == "" && len(opts.Images) > 0 {
+					coverImg = opts.Images[0]
+				}
+				targetCovers = []string{coverImg}
+			}
+		} else if opts == nil {
+			// 如果没指定任何 opts，且正文变了，我们重新自适应
+			if len(inlineImages) >= 3 {
+				targetCoverMode = "三图"
+				targetCovers = inlineImages[:3]
+				isAutoCover = true
+			} else if len(inlineImages) > 0 {
+				targetCoverMode = "单图"
+				targetCovers = []string{inlineImages[0]}
+				isAutoCover = true
+			} else {
+				targetCoverMode = "无封面"
+			}
+		}
+
+		if targetCoverMode != "" {
+			log.Infof("重新决策更新封面: 模式=%s, 图片数=%d, 自适应=%t", targetCoverMode, len(targetCovers), isAutoCover)
+			if err := a.setCoverMode(targetCoverMode); err != nil {
+				log.Warnf("Failed to set cover mode to %s: %v", targetCoverMode, err)
+			} else if len(targetCovers) > 0 {
+				if isAutoCover {
+					time.Sleep(3 * time.Second)
+				}
+				if err := a.uploadCovers(targetCovers, isAutoCover); err != nil {
+					log.Warnf("Failed to upload cover images: %v", err)
+				}
+			}
+		}
+	}
+
+	// 5. 修改选项 (原创/虚构)
+	if opts != nil {
+		if opts.Original {
+			a.setOriginal()
+		}
+		if opts.Fiction {
+			a.setFictionDeclaration()
+		}
+	}
+
+	time.Sleep(1 * time.Second)
+
+	// 6. 重新点击发布
+	if err := a.clickPublish(opts); err != nil {
+		return fmt.Errorf("failed to publish updated article: %w", err)
+	}
+
+	log.Infof("Article %s updated and published successfully", articleID)
+	return nil
 }

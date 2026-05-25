@@ -137,6 +137,42 @@ func (s *AppServer) handlePublishArticle(ctx context.Context, args map[string]in
 	return NewTextResult(`{"success": true, "message": "Article published"}`)
 }
 
+// handleUpdateArticle 处理文章修改
+func (s *AppServer) handleUpdateArticle(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	articleID, _ := args["article_id"].(string)
+	title, _ := args["title"].(string)
+	content, _ := args["content"].(string)
+
+	opts := &toutiaohao.ArticleOptions{}
+	if imgs, ok := args["images"].([]string); ok {
+		opts.Images = imgs
+	}
+	if tags, ok := args["tags"].([]string); ok {
+		opts.Tags = tags
+	}
+	if cat, ok := args["category"].(string); ok {
+		opts.Category = cat
+	}
+	if cover, ok := args["cover_image"].(string); ok {
+		opts.CoverImage = cover
+	}
+	if orig, ok := args["original"].(bool); ok {
+		opts.Original = orig
+	}
+	if fiction, ok := args["fiction"].(bool); ok {
+		opts.Fiction = fiction
+	}
+	if publishTime, ok := args["publish_time"]; ok {
+		opts.PublishTime = publishTime
+	}
+
+	if err := s.toutiaoService.UpdateArticle(ctx, articleID, title, content, opts); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	return NewTextResult(`{"success": true, "message": "Article updated"}`)
+}
+
 // handleGetArticleList 处理文章列表查询
 func (s *AppServer) handleGetArticleList(ctx context.Context, args map[string]interface{}) *MCPToolResult {
 	params := toutiaohao.NewArticleListParams(args)

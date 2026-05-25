@@ -124,6 +124,22 @@ func (s *ToutiaoService) GenerateReport(ctx context.Context, reportType string) 
 	return toutiaohao.GenerateReport(ctx, reportType, page, s.cookieStore)
 }
 
+// UpdateArticle 修改/更新文章
+func (s *ToutiaoService) UpdateArticle(ctx context.Context, articleID string, title, content string, opts *toutiaohao.ArticleOptions) error {
+	if err := toutiaohao.ValidateUpdateArticle(articleID, title, content, opts); err != nil {
+		return err
+	}
+
+	b := browser.NewBrowser(false)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	action := toutiaohao.NewArticlePublishAction(page, s.cookieStore)
+	return action.Update(ctx, articleID, title, content, opts)
+}
+
 // QrCodeLogin 独立的交互式扫码登录方法，专为在不受MCP超时限制的CLI环境下进行登录捕获
 func (s *ToutiaoService) QrCodeLogin(ctx context.Context) error {
 	// 启动非无头浏览器

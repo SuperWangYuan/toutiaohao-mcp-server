@@ -33,6 +33,7 @@ func setupRoutes(router *gin.Engine, mcpServer *mcp.Server, appServer *AppServer
 		// 内容管理
 		api.GET("/articles", appServer.apiGetArticleList)
 		api.POST("/articles/delete", appServer.apiDeleteArticle)
+		api.POST("/articles/update", appServer.apiUpdateArticle)
 
 		// 数据分析
 		api.GET("/analytics/overview", appServer.apiGetAccountOverview)
