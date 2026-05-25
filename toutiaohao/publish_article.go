@@ -269,9 +269,32 @@ func (a *ArticlePublishAction) inputContent(content string) error {
 
 	log.Infof("准备插入正文，共包含 %d 个文本/插图内容块...", len(blocks))
 
-	// 先清空编辑器并 focus
+	// 先清空编辑器并 focus (优先使用 ProseMirror API 彻底同步清空其内部 State，防止残留)
 	_, err = el.Eval(`() => {
 		this.focus();
+		
+		let view = null;
+		if (this.pmViewDesc && this.pmViewDesc.view) {
+			view = this.pmViewDesc.view;
+		} else if (this.cmView && this.cmView.view) {
+			view = this.cmView.view;
+		}
+
+		if (view && view.state && view.dispatch) {
+			try {
+				const { state } = view;
+				const schema = state.schema;
+				const newDoc = schema.nodes.doc.create(null, [schema.nodes.paragraph.create()]);
+				const tr = state.tr.replaceWith(0, state.doc.content.size, newDoc.content);
+				view.dispatch(tr);
+				view.focus();
+				return;
+			} catch(e) {
+				console.warn('ProseMirror clear failed:', e);
+			}
+		}
+
+		// 兜底原生 DOM 与编辑指令清空
 		this.innerHTML = '';
 		if (document.execCommand) {
 			document.execCommand('selectAll', false, null);
@@ -1385,8 +1408,51 @@ func (a *ArticlePublishAction) setFictionDeclaration() {
 }
 
 func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
-	if err := clickFirst(a.page, 3*time.Second, ArticlePublishButtonSelectors, "publish button"); err != nil {
-		return err
+	// 1. 先查找我们将要点击的发布按钮
+	el, sel, err := findElement(a.page, 3*time.Second, ArticlePublishButtonSelectors)
+	if err != nil {
+		return fmt.Errorf("publish button not found: %w", err)
+	}
+	log.Infof("Found publish button using selector: %s", sel)
+
+	// 获取该按钮的文本
+	btnTextVal, _ := el.Eval(`() => this.textContent || ''`)
+	btnText := ""
+	if btnTextVal != nil {
+		btnText = strings.TrimSpace(btnTextVal.Value.Str())
+	}
+	log.Infof("Publish button text is: %s", btnText)
+
+	// 获取 OuterHTML 和 disabled 状态用于诊断
+	if htmlVal, errHtml := el.Eval(`() => this.outerHTML`); errHtml == nil && htmlVal != nil {
+		log.Infof("Publish button OuterHTML: %s", htmlVal.Value.Str())
+	}
+	if disVal, errDis := el.Eval(`() => this.disabled`); errDis == nil && disVal != nil {
+		log.Infof("Publish button disabled state: %v", disVal.Value.Bool())
+	}
+
+	// 滚动到该元素并清除浮动遮挡物
+	_, _ = el.Eval(`() => {` + SafeScrollJS + `
+		scrollIntoViewSafe(this);
+	}`)
+	time.Sleep(500 * time.Millisecond)
+	a.dismissObstacles()
+	time.Sleep(500 * time.Millisecond)
+
+	// 尝试物理点击
+	var clickErr error
+	pt, ptErr := el.Interactable()
+	if ptErr == nil {
+		log.Infof("Clicking publish button via physical mouse click at point: (%f, %f)", pt.X, pt.Y)
+		_ = a.page.Mouse.MoveTo(*pt)
+		_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+		_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+	} else {
+		log.Warnf("Failed to get interactable point for publish button, fallback to JS click: %v", ptErr)
+		_, clickErr = el.Timeout(10 * time.Second).Eval(`() => this.click()`)
+	}
+	if clickErr != nil {
+		return fmt.Errorf("failed to click publish button: %w", clickErr)
 	}
 	
 	// 保存点击后的截图用于调试分析
@@ -1400,6 +1466,14 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 		if err := setPublishTime(a.page, opts.PublishTime); err != nil {
 			log.Warnf("设置定时发布时间失败: %v", err)
 		}
+	}
+
+	// 关键判定：
+	// 若点击的按钮本身即为“发布”字样（如修改文章时的直发底栏），这说明它已经是最终提交操作，
+	// 不需要也绝不应该做后文的“二次确认弹窗”等待轮询，否则会因重复点击该可见按钮导致锁死。
+	if btnText == "发布" {
+		log.Info("点击的按钮文本是'发布'，跳过二次确认弹窗检测，直接进入结果等待。")
+		return waitForPublishResult(a.page, 25*time.Second)
 	}
 
 	// 轮询等待二次确认弹窗中的“确认发布”按钮并进行点击，最多等待 10 秒
@@ -1511,7 +1585,36 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 		return fmt.Errorf("failed to navigate to edit page: %w", err)
 	}
 	_ = a.page.Timeout(15 * time.Second).WaitLoad()
-	time.Sleep(3 * time.Second)
+	
+	// 强行清空本地 LocalStorage 和 SessionStorage 缓存，防止之前的残留草稿被头条编辑器恢复出来
+	_, _ = a.page.Eval(`() => {
+		try {
+			window.localStorage.clear();
+			window.sessionStorage.clear();
+		} catch(e) {}
+	}`)
+	time.Sleep(2 * time.Second)
+
+	// 轮询等待编辑器异步数据填充完毕（最大等待 10 秒），防止写入太快被后续拉取到的原有内容覆写冲掉
+	log.Info("等待编辑器异步加载并填充原有文章内容...")
+	for i := 0; i < 20; i++ {
+		titleEl, _, errT := findElement(a.page, 500*time.Millisecond, ArticleTitleSelectors)
+		contentEl, _, errC := findElement(a.page, 500*time.Millisecond, ArticleContentSelectors)
+		if errT == nil && errC == nil && titleEl != nil && contentEl != nil {
+			titleVal, _ := titleEl.Eval(`() => this.value || ''`)
+			contentVal, _ := contentEl.Eval(`() => this.innerText || this.textContent || ''`)
+			if titleVal != nil && contentVal != nil {
+				tText := strings.TrimSpace(titleVal.Value.Str())
+				cText := strings.TrimSpace(contentVal.Value.Str())
+				if tText != "" || cText != "" {
+					log.Infof("检测到编辑器数据已填充完毕（标题长度: %d, 正文长度: %d）", len(tText), len(cText))
+					break
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	time.Sleep(1 * time.Second)
 
 	// 3. 修改标题
 	if title != "" {
@@ -1560,8 +1663,8 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 				}
 				targetCovers = []string{coverImg}
 			}
-		} else if opts == nil {
-			// 如果没指定任何 opts，且正文变了，我们重新自适应
+		} else {
+			// 如果没指定任何 opts（或者指定的 opts 中没有封面），且正文变了，我们重新自适应
 			if len(inlineImages) >= 3 {
 				targetCoverMode = "三图"
 				targetCovers = inlineImages[:3]
@@ -1577,15 +1680,32 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 
 		if targetCoverMode != "" {
 			log.Infof("重新决策更新封面: 模式=%s, 图片数=%d, 自适应=%t", targetCoverMode, len(targetCovers), isAutoCover)
+			
+			// 在修改文章时，若页面上对应的封面插槽已经有上传完成的图片了，则跳过重传以提升速度并防止超时
+			needUpload := false
+			if targetCoverMode == "无封面" {
+				needUpload = false
+			} else {
+				for i := 0; i < len(targetCovers); i++ {
+					hasImg, errCheck := a.checkCoverSlotHasImage(i)
+					if errCheck != nil || !hasImg {
+						needUpload = true
+						break
+					}
+				}
+			}
+
 			if err := a.setCoverMode(targetCoverMode); err != nil {
 				log.Warnf("Failed to set cover mode to %s: %v", targetCoverMode, err)
-			} else if len(targetCovers) > 0 {
+			} else if len(targetCovers) > 0 && needUpload {
 				if isAutoCover {
 					time.Sleep(3 * time.Second)
 				}
 				if err := a.uploadCovers(targetCovers, isAutoCover); err != nil {
 					log.Warnf("Failed to upload cover images: %v", err)
 				}
+			} else if !needUpload && targetCoverMode != "无封面" {
+				log.Infof("检测到修改页面封面插槽已有上传完成的封面图，跳过封面重传流程")
 			}
 		}
 	}
@@ -1601,6 +1721,58 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 	}
 
 	time.Sleep(1 * time.Second)
+
+	// 诊断 React 状态与警告提示
+	if diagRes, diagErr := a.page.Eval(`() => {
+		let results = [];
+		// 1. 查找所有可能显示错误或警告提示的可见元素
+		let alertEls = Array.from(document.querySelectorAll('*')).filter(el => {
+			if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
+			let className = el.className && typeof el.className === 'string' ? el.className.toLowerCase() : '';
+			let id = el.id && typeof el.id === 'string' ? el.id.toLowerCase() : '';
+			return className.includes('error') || className.includes('warning') || className.includes('alert') || 
+			       className.includes('invalid') || className.includes('tip') || className.includes('danger') ||
+			       id.includes('error') || id.includes('warning') || id.includes('alert') || id.includes('invalid');
+		});
+		alertEls.forEach(el => {
+			if (el.textContent && el.textContent.trim().length > 0) {
+				results.push('Alert Element (' + el.tagName + ', class=' + el.className + '): ' + el.textContent.trim());
+			}
+		});
+
+		// 2. 检查标题 input 的 React 状态
+		let titleEl = document.querySelector("textarea[placeholder*='请输入文章标题']");
+		if (titleEl) {
+			results.push('Title DOM Value: "' + titleEl.value + '"');
+			let reactKeys = Object.keys(titleEl).filter(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+			if (reactKeys.length > 0) {
+				let fiber = titleEl[reactKeys[0]];
+				if (fiber && fiber.memoizedProps) {
+					results.push('Title React memoizedProps value: "' + fiber.memoizedProps.value + '"');
+				}
+				// 遍历 fiber 树寻找 React State 里的值
+				let curr = fiber;
+				while (curr) {
+					if (curr.memoizedState && curr.memoizedState.memoizedState !== undefined) {
+						results.push('React State Value found: ' + curr.memoizedState.memoizedState);
+					}
+					curr = curr.return;
+				}
+			}
+		}
+
+		// 3. 检查编辑器（ProseMirror）的文本字数
+		let editorEl = document.querySelector(".ProseMirror");
+		if (editorEl) {
+			results.push('Editor DOM Text Length: ' + (editorEl.textContent || '').length);
+		}
+		return results;
+	}`); diagErr == nil && diagRes != nil {
+		log.Infof("【DOM 状态诊断】:")
+		for _, item := range diagRes.Value.Arr() {
+			log.Infof(" - %s", item.Str())
+		}
+	}
 
 	// 6. 重新点击发布
 	if err := a.clickPublish(opts); err != nil {

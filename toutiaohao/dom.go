@@ -123,7 +123,31 @@ func inputText(el *rod.Element, text string) error {
 	if tagName != nil {
 		switch tagName.Value.Str() {
 		case "input", "textarea":
-			// 定义设置 React 状态值的 JS 模板
+			// 1. 优先尝试使用浏览器的原生 execCommand('insertText') 进行全选覆盖。
+			// 这能保证物理按键的编辑通道被触发，React 等框架会完美监听并同步全部 State，没有任何残留。
+			_, errEval := el.Eval(`val => {
+				this.focus();
+				if (typeof this.select === 'function') {
+					this.select();
+				} else {
+					const len = this.value ? this.value.length : 0;
+					this.setSelectionRange(0, len);
+				}
+				// 替换选中的全部文本
+				document.execCommand('insertText', false, val);
+				this.dispatchEvent(new Event('input', {bubbles: true}));
+				this.dispatchEvent(new Event('change', {bubbles: true}));
+			}`, text)
+
+			if errEval == nil {
+				// 检查内容是否成功覆盖且一致
+				val, evalErr := el.Eval(`() => this.value || ''`)
+				if evalErr == nil && val != nil && strings.TrimSpace(val.Value.Str()) == text {
+					return nil
+				}
+			}
+
+			// 2. 兜底 Fallback：采用 React Value Tracker 劫持技术强行注入
 			reactSetJSTemplate := `(el, val) => {
 				try {
 					let setter = null;
@@ -152,28 +176,7 @@ func inputText(el *rod.Element, text string) error {
 				el.dispatchEvent(new Event('change', {bubbles: true}));
 			}`
 
-			// 1. 先使用 React value setter 机制将输入框清空并同步 React state
-			_, errEval := el.Eval(`val => {
-				const setter = ` + reactSetJSTemplate + `;
-				setter(this, val);
-			}`, "")
-			if errEval != nil {
-				log.Warnf("React clear value failed: %v", errEval)
-			}
-
-			// 2. 模拟原生物理按键输入
-			_ = el.SelectAllText()
-			err := el.Input(text)
-			if err == nil {
-				// 检查输入后的值是否成功写入
-				val, evalErr := el.Eval(`() => this.value || ''`)
-				if evalErr == nil && val != nil && strings.TrimSpace(val.Value.Str()) == text {
-					return nil
-				}
-			}
-
-			// 3. 兜底 Fallback：使用 React value setter 机制强行注入并同步 React state
-			_, err = el.Eval(`val => {
+			_, err := el.Eval(`val => {
 				const setter = ` + reactSetJSTemplate + `;
 				setter(this, val);
 			}`, text)
@@ -327,6 +330,15 @@ func waitForPublishResult(page *rod.Page, timeout time.Duration) error {
 	time.Sleep(1 * time.Second)
 
 	for time.Now().Before(deadline) {
+		// 捕获并输出任何可能出现的 Toast 或提示消息，帮助定位异步结果
+		if toastEls, toastErr := page.Timeout(100 * time.Millisecond).Elements(`[class*="toast"], [class*="message"], [class*="notification"], [class*="alert"]`); toastErr == nil {
+			for _, el := range toastEls {
+				if tTxt, errTxt := el.Text(); errTxt == nil && strings.TrimSpace(tTxt) != "" {
+					log.Infof("【检测到页面浮动提示】: %s", strings.TrimSpace(tTxt))
+				}
+			}
+		}
+
 		info, err := page.Info()
 		if err == nil && info != nil {
 			currentURL := info.URL
@@ -351,7 +363,7 @@ func waitForPublishResult(page *rod.Page, timeout time.Duration) error {
 		}
 
 		// 检查是否出现成功提示（如 toast）
-		successTexts := []string{"发布成功", "已发布", "发表成功"}
+		successTexts := []string{"发布成功", "已发布", "发表成功", "更新成功", "修改成功", "保存成功", "已更新", "更新发表成功", "成功"}
 		for _, sText := range successTexts {
 			sel := fmt.Sprintf(`//*[contains(@class, 'toast') or contains(@class, 'message') or contains(@class, 'notification') or contains(@class, 'alert') or contains(@class, 'semi-') or contains(@class, 'byte-') or @role='alert']//*[contains(text(), '%s')] | //*[contains(@class, 'toast') or contains(@class, 'message') or contains(@class, 'notification') or contains(@class, 'alert') or contains(@class, 'semi-') or contains(@class, 'byte-') or @role='alert'][contains(text(), '%s')]`, sText, sText)
 			el, err := page.Timeout(200 * time.Millisecond).ElementX(sel)
@@ -378,6 +390,12 @@ func waitForPublishResult(page *rod.Page, timeout time.Duration) error {
 
 	// 超时——发布很可能没有成功
 	safeScreenshot(page, "./screenshot_timeout.png")
+	bodyText, _ := page.Eval(`() => document.body.innerText`)
+	var textStr string
+	if bodyText != nil {
+		textStr = bodyText.Value.Str()
+	}
+	log.Warnf("发布检测超时，当前页面文本内容:\n%s", textStr)
 	log.Warn("发布检测超时，已保存截图到 screenshot_timeout.png")
 	return fmt.Errorf("发布结果检测超时（%v），页面仍停留在发布页，未检测到成功跳转或提示", timeout)
 }

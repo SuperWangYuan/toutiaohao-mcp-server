@@ -2,9 +2,9 @@ package toutiaohao
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -239,33 +239,15 @@ func TestPublishMicroManual(t *testing.T) {
 func TestUpdateArticleManual(t *testing.T) {
 	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
-	log.Info("开始修改/更新文章集成测试...")
+	log.Info("开始修改/更新文章集成测试（新建临时文章 -> 修改 -> 清理）...")
 
 	cookiePath := "../cookies.json"
 	store := cookies.NewFileCookieStore(cookiePath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// 1. 获取文章列表，拿到最近的一篇文章 ID
-	params := &ArticleListParams{
-		Status:   "all",
-		Page:     1,
-		PageSize: 10,
-	}
-	resp, err := GetArticleList(ctx, params, store)
-	if err != nil {
-		t.Fatalf("获取文章列表失败: %v", err)
-	}
-	if len(resp.Articles) == 0 {
-		t.Skip("没有检测到文章，跳过修改测试")
-	}
-
-	targetArticle := resp.Articles[0]
-	articleID := targetArticle.ArticleID
-	log.Infof("检测到最近的文章 ID: %s, 标题: %s", articleID, targetArticle.Title)
-
-	// 2. 启动浏览器
+	// 1. 启动浏览器
 	b := browser.NewBrowser(true)
 	defer b.Close()
 
@@ -274,29 +256,89 @@ func TestUpdateArticleManual(t *testing.T) {
 
 	a := NewArticlePublishAction(page, store)
 
-	// 3. 执行修改
-	newTitle := targetArticle.Title
-	if !strings.HasPrefix(newTitle, "[修改测试]") {
-		newTitle = "[修改测试]" + newTitle
-	} else {
-		newTitle = strings.TrimPrefix(newTitle, "[修改测试]")
-		if newTitle == "" {
-			newTitle = "移动云智能新空间：开启AI算力与模型服务的新篇章"
+	// 2. 先导航到发布页并检查登录
+	log.Info("正在导航到发布页并确保登录...")
+	if err := page.Navigate("https://mp.toutiao.com/profile_v4/graphic/publish"); err != nil {
+		t.Fatalf("导航失败: %v", err)
+	}
+	_ = page.WaitLoad()
+	if err := EnsureLogin(page, store); err != nil {
+		t.Fatalf("登录校验失败: %v", err)
+	}
+
+	// 3. 发布一篇临时新文章，标题唯一且在 30 字内
+	uniqueTitle := fmt.Sprintf("临时新建测试文章%d", time.Now().Unix()%100000)
+	log.Infof("准备发布临时新文章，标题: %s", uniqueTitle)
+
+	// 输入标题和正文
+	if err := a.inputTitle(uniqueTitle); err != nil {
+		t.Fatalf("输入临时标题失败: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	tempContent := "这是一篇临时创建的用于修改功能测试的文章。\n\n我们将在此文章发布后，通过接口对它执行二次修改，以验证修改接口的高容错性。"
+	if err := a.inputContent(tempContent); err != nil {
+		t.Fatalf("输入临时正文失败: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	// 设为无封面以防干扰发布
+	if err := a.setCoverMode("无封面"); err != nil {
+		t.Fatalf("设置无封面失败: %v", err)
+	}
+
+	// 点击发布
+	log.Info("发布临时文章...")
+	if err := a.clickPublish(nil); err != nil {
+		t.Fatalf("发布临时文章失败: %v", err)
+	}
+	time.Sleep(5 * time.Second)
+
+	// 4. 从文章列表拉取，寻找刚发布的文章以获取其 pgc_id
+	log.Info("获取文章列表以提取新建文章的 ID...")
+	params := &ArticleListParams{
+		Status:   "all",
+		Page:     1,
+		PageSize: 5,
+	}
+	resp, err := GetArticleList(ctx, params, store)
+	if err != nil {
+		t.Fatalf("获取文章列表失败: %v", err)
+	}
+
+	var articleID string
+	for _, art := range resp.Articles {
+		if art.Title == uniqueTitle {
+			articleID = art.ArticleID
+			break
 		}
 	}
+	if articleID == "" {
+		t.Fatalf("未能从文章列表中提取到刚发布的临时文章 ID (标题: %s)", uniqueTitle)
+	}
+	log.Infof("成功获取新建临时文章 ID: %s", articleID)
 
-	newContent := "【修改测试】今日头条自动化更新功能已成功运行！\n\n" +
-		"这是一次自动化的修改文章集成测试。测试自动更新了文章的标题和这一段正文内容，并验证了页面加载、输入与保存发布的整个流程。"
+	// 测试结束时，自动清理（删除）这篇临时文章！
+	defer func() {
+		log.Infof("测试结束，正在自动清理（删除）临时文章 %s ...", articleID)
+		if delErr := DeleteArticle(ctx, articleID, store); delErr != nil {
+			log.Warnf("清理临时文章失败: %v", delErr)
+		} else {
+			log.Info("临时测试文章已物理删除成功，无测试垃圾残留。")
+		}
+	}()
 
-	log.Infof("准备将文章 %s 的标题修改为: %s", articleID, newTitle)
+	// 5. 对这篇临时文章执行修改测试
+	newTitle := fmt.Sprintf("修改测试iOS27倒计时%d", time.Now().Unix()%10000)
+	newContent := "【修改测试成功】这是一次对刚刚临时新建文章的编辑修改测试，修改后的标题和这一段内容已成功生效！"
 
-	opts := &ArticleOptions{}
+	log.Infof("准备对文章 %s 开展修改测试，新标题: %s", articleID, newTitle)
 
 	// 调用 a.Update
-	if err := a.Update(ctx, articleID, newTitle, newContent, opts); err != nil {
-		t.Fatalf("修改文章失败: %v", err)
+	if err := a.Update(ctx, articleID, newTitle, newContent, &ArticleOptions{}); err != nil {
+		t.Fatalf("修改临时文章失败: %v", err)
 	}
 
-	log.Info("修改/更新文章集成测试成功！")
+	log.Info("修改/更新文章集成测试圆满成功！")
 }
 
