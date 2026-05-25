@@ -21,6 +21,9 @@ go build -o toutiaohao-server .
 # 指定自定义端口启动服务
 ./toutiaohao-server -port 9000
 
+# 启动交互式扫码登录以持久化保存 Cookie 凭证并退出
+./toutiaohao-server -login
+
 # 执行指定集成测试（发图文、存草稿逻辑验证）
 cd toutiaohao && go test -v -run TestPublishArticleManual
 ```

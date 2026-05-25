@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"strings"
+	"time"
 
 	"github.com/example/toutiaohao-mcp-server/browser"
+	"github.com/example/toutiaohao-mcp-server/configs"
 	"github.com/example/toutiaohao-mcp-server/cookies"
 	"github.com/example/toutiaohao-mcp-server/toutiaohao"
+	log "github.com/sirupsen/logrus"
 )
 
 // ToutiaoService 今日头条业务服务层
@@ -117,4 +122,61 @@ func (s *ToutiaoService) GenerateReport(ctx context.Context, reportType string) 
 	defer page.Close()
 
 	return toutiaohao.GenerateReport(ctx, reportType, page, s.cookieStore)
+}
+
+// QrCodeLogin 独立的交互式扫码登录方法，专为在不受MCP超时限制的CLI环境下进行登录捕获
+func (s *ToutiaoService) QrCodeLogin(ctx context.Context) error {
+	// 启动非无头浏览器
+	b := browser.NewBrowser(false)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	// 导航到头条登录页
+	log.Info("正在导航到今日头条登录页面，请准备在弹出的 Chrome 窗口中扫码...")
+	if err := page.Navigate(configs.LoginPage); err != nil {
+		return fmt.Errorf("导航到登录页失败: %w", err)
+	}
+	_ = page.WaitLoad()
+
+	// 轮询等待登录成功（最大5分钟）
+	timeout := 300 * time.Second
+	interval := 1 * time.Second
+	deadline := time.Now().Add(timeout)
+
+	log.Warn("=================================================================")
+	log.Warn("【安全提示】交互式扫码登录已启动！")
+	log.Warn("请在弹出的 Chrome 浏览器窗口中，及时使用手机微信/今日头条App扫码登录...")
+	log.Warn("登录成功后，程序会自动保存Cookie凭证并自动关闭浏览器。")
+	log.Warn("=================================================================")
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		currentInfo, err := page.Info()
+		if err == nil {
+			if toutiaohao.IsLoginSuccessURL(currentInfo.URL) || 
+			   (!strings.Contains(currentInfo.URL, "login") && !strings.Contains(currentInfo.URL, "auth") && strings.Contains(currentInfo.URL, "mp.toutiao.com")) {
+				log.Info("检测到扫码登录成功！")
+				
+				// 延迟一秒等待 Cookie 完全写入浏览器内存
+				time.Sleep(1 * time.Second)
+				
+				// 自动回写 Cookie 到本地
+				if err := toutiaohao.SaveBrowserCookies(page, s.cookieStore); err != nil {
+					return fmt.Errorf("自动保存新 Cookie 失败: %w", err)
+				}
+				log.Info("新 Cookie 已成功保存！登录凭证已持久化写入 cookies.json。")
+				return nil
+			}
+		}
+		time.Sleep(interval)
+	}
+
+	return fmt.Errorf("扫码登录超时（已等待 5 分钟），请重新运行并及时扫码")
 }
