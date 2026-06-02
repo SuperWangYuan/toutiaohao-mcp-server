@@ -83,6 +83,13 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 	router := a.page.HijackRequests()
 	_ = router.Add("*", "*", func(ctx *rod.Hijack) {
 		reqURL := ctx.Request.URL().String()
+		
+		// 【新增诊断】如果是上传图片的 API 请求，打印它的 Payload 大小和 Headers
+		if strings.Contains(reqURL, "upload") || strings.Contains(reqURL, "media") {
+			log.Infof("[HTTP Upload Hijack] URL: %s, Method: %s, Content-Length: %s, BodyLen: %d",
+				reqURL, ctx.Request.Method(), ctx.Request.Header("Content-Length"), len(ctx.Request.Body()))
+		}
+
 		if !strings.Contains(reqURL, "toutiao.com") || strings.Contains(reqURL, ".js") || strings.Contains(reqURL, ".css") || strings.Contains(reqURL, ".png") || strings.Contains(reqURL, ".jpg") || strings.Contains(reqURL, ".woff") {
 			ctx.ContinueRequest(&proto.FetchContinueRequest{})
 			return
@@ -708,6 +715,7 @@ func (a *ArticlePublishAction) insertImageAtCursor(imagePath string) error {
 	if err := fileInput.SetFiles([]string{absPath}); err != nil {
 		return fmt.Errorf("文件输入控件设置路径失败: %w", err)
 	}
+	time.Sleep(2 * time.Second) // 留足时间让 Chrome 异步载入物理图片文件
 	_, _ = fileInput.Eval(`() => {
 		this.dispatchEvent(new Event('input', { bubbles: true }));
 		this.dispatchEvent(new Event('change', { bubbles: true }));
@@ -994,6 +1002,7 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 				this.style.zIndex = '99999';
 			}`)
 			if errInject := fileInputDirect.SetFiles([]string{localPath}); errInject == nil {
+				time.Sleep(2 * time.Second) // 留足时间让 Chrome 异步载入物理图片文件
 				_, _ = fileInputDirect.Eval(`() => {
 					this.dispatchEvent(new Event('input', { bubbles: true }));
 					this.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1094,6 +1103,7 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			if err := fileInput.SetFiles([]string{localPath}); err != nil {
 				return fmt.Errorf("failed to set file path for image %d: %w", i+1, err)
 			}
+			time.Sleep(2 * time.Second) // 留足时间让 Chrome 异步载入物理图片文件
 			_, _ = fileInput.Eval(`() => {
 				this.dispatchEvent(new Event('input', { bubbles: true }));
 				this.dispatchEvent(new Event('change', { bubbles: true }));

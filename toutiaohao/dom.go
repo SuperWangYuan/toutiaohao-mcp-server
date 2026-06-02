@@ -843,6 +843,13 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 	}`)
 	time.Sleep(3000 * time.Millisecond) // 等待时间选择弹窗渲染出来
 
+	// 【诊断截图与 DOM Dump】
+	safeScreenshot(page, "./screenshot_after_radio_click.png")
+	if htmlVal, _ := page.Eval(`() => document.body.innerHTML`); htmlVal != nil {
+		_ = os.WriteFile("./dom_dump_after_radio_click.html", []byte(htmlVal.Value.Str()), 0644)
+		log.Warn("已保存勾选定时发布后的瞬时 DOM Dump 至 ./dom_dump_after_radio_click.html")
+	}
+
 	// 2. 检查并操作定时发布弹窗（byte-select 新版结构）
 	modalEl, errModal := page.Timeout(2 * time.Second).Element(`[class*='timing-picker'], .common-timing-picker, .byte-modal`)
 	if errModal == nil && modalEl != nil {
