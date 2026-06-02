@@ -1129,5 +1129,36 @@ func safeScreenshot(page *rod.Page, path string) {
 	_ = page.MustScreenshot(path)
 }
 
+// ensureSettingsExpanded 确保页面底部的“发文设置”抽屉处于展开状态。
+// 它会根据内部特征元素的可见性智能决策是否需要点击开关，防止已展开的状态被反向折叠收起。
+func ensureSettingsExpanded(page *rod.Page) {
+	log.Info("正在检查“发文设置”抽屉展开状态...")
+	_, _ = page.Timeout(3*time.Second).Eval(`() => {
+		// 1. 检测“单图”、“三图”或“投放广告”等专属折叠元素是否已可见
+		let expandedMarker = Array.from(document.querySelectorAll('span, label, div')).find(el => {
+			let text = el.textContent ? el.textContent.trim() : '';
+			return (text === '单图' || text === '三图' || text === '投放广告') && el.offsetWidth > 0;
+		});
+		if (expandedMarker) {
+			return true; // 已展开，无需点击
+		}
+
+		// 2. 若不可见，寻找“发文设置”触发标签并执行点击展开
+		let settingsTrigger = Array.from(document.querySelectorAll('*')).find(el => {
+			let text = el.textContent ? el.textContent.trim() : '';
+			return (text === '发文设置' || text.includes('发文设置')) && 
+			       (text.includes('∨') || text.includes('down') || !text.includes('^')) &&
+			       el.children.length <= 1 && 
+			       el.offsetWidth > 0;
+		});
+		if (settingsTrigger) {
+			settingsTrigger.click();
+			return false; // 触发了点击
+		}
+		return false;
+	}`)
+	time.Sleep(1200 * time.Millisecond) // 等待展开动画播放完毕
+}
+
 
 

@@ -928,6 +928,10 @@ func (a *ArticlePublishAction) dismissObstacles() {
 
 func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover bool) error {
 	log.Infof("Uploading %d cover images...", len(coverPaths))
+	
+	// 确保展开“发文设置”以露出封面插槽
+	ensureSettingsExpanded(a.page)
+
 	var cleanups []func()
 	defer func() {
 		for _, cleanup := range cleanups {
@@ -1345,17 +1349,8 @@ func (a *ArticlePublishAction) checkCoverSlotHasImage(index int) (bool, error) {
 func (a *ArticlePublishAction) setCoverMode(mode string) error {
 	log.Infof("Attempting to select cover mode: %s", mode)
 	
-	// 1. 展开“发文设置”
-	_, _ = a.page.Timeout(3*time.Second).Eval(`() => {
-		let settingsTrigger = Array.from(document.querySelectorAll('*')).find(el => {
-			let text = el.textContent ? el.textContent.trim() : '';
-			return (text === '发文设置' || text === '发文设置 ∨' || text === '发文设置 ^') && el.children.length <= 1;
-		});
-		if (settingsTrigger) {
-			settingsTrigger.click();
-		}
-	}`)
-	time.Sleep(1 * time.Second)
+	// 1. 安全确保展开“发文设置”
+	ensureSettingsExpanded(a.page)
 
 	// 2. 清理已有标记和隐藏可能遮挡的元素
 	a.dismissObstacles()
