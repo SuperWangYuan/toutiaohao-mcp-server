@@ -81,6 +81,12 @@ const NetworkTrackerJS = `(() => {
 })()`
 
 func getLocalTempDir() string {
+	homeDir, _ := os.UserHomeDir()
+	if homeDir != "" {
+		tempDir := filepath.Join(homeDir, "Downloads", "toutiaohao_temp_uploads")
+		_ = os.MkdirAll(tempDir, 0755)
+		return tempDir
+	}
 	tempDir := "./temp_uploads"
 	_ = os.MkdirAll(tempDir, 0755)
 	return tempDir
@@ -806,10 +812,8 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 
 	// 1. 定位并点击“定时发布”单选标签/大按钮
 	scheduleRadioSelectors := []string{
-		`//button[contains(., '定时发布')]`,
-		`//button[span[contains(text(), '定时发布')]]`,
-		`//span[contains(text(), '定时发布')]`,
 		`//label[contains(., '定时发布')]`,
+		`//span[contains(text(), '定时发布') and not(ancestor::button)]`,
 		`//span[contains(text(), '定时')]/preceding-sibling::span/input[@type='radio']`,
 		`[class*='radio'] input[value='1']`, // 有时头条定时发布单选框 value 为 1
 	}
