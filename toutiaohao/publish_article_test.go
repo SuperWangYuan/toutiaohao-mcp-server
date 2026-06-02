@@ -74,3 +74,41 @@ func TestArticleValidation_WithAllOptional(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestShouldBypassHijackForImageUpload(t *testing.T) {
+	cases := []struct {
+		name        string
+		url         string
+		method      string
+		contentType string
+		want        bool
+	}{
+		{
+			name:   "spice image upload",
+			url:    "https://mp.toutiao.com/spice/image?upload_source=20020002&aid=1231&device_platform=web",
+			method: "POST",
+			want:   true,
+		},
+		{
+			name:        "multipart upload",
+			url:         "https://mp.toutiao.com/mp/agw/article/submit",
+			method:      "POST",
+			contentType: "multipart/form-data; boundary=abc",
+			want:        true,
+		},
+		{
+			name:   "star api stays hijacked",
+			url:    "https://mp.toutiao.com/mp/agw/media/get_user_base_info",
+			method: "GET",
+			want:   false,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldBypassHijack(tt.url, tt.method, tt.contentType); got != tt.want {
+				t.Fatalf("shouldBypassHijack() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

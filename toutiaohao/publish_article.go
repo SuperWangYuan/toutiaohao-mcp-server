@@ -19,6 +19,32 @@ import (
 
 var starNullRe = regexp.MustCompile(`"([^"]*star[^"]*)"\s*:\s*null`)
 
+func shouldBypassHijack(reqURL, method, contentType string) bool {
+	lowerURL := strings.ToLower(reqURL)
+	lowerContentType := strings.ToLower(contentType)
+	if !strings.Contains(lowerURL, "toutiao.com") {
+		return true
+	}
+	if strings.Contains(lowerURL, ".js") ||
+		strings.Contains(lowerURL, ".css") ||
+		strings.Contains(lowerURL, ".png") ||
+		strings.Contains(lowerURL, ".jpg") ||
+		strings.Contains(lowerURL, ".woff") {
+		return true
+	}
+
+	// 图片上传请求必须让 Chrome 原样发送。通过 ctx.LoadResponse 代理 multipart body
+	// 会破坏文件内容，导致头条后台只收到约 210 字节并提示“无效图片数据”。
+	if strings.Contains(lowerURL, "/spice/image") ||
+		strings.Contains(lowerURL, "upload_source=") ||
+		strings.Contains(lowerContentType, "multipart/form-data") ||
+		strings.Contains(lowerContentType, "application/octet-stream") {
+		return true
+	}
+
+	return false
+}
+
 // ArticleOptions 文章发布可选参数
 type ArticleOptions struct {
 	Images      []string    `json:"images,omitempty"`
@@ -90,7 +116,7 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 				reqURL, ctx.Request.Method(), ctx.Request.Header("Content-Length"), len(ctx.Request.Body()))
 		}
 
-		if !strings.Contains(reqURL, "toutiao.com") || strings.Contains(reqURL, ".js") || strings.Contains(reqURL, ".css") || strings.Contains(reqURL, ".png") || strings.Contains(reqURL, ".jpg") || strings.Contains(reqURL, ".woff") {
+		if shouldBypassHijack(reqURL, ctx.Request.Method(), ctx.Request.Header("Content-Type")) {
 			ctx.ContinueRequest(&proto.FetchContinueRequest{})
 			return
 		}
@@ -1993,7 +2019,7 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 	router := a.page.HijackRequests()
 	_ = router.Add("*", "*", func(ctx *rod.Hijack) {
 		reqURL := ctx.Request.URL().String()
-		if !strings.Contains(reqURL, "toutiao.com") || strings.Contains(reqURL, ".js") || strings.Contains(reqURL, ".css") || strings.Contains(reqURL, ".png") || strings.Contains(reqURL, ".jpg") || strings.Contains(reqURL, ".woff") {
+		if shouldBypassHijack(reqURL, ctx.Request.Method(), ctx.Request.Header("Content-Type")) {
 			ctx.ContinueRequest(&proto.FetchContinueRequest{})
 			return
 		}
