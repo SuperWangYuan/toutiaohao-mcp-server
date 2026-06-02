@@ -25,6 +25,10 @@ func (s *AppServer) apiHealth(c *gin.Context) {
 	})
 }
 
+func handleHealth(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 // respondSuccess 统一成功响应
 func respondSuccess(c *gin.Context, data interface{}) {
 	c.JSON(http.StatusOK, SuccessResponse{
@@ -240,7 +244,6 @@ func (s *AppServer) apiUpdateArticle(c *gin.Context) {
 	}
 	respondSuccess(c, res)
 }
-
 
 // apiGetAccountOverview 账户概览 API
 func (s *AppServer) apiGetAccountOverview(c *gin.Context) {

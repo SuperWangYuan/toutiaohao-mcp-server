@@ -13,7 +13,7 @@ func TestArticleValidation_EmptyTitle(t *testing.T) {
 }
 
 func TestArticleValidation_TitleTooLong(t *testing.T) {
-	title := make([]rune, 101)
+	title := make([]rune, 31)
 	for i := range title {
 		title[i] = '测'
 	}
@@ -24,7 +24,7 @@ func TestArticleValidation_TitleTooLong(t *testing.T) {
 }
 
 func TestArticleValidation_TitleAtLimit(t *testing.T) {
-	title := make([]rune, 100)
+	title := make([]rune, 30)
 	for i := range title {
 		title[i] = '测'
 	}

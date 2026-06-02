@@ -11,6 +11,7 @@ import (
 	_ "image/png"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,15 +82,131 @@ const NetworkTrackerJS = `(() => {
 })()`
 
 func getLocalTempDir() string {
-	homeDir, _ := os.UserHomeDir()
-	if homeDir != "" {
-		tempDir := filepath.Join(homeDir, "Downloads", "toutiaohao_temp_uploads")
-		_ = os.MkdirAll(tempDir, 0755)
-		return tempDir
-	}
-	tempDir := "./temp_uploads"
+	tempDir := filepath.Join(findProjectRoot(), ".tmp")
 	_ = os.MkdirAll(tempDir, 0755)
+	if abs, err := filepath.Abs(tempDir); err == nil {
+		return abs
+	}
 	return tempDir
+}
+
+func findProjectRoot() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	dir := wd
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return wd
+		}
+		dir = parent
+	}
+}
+
+func clickVisibleModalPrimaryButton(page *rod.Page, wantedTexts []string, description string) (bool, string, error) {
+	res, err := page.Eval(`(wantedTexts, description) => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' &&
+				style.visibility !== 'hidden' &&
+				style.opacity !== '0' &&
+				rect.width > 0 &&
+				rect.height > 0;
+		};
+		const disabled = (el) => {
+			const cls = String(el.className || '');
+			return el.disabled ||
+				el.getAttribute('disabled') !== null ||
+				el.getAttribute('aria-disabled') === 'true' ||
+				cls.includes('disabled') ||
+				cls.includes('is-disabled') ||
+				cls.includes('byte-btn-disabled') ||
+				cls.includes('semi-button-disabled');
+		};
+		const modalSelectors = [
+			'.common-timing-picker',
+			'[class*="timing-picker"]',
+			'.semi-modal',
+			'.byte-modal',
+			'[role="dialog"]',
+			'[class*="modal"]',
+			'[class*="dialog"]'
+		];
+		const modals = Array.from(document.querySelectorAll(modalSelectors.join(',')))
+			.filter(el => visible(el) && (el.textContent || '').trim().length > 0);
+		const debug = [];
+		for (const modal of modals) {
+			const modalText = (modal.textContent || '').trim();
+			const actionControls = Array.from(modal.querySelectorAll('button, [role="button"], a, .byte-btn, .semi-button, [class*="btn"], [class*="button"]'));
+			let controls = actionControls
+				.filter(el => el !== modal && visible(el) && !disabled(el))
+				.filter(el => {
+					const text = (el.textContent || '').trim();
+					if (!text) return false;
+					if (text === modalText) return false;
+					if (text === '取消' || text === '关闭' || text === '返回') return false;
+					return true;
+				});
+			if (controls.length === 0) {
+				controls = Array.from(modal.querySelectorAll('div, span'))
+					.filter(el => el !== modal && visible(el) && !disabled(el))
+					.filter(el => {
+						const text = (el.textContent || '').trim();
+						if (!text || text === modalText) return false;
+						if (text === '取消' || text === '关闭' || text === '返回') return false;
+						return !Array.from(el.children || []).some(child => {
+							const childText = (child.textContent || '').trim();
+							return childText && text.includes(childText);
+						});
+					});
+			}
+			debug.push({
+				modal: (modal.className || modal.getAttribute('role') || modal.tagName || '').toString(),
+				buttons: controls.map(el => (el.textContent || '').trim()).filter(Boolean).slice(0, 8)
+			});
+
+			let btn = controls.find(el => {
+				const text = (el.textContent || '').trim();
+				return wantedTexts.some(w => text === w);
+			});
+			if (!btn) {
+				btn = controls.find(el => {
+					const text = (el.textContent || '').trim();
+					return wantedTexts.some(w => text.includes(w));
+				});
+			}
+			if (!btn) {
+				btn = controls.find(el => {
+					const cls = String(el.className || '');
+					return cls.includes('primary') || cls.includes('confirm');
+				});
+			}
+			if (!btn && controls.length > 0) {
+				btn = controls[controls.length - 1];
+			}
+			if (btn) {
+				const text = (btn.textContent || '').trim();
+				btn.click();
+				return JSON.stringify({ clicked: true, text, description, debug });
+			}
+		}
+		return JSON.stringify({ clicked: false, description, debug });
+	}`, wantedTexts, description)
+	if err != nil {
+		return false, "", err
+	}
+	if res == nil {
+		return false, "", nil
+	}
+	result := res.Value.Str()
+	return strings.Contains(result, `"clicked":true`), result, nil
 }
 
 // sanitizeImageToTemp 将给定的图片文件（PNG/JPEG/GIF）进行解码并使用 Go 官方的纯净编码器重新写为标准的 JPEG/PNG 临时文件。
@@ -141,7 +258,7 @@ func sanitizeImageToTemp(srcPath string) (string, func(), error) {
 	currW := bounds.Dx()
 	currH := bounds.Dy()
 	whiteBgImg := image.NewRGBA(image.Rect(0, 0, currW, currH))
-	
+
 	// 填充白色
 	whiteColor := color.RGBA{R: 255, G: 255, B: 255, A: 255}
 	for y := 0; y < currH; y++ {
@@ -149,7 +266,7 @@ func sanitizeImageToTemp(srcPath string) (string, func(), error) {
 			whiteBgImg.Set(x, y, whiteColor)
 		}
 	}
-	
+
 	// 将原图绘制在白色背景之上（如果带透明通道会自动融合，不带透明通道则原样覆盖）
 	draw.Draw(whiteBgImg, whiteBgImg.Bounds(), img, bounds.Min, draw.Over)
 	img = whiteBgImg
@@ -185,7 +302,18 @@ func sanitizeImageToTemp(srcPath string) (string, func(), error) {
 func downloadImageToTemp(imgURL string) (string, func(), error) {
 	// 1. 如果是本地路径，转换为绝对路径并进行净化
 	if !strings.HasPrefix(imgURL, "http://") && !strings.HasPrefix(imgURL, "https://") {
-		absPath, err := filepath.Abs(imgURL)
+		localPath := imgURL
+		if strings.HasPrefix(imgURL, "file://") {
+			u, err := url.Parse(imgURL)
+			if err != nil {
+				return "", func() {}, fmt.Errorf("解析 file URL 失败: %w", err)
+			}
+			localPath = u.Path
+			if localPath == "" {
+				return "", func() {}, fmt.Errorf("file URL 缺少本地路径: %s", imgURL)
+			}
+		}
+		absPath, err := filepath.Abs(localPath)
 		if err != nil {
 			log.Warnf("获取本地图片绝对路径失败: %s, err: %v", imgURL, err)
 			return imgURL, func() {}, nil
@@ -275,7 +403,6 @@ func downloadImageToTemp(imgURL string) (string, func(), error) {
 	}
 	return tempPath, cleanup, nil
 }
-
 
 func findElement(page *rod.Page, timeout time.Duration, selectors []string) (*rod.Element, string, error) {
 	var lastErr error
@@ -374,7 +501,7 @@ func inputText(el *rod.Element, text string) error {
 			}`
 
 			_, err := el.Eval(`val => {
-				const setter = ` + reactSetJSTemplate + `;
+				const setter = `+reactSetJSTemplate+`;
 				setter(this, val);
 			}`, text)
 			return err
@@ -768,9 +895,9 @@ func parsePublishTime(publishTime interface{}) (string, error) {
 	// 打印警告以辅助调试，但不强行中断发文
 	now := time.Now()
 	minTime := now.Add(2 * time.Hour)
-	maxTime := now.Add(30 * 24 * time.Hour)
+	maxTime := now.Add(7 * 24 * time.Hour)
 	if targetTime.Before(minTime) || targetTime.After(maxTime) {
-		log.Warnf("【时间提示】定时发布时间 %s 可能不符合头条平台要求。头条通常要求在“当前时间+2小时 到 30天内”之间。当前时间：%s", 
+		log.Warnf("【时间提示】定时发布时间 %s 可能不符合头条平台要求。当前页面提示通常要求在“当前时间+2小时 到 7天内”之间。当前时间：%s",
 			targetTime.Format("2006-01-02 15:04"), now.Format("2006-01-02 15:04"))
 	}
 
@@ -790,7 +917,7 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 	log.Infof("检测到定时发布选项，目标时间: %s", timeStr)
 
 	// 确保展开“发文设置”以露出定时发布选项
-	_, _ = page.Timeout(3*time.Second).Eval(`() => {
+	_, _ = page.Timeout(3 * time.Second).Eval(`() => {
 		// 先看当前页面上能不能找到含有“定时发布”或“立即发布”相关的可见元素。如果能找到，说明“发文设置”可能已经是展开的，无需再次点击。
 		let timeFound = Array.from(document.querySelectorAll('span, label, p, div')).find(el => {
 			let text = el.textContent ? el.textContent.trim() : '';
@@ -851,11 +978,24 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 	}
 
 	// 2. 检查并操作定时发布弹窗（byte-select 新版结构）
-	modalEl, errModal := page.Timeout(2 * time.Second).Element(`[class*='timing-picker'], .common-timing-picker, .byte-modal`)
+	_, _ = page.Eval(`() => {
+		document.querySelectorAll('.mcp-timing-modal').forEach(el => el.classList.remove('mcp-timing-modal'));
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const modal = Array.from(document.querySelectorAll('[class*="timing-picker"], .common-timing-picker, .byte-modal, [role="dialog"]')).find(el => {
+			const text = (el.textContent || '').trim();
+			return visible(el) && (text.includes('定时发布') || text.includes('预览并定时发布'));
+		});
+		if (modal) modal.classList.add('mcp-timing-modal');
+	}`)
+	modalEl, errModal := page.Timeout(2 * time.Second).Element(`.mcp-timing-modal`)
 	if errModal == nil && modalEl != nil {
 		log.Info("检测到新版定时发布 Modal 弹窗存在，开始进行 Select 下拉框交互选择...")
 
-		
 		t, errParse := time.ParseInLocation("2006-01-02 15:04", timeStr, time.Local)
 		if errParse != nil {
 			log.Warnf("【时间】解析定时时间 %s 失败: %v，将强行隐藏弹窗进行优雅降级...", timeStr, errParse)
@@ -878,7 +1018,7 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 		if errDaySel != nil {
 			daySelect, _ = modalEl.ElementX(`//div[contains(@class, 'byte-select') and (contains(., '月') or contains(., '日'))]`)
 		}
-		
+
 		if daySelect != nil {
 			log.Infof("找到日期下拉框，点击展开。")
 			_ = daySelect.Click(proto.InputMouseButtonLeft, 1)
@@ -989,51 +1129,24 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 
 		// (3) 点击确定
 		log.Info("确认定时选择...")
-		var confirmed bool
-		modalConfirmSelectors := []string{
-			`button:contains('预览并定时发布')`,
-			`button:contains('定时发布')`,
-			`.byte-modal-footer button`,
-		}
-		for _, sel := range modalConfirmSelectors {
-			var elConfirm *rod.Element
-			var errEl error
-			if strings.Contains(sel, ":contains") {
-				text := strings.TrimSuffix(strings.TrimPrefix(sel, `button:contains('`), `')`)
-				elConfirm, errEl = modalEl.ElementX(fmt.Sprintf(`//button[contains(., '%s')]`, text))
-			} else {
-				elConfirm, errEl = modalEl.Element(sel)
-			}
-			
-			if errEl == nil && elConfirm != nil {
-				_ = elConfirm.Click(proto.InputMouseButtonLeft, 1)
-				confirmed = true
-				break
-			}
-		}
-
-		if !confirmed {
-			clickedConf, errConf := page.Eval(`() => {
-				let btn = Array.from(document.querySelectorAll('.byte-modal-footer button, .byte-modal button, button')).find(b => {
-					let text = b.textContent ? b.textContent.trim() : '';
-					return (text.includes('定时发布') || text.includes('确定') || text.includes('确认') || text.includes('提交')) && b.offsetWidth > 0;
-				});
-				if (btn) {
-					btn.click();
-					return true;
-				}
-				return false;
-			}`)
-			if errConf == nil && clickedConf != nil && clickedConf.Value.Bool() {
-				confirmed = true
-			}
+		confirmed, confirmInfo, errConfirm := clickVisibleModalPrimaryButton(page, []string{"预览并定时发布", "定时发布", "确定", "确认", "提交"}, "timing publish modal")
+		if errConfirm != nil {
+			log.Warnf("点击定时发布 Modal 主按钮失败: %v", errConfirm)
+		} else {
+			log.Infof("定时发布 Modal 主按钮点击结果: %s", confirmInfo)
 		}
 
 		if confirmed {
 			time.Sleep(1500 * time.Millisecond)
 			closed, _ := page.Eval(`() => {
-				let modal = document.querySelector('[class*="timing-picker"], .common-timing-picker, .byte-modal');
-				return !modal || modal.offsetWidth === 0;
+				const visible = (el) => {
+					if (!el) return false;
+					const style = window.getComputedStyle(el);
+					const rect = el.getBoundingClientRect();
+					return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+				};
+				let modal = document.querySelector('.mcp-timing-modal, [class*="timing-picker"], .common-timing-picker');
+				return !visible(modal);
 			}`)
 			if closed != nil && closed.Value.Bool() {
 				log.Info("新版定时发布 Modal 成功设置并关闭")
@@ -1041,15 +1154,7 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 			}
 		}
 
-		// 优雅降级：直接隐藏遮挡弹窗，供底部发文大按钮展示
-		log.Warn("定时发布 Modal 未正常关闭，强行隐藏以防物理遮挡...")
-		_, _ = page.Eval(`() => {
-			document.querySelectorAll('[class*="timing-picker"], .common-timing-picker, .byte-modal, .byte-modal-wrapper, .semi-modal-wrapper, [class*="modal-wrapper"]').forEach(el => {
-				el.style.display = 'none';
-				el.style.pointerEvents = 'none';
-			});
-		}`)
-		time.Sleep(500 * time.Millisecond)
+		log.Warn("定时发布 Modal 未正常关闭，将按项目约定降级为普通发布，但不会强行隐藏真实弹窗")
 		return nil
 	}
 
@@ -1133,7 +1238,7 @@ func safeScreenshot(page *rod.Page, path string) {
 // 它会根据内部特征元素的可见性智能决策是否需要点击开关，防止已展开的状态被反向折叠收起。
 func ensureSettingsExpanded(page *rod.Page) {
 	log.Info("正在检查“发文设置”抽屉展开状态...")
-	_, _ = page.Timeout(3*time.Second).Eval(`() => {
+	_, _ = page.Timeout(3 * time.Second).Eval(`() => {
 		// 1. 检测“单图”、“三图”或“投放广告”等专属折叠元素是否已可见
 		let expandedMarker = Array.from(document.querySelectorAll('span, label, div')).find(el => {
 			let text = el.textContent ? el.textContent.trim() : '';
@@ -1159,6 +1264,3 @@ func ensureSettingsExpanded(page *rod.Page) {
 	}`)
 	time.Sleep(1200 * time.Millisecond) // 等待展开动画播放完毕
 }
-
-
-

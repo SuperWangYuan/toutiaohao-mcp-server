@@ -219,6 +219,98 @@ func TestPublishArticleManual(t *testing.T) {
 	log.Info("测试完成")
 }
 
+func TestPublishArticleBodyImageManual(t *testing.T) {
+	testdataDir := "./testdata_body_image"
+	testImagePath := filepath.Join(testdataDir, "test_body_image.png")
+	if err := os.MkdirAll(testdataDir, 0755); err != nil {
+		t.Fatalf("创建临时测试目录失败: %v", err)
+	}
+
+	copied := false
+	for _, pImg := range []string{"../scratch_insert_result.png", "../scratch_save_draft_result.png", "../publish_after_first_click.png"} {
+		if input, errRead := os.ReadFile(pImg); errRead == nil {
+			if errWrite := os.WriteFile(testImagePath, input, 0644); errWrite == nil {
+				copied = true
+				log.Infof("成功从 %s 复制真实图片用于正文插图测试", pImg)
+				break
+			}
+		}
+	}
+	if !copied {
+		dummyPNG := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82")
+		if err := os.WriteFile(testImagePath, dummyPNG, 0644); err != nil {
+			t.Fatalf("创建临时测试图片失败: %v", err)
+		}
+	}
+
+	var articleID string
+	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
+	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
+
+	cookiePath := "../cookies.json"
+	store := cookies.NewFileCookieStore(cookiePath)
+	b := browser.NewBrowser(true)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+	defer func() {
+		_ = os.RemoveAll(testdataDir)
+		if articleID != "" {
+			log.Infof("测试结束，正在自动清理正文插图临时草稿 %s ...", articleID)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if delErr := DeleteDraftByBrowser(ctx, page, articleID); delErr != nil {
+				log.Warnf("清理正文插图临时草稿失败: %v", delErr)
+			}
+		}
+	}()
+
+	a := NewArticlePublishAction(page, store)
+	if err := page.Navigate("https://mp.toutiao.com/profile_v4/graphic/publish"); err != nil {
+		t.Fatalf("导航失败: %v", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		t.Fatalf("等待加载失败: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	if err := EnsureLogin(page, store); err != nil {
+		t.Fatalf("登录校验/扫码失败: %v", err)
+	}
+	if err := page.Navigate("https://mp.toutiao.com/profile_v4/graphic/publish"); err != nil {
+		t.Fatalf("重新导航失败: %v", err)
+	}
+	if err := page.WaitLoad(); err != nil {
+		t.Fatalf("重新导航等待加载失败: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	uniqueTitle := fmt.Sprintf("正文插图测试%d", time.Now().Unix()%100000)
+	if err := a.inputTitle(uniqueTitle); err != nil {
+		t.Fatalf("输入标题失败: %v", err)
+	}
+
+	content := fmt.Sprintf("正文插图上传测试开始。\n\n![正文测试图](%s)\n\n正文插图上传测试结束。", testImagePath)
+	if err := a.inputContent(content, nil); err != nil {
+		t.Fatalf("输入正文图片失败: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	_ = page.MustScreenshot("../scratch_body_image_result.png")
+	ctxList, cancelList := context.WithTimeout(context.Background(), 1*time.Minute)
+	resp, errList := GetArticleList(ctxList, &ArticleListParams{Status: "all", Page: 1, PageSize: 5}, store)
+	cancelList()
+	if errList == nil && resp != nil {
+		for _, art := range resp.Articles {
+			if art.Title == uniqueTitle {
+				articleID = art.ArticleID
+				break
+			}
+		}
+	}
+}
+
 func TestPublishMicroManual(t *testing.T) {
 	// 动态创建测试插图目录与 dummy 临时图片文件
 	testdataDir := "./testdata_micro"
@@ -425,4 +517,3 @@ func TestUpdateArticleManual(t *testing.T) {
 
 	log.Info("修改/更新文章集成测试（全草稿沙盒）圆满成功！")
 }
-

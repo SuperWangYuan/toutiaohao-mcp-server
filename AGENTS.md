@@ -27,8 +27,11 @@ go build -o toutiaohao-server .
 # 启动交互式扫码登录以持久化保存 Cookie 凭证并退出
 ./toutiaohao-server -login
 
-# 执行指定集成测试（发图文、存草稿逻辑验证）
+# 执行指定集成测试（封面上传、定时发布、存草稿逻辑验证）
 cd toutiaohao && go test -v -run TestPublishArticleManual
+
+# 执行正文插图上传专项集成测试
+cd toutiaohao && go test -v -run TestPublishArticleBodyImageManual
 ```
 
 ### 凭证配置
@@ -126,9 +129,11 @@ AI 助手在此项目中编写代码或执行自动化修改时，必须严格�
     - 所有下载与被图片净化功能重构的临时图片文件，**必须**生成在当前项目工作区根目录下的隐藏目录 `./.tmp` 内，严禁使用系统的 `/tmp` 或 `/var/folders` 默认临时目录。
     - 这可防止由于无头/隔离环境下 Chrome 浏览器因 macOS 沙盒隔离权限限制无法跨卷/跨目录访问 `/var` 导致上传 0 字节损坏空文件（触发头条后台“无效图片数据”拦截）的缺陷。
 
-14. **隐藏 File Input 物理可见化加固（硬性发文规则）**：
-    - 在向被网页隐藏（例如 `display: none`）的 file input 塞入路径前，必须先通过 JS 临时将其样式修改为在页面物理可见的正常 DOM 元素，以规避 Chrome 在向不可见元素载入数据时的静默拦截。
-    - 在 `SetFiles` 写入后，必须同时派发 `input` 与 `change` 事件以深层同步 React 等前端受控状态，最后再将 input 元素恢复原始隐藏样式。
+14. **图片上传必须走 Chrome 文件选择器（硬性发文规则）**：
+    - 正文插图与封面图上传严禁再直接对隐藏 `input[type=file]` 调用 `SetFiles`。头条图片上传组件会生成本地 blob 预览，但服务端可能只收到约 210 字节的空/损坏 body，并报“无效图片数据”。
+    - 必须使用 go-rod `page.HandleFileDialog()` 先拦截 Chrome 原生文件选择器，再物理点击当前可见上传面板里的“本地上传”按钮，最后由文件选择器回调传入 Go 层动态转换后的绝对路径。
+    - 上传触发器必须限定在当前可见的 `.upload-image-panel` / `.byte-modal` / `.semi-modal` / `[role="dialog"]` 等上传弹窗中，严禁抓取页面底层或历史遗留的全局 file input。
+    - 图片上传确认弹窗若未正常关闭，不允许“优雅降级继续发文”；必须保存错误截图并返回明确错误，防止正文或封面实际缺图却继续提交。
 
 ---
 
@@ -153,7 +158,17 @@ AI 助手在修改项目后需进行完整的自我闭环验证，流程如下�
    - 浏览器自动运行输入标题、自动上传测试图片、模拟排版、自动勾选虚构演绎声明并保存草稿。
    - 测试结束后自动输出 `PASS`，且 `testdata/` 目录被物理清除干净。
 
-3. **修改文章自动化流验证 (安全沙盒)**：
+3. **正文插图上传专项验证**：
+   在大包 `toutiaohao/` 目录下执行正文插图上传闭环测试：
+   ```bash
+   go test -v -run TestPublishArticleBodyImageManual
+   ```
+   **预期验证结果**：
+   - 控制台输出 `Chrome 文件选择器已接收文件`。
+   - 正文图片确认弹窗成功关闭，不出现“无效图片数据”。
+   - 测试结束后输出 `PASS`，临时草稿会在 `defer` 中尝试清理。
+
+4. **修改文章自动化流验证 (安全沙盒)**：
    在 `toutiaohao/` 目录下执行修改文章全链路闭环测试：
    ```bash
    go test -v -run TestUpdateArticleManual
