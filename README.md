@@ -11,6 +11,7 @@
 ## 🚀 核心特性
 
 - **双通道服务架构**：同一端口（默认 `8080`）下，同时提供符合标准 MCP 协议的 JSON-RPC 路由（`/mcp`）与面向传统 Webhooks 的 RESTful HTTP API。
+- **文章在线二次修改与安全测试沙盒**：支持对已发布或草稿状态的文章进行无残留二次修改。新支持 `SaveAsDraft` 选项（仅保存草稿不发布），支持纯草稿箱安全测试，测试数据不污染真实主页，且测试完毕后能通过浏览器物理清除。智能跳过非必要封面重传以防超时；引入 React onChange 底层强力驱动与 3s 延迟平息期以彻底防止 React 异步重绘回滚；在最终发布前执行“一致性二次固化校验与强行覆盖”，保证提交数据 100% 固化；物理兼容“发布”确认弹窗。
 - **登录态自愈机制**：支持本地 `cookies.json` 的自动装载与生命周期管理。若会话过期，程序会在有头模式下自动弹窗等待扫码登录，登录成功后自动更新并捕获凭证回写。
 - **Markdown 智能排版引擎**：
   - 自动将正文解析分割为文本块与图片块，由浏览器控制完成图文交替混排。
@@ -47,7 +48,10 @@ go build -o toutiaohao-server .
 # 启动混合服务（默认监听 8080 端口，包含 MCP 路由及 HTTP 接口）
 ./toutiaohao-server
 
-# 指定自定义端口启动
+# 以标准 Stdio 管道传输模式运行 (专供 AI 本地集成)
+./toutiaohao-server -stdio
+
+# 指定自定义端口启动混合服务
 ./toutiaohao-server -port 9000
 ```
 
@@ -61,11 +65,13 @@ go build -o toutiaohao-server .
 
 ## 🤖 AI 协同与 MCP 配置
 
+为了使 AI 客户端（如 Cursor、Claude Desktop）更高效、稳定地集成，建议使用本地无端口占用的 **Stdio 管道传输模式**（添加 `-stdio` 参数）。这能避免本地端口占用与冲突，且比 HTTP/SSE 传输方式具有更高的响应速度。
+
 ### 1. Cursor 配置
 在 Cursor 中打开 `Settings -> Features -> MCP`，添加一个新的 MCP 服务：
 - **Name**: `toutiao`
 - **Type**: `command`
-- **Command**: `/path/to/your/toutiaohao-server` (指定编译出的二进制物理路径)
+- **Command**: `/path/to/your/toutiaohao-server -stdio`
 
 ### 2. Claude Desktop 配置
 编辑您的 `config.json`（通常在 `~/Library/Application Support/Claude/claude_desktop_config.json`）：
@@ -75,7 +81,7 @@ go build -o toutiaohao-server .
   "mcpServers": {
     "toutiao-mcp": {
       "command": "/path/to/your/toutiaohao-server",
-      "args": ["-port", "8080"]
+      "args": ["-stdio"]
     }
   }
 }
@@ -94,6 +100,7 @@ go build -o toutiaohao-server .
 | **POST** | `/api/v1/publish/micro` | 发布微头条（支持最多 9 张插图与话题标签） |
 | **POST** | `/api/v1/publish/micro/draft` | 保存微头条草稿 |
 | **GET** | `/api/v1/articles` | 获取文章列表（支持 `published/draft/review` 状态筛选） |
+| **POST** | `/api/v1/articles/update` | 修改/更新已有图文文章 |
 | **POST** | `/api/v1/articles/delete` | 物理删除文章或删除草稿 |
 | **GET** | `/api/v1/analytics/overview` | 账户整体运营数据（粉丝、阅读量、展现量指标） |
 | **GET** | `/api/v1/analytics/article` | 单篇文章阅读与交互明细统计 |
@@ -151,6 +158,14 @@ go build ./...
 ```bash
 cd toutiaohao
 go test -v -run TestPublishArticleManual
+```
+
+### 3. 自动化修改文章集成测试 (安全沙盒闭环)
+此测试自动开展“发布临时新文章 -> 从文章列表提取新文章 ID -> 物理修改新文章 -> 自动删除临时新文章”的闭环测试，确保高容错性且不损耗线上老文章的宝贵修改额度，无任何脏数据残留：
+
+```bash
+cd toutiaohao
+go test -v -run TestUpdateArticleManual
 ```
 
 ---

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	log "github.com/sirupsen/logrus"
@@ -47,6 +48,7 @@ type PublishArticleArgs struct {
 	Original    bool        `json:"original,omitempty" jsonschema_description:"是否声明原创"`
 	Fiction     bool        `json:"fiction,omitempty" jsonschema_description:"是否声明作品取材网络、虚构演绎以防范版权/姓名权争议"`
 	PublishTime interface{} `json:"publish_time,omitempty" jsonschema_description:"定时发布时间（支持 Unix 时间戳或 YYYY-MM-DD HH:mm 格式的字符串）"`
+	SaveAsDraft bool        `json:"save_as_draft,omitempty" jsonschema_description:"是否仅保存为草稿而不直接发布"`
 }
 
 // UpdateArticleArgs 文章修改参数
@@ -59,6 +61,7 @@ type UpdateArticleArgs struct {
 	Original    bool        `json:"original,omitempty" jsonschema_description:"是否声明原创"`
 	Fiction     bool        `json:"fiction,omitempty" jsonschema_description:"是否声明作品取材网络、虚构演绎以防范版权/姓名权争议"`
 	PublishTime interface{} `json:"publish_time,omitempty" jsonschema_description:"定时发布时间（支持 Unix 时间戳或 YYYY-MM-DD HH:mm 格式的字符串）"`
+	SaveAsDraft bool        `json:"save_as_draft,omitempty" jsonschema_description:"是否仅保存为草稿而不直接发布"`
 }
 
 // GetArticleListArgs 文章列表参数
@@ -208,15 +211,16 @@ func registerArticleTools(server *mcp.Server, appServer *AppServer) {
 	}, withPanicRecovery("publish_article",
 		func(ctx context.Context, req *mcp.CallToolRequest, args PublishArticleArgs) (*mcp.CallToolResult, any, error) {
 			argsMap := map[string]interface{}{
-				"title":        args.Title,
-				"content":      args.Content,
-				"images":       args.Images,
-				"tags":         args.Tags,
-				"category":     args.Category,
-				"cover_image":  args.CoverImage,
-				"original":     args.Original,
-				"fiction":      args.Fiction,
-				"publish_time": args.PublishTime,
+				"title":         args.Title,
+				"content":       args.Content,
+				"images":        args.Images,
+				"tags":          args.Tags,
+				"category":      args.Category,
+				"cover_image":   args.CoverImage,
+				"original":      args.Original,
+				"fiction":       args.Fiction,
+				"publish_time":  args.PublishTime,
+				"save_as_draft": args.SaveAsDraft,
 			}
 			result := appServer.handlePublishArticle(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
@@ -231,14 +235,15 @@ func registerArticleTools(server *mcp.Server, appServer *AppServer) {
 	}, withPanicRecovery("update_article",
 		func(ctx context.Context, req *mcp.CallToolRequest, args UpdateArticleArgs) (*mcp.CallToolResult, any, error) {
 			argsMap := map[string]interface{}{
-				"article_id":   args.ArticleID,
-				"title":        args.Title,
-				"content":      args.Content,
-				"images":       args.Images,
-				"cover_image":  args.CoverImage,
-				"original":     args.Original,
-				"fiction":      args.Fiction,
-				"publish_time": args.PublishTime,
+				"article_id":    args.ArticleID,
+				"title":         args.Title,
+				"content":       args.Content,
+				"images":        args.Images,
+				"cover_image":   args.CoverImage,
+				"original":      args.Original,
+				"fiction":       args.Fiction,
+				"publish_time":  args.PublishTime,
+				"save_as_draft": args.SaveAsDraft,
 			}
 			result := appServer.handleUpdateArticle(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
@@ -328,11 +333,43 @@ func registerAnalyticsTools(server *mcp.Server, appServer *AppServer) {
 func boolPtr(b bool) *bool { return &b }
 
 // NewMCPHTTPHandler 创建 MCP HTTP Handler
-func NewMCPHTTPHandler(server *mcp.Server) http.Handler {
-	return mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
-		return server
+func NewMCPHTTPHandler(appServer *AppServer) http.Handler {
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+		return InitMCPServer(appServer)
 	}, &mcp.StreamableHTTPOptions{
 		JSONResponse: true,
+	})
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 自动从 Query 参数中提取 session_id，兼容一些只在 Query 中传递 session_id 的客户端
+		if r.Header.Get("Mcp-Session-Id") == "" {
+			q := r.URL.Query()
+			sessionID := q.Get("session_id")
+			if sessionID == "" {
+				sessionID = q.Get("sessionId")
+			}
+			if sessionID == "" {
+				sessionID = q.Get("sessionid")
+			}
+			if sessionID == "" {
+				sessionID = q.Get("mcp_session_id")
+			}
+			if sessionID != "" {
+				r.Header.Set("Mcp-Session-Id", sessionID)
+			}
+		}
+
+		// 强制设置或补充 Accept 头以绕过官方 SDK 的严格校验（要求必须同时包含 application/json 和 text/event-stream）
+		accept := r.Header.Get("Accept")
+		if !strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream") {
+			if accept == "" || accept == "*/*" {
+				r.Header.Set("Accept", "application/json, text/event-stream")
+			} else {
+				r.Header.Set("Accept", accept+", application/json, text/event-stream")
+			}
+		}
+
+		mcpHandler.ServeHTTP(w, r)
 	})
 }
 

@@ -51,6 +51,9 @@ var ArticleContentSelectors = []string{
 var ArticleCoverAddSelectors = []string{
 	ArticleCoverAdd,
 	`[class*='cover'][class*='add']`,
+	`.cover-upload-area`,
+	`[class*='cover'] [class*='upload']`,
+	`div.cover-container`,
 	`//div[contains(., '封面') and (contains(@class, 'add') or contains(@class, 'cover'))]`,
 	`//button[contains(., '封面')]`,
 }

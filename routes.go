@@ -1,21 +1,18 @@
 package main
 
 import (
-	"net/http"
-
 	"github.com/gin-gonic/gin"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // setupRoutes 配置所有路由
-func setupRoutes(router *gin.Engine, mcpServer *mcp.Server, appServer *AppServer) {
+func setupRoutes(router *gin.Engine, appServer *AppServer) {
 	// MCP 端点
-	mcpHandler := NewMCPHTTPHandler(mcpServer)
+	mcpHandler := NewMCPHTTPHandler(appServer)
 	router.Any("/mcp", gin.WrapH(mcpHandler))
-	router.Any("/mcp/*path", gin.WrapH(http.StripPrefix("/mcp", mcpHandler)))
+	router.Any("/mcp/*path", gin.WrapH(mcpHandler))
 
 	// 健康检查
-	router.GET("/health", handleHealth)
+	router.GET("/health", appServer.apiHealth)
 
 	// REST API
 	api := router.Group("/api/v1")
@@ -37,6 +34,9 @@ func setupRoutes(router *gin.Engine, mcpServer *mcp.Server, appServer *AppServer
 
 		// 数据分析
 		api.GET("/analytics/overview", appServer.apiGetAccountOverview)
+		api.POST("/analytics/overview", appServer.apiGetAccountOverview) // 兼容 POST
+		api.GET("/account/overview", appServer.apiGetAccountOverview)    // 兼容 /account/overview
+		api.POST("/account/overview", appServer.apiGetAccountOverview)   // 兼容 /account/overview POST
 		api.GET("/analytics/article", appServer.apiGetArticleStats)
 		api.GET("/analytics/report", appServer.apiGenerateReport)
 	}

@@ -41,7 +41,7 @@ func TestHTTPAPIRoutes(t *testing.T) {
 	server := NewAppServer(service)
 
 	server.router = gin.New()
-	setupRoutes(server.router, server.mcpServer, server)
+	setupRoutes(server.router, server)
 
 	expectedRoutes := []struct {
 		method string

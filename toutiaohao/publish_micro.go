@@ -85,7 +85,7 @@ func (a *MicroPostAction) Publish(ctx context.Context, content string, images []
 	// 上传图片
 	if len(images) > 0 {
 		if err := a.uploadImages(images); err != nil {
-			log.Warnf("Image upload failed: %v", err)
+			return fmt.Errorf("图片上传失败: %w", err)
 		}
 	}
 
@@ -196,11 +196,29 @@ func (a *MicroPostAction) uploadImages(images []string) error {
 	}
 	fileInput = fileInput.CancelTimeout()
 
-	// 4. 一次性上传所有图片（防止多次 SetFiles 产生文件覆盖）
+	_, _ = fileInput.Eval(`() => {
+		this.dataset.mcpOldStyle = this.getAttribute('style') || '';
+		this.style.display = 'block';
+		this.style.visibility = 'visible';
+		this.style.opacity = '1';
+		this.style.width = '100px';
+		this.style.height = '100px';
+		this.style.position = 'absolute';
+		this.style.top = '0';
+		this.style.left = '0';
+		this.style.zIndex = '99999';
+	}`)
 	log.Infof("正在向 file input 设置全部 %d 张图片...", len(localImages))
 	if err := fileInput.SetFiles(localImages); err != nil {
 		return fmt.Errorf("fileInput.SetFiles 失败: %w", err)
 	}
+	_, _ = fileInput.Eval(`() => {
+		this.dispatchEvent(new Event('input', { bubbles: true }));
+		this.dispatchEvent(new Event('change', { bubbles: true }));
+		if (this.dataset.mcpOldStyle !== undefined) {
+			this.setAttribute('style', this.dataset.mcpOldStyle);
+		}
+	}`)
 
 	// 5. 等待图片上传在弹窗中渲染完成
 	log.Info("等待图片上传并生成缩略图...")
@@ -260,7 +278,7 @@ func (a *MicroPostAction) clickPublish() error {
 	}
 
 	// 等待并检测发布结果
-	if err := waitForPublishResult(a.page, 8*time.Second); err != nil {
+	if err := waitForPublishResult(a.page, 30*time.Second); err != nil {
 		return err
 	}
 

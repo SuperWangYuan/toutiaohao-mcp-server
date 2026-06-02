@@ -125,16 +125,21 @@ func (s *AppServer) handlePublishArticle(ctx context.Context, args map[string]in
 	if publishTime, ok := args["publish_time"]; ok {
 		opts.PublishTime = publishTime
 	}
+	if saveDraft, ok := args["save_as_draft"].(bool); ok {
+		opts.SaveAsDraft = saveDraft
+	}
 
 	if err := toutiaohao.ValidateArticle(title, content, opts); err != nil {
 		return NewErrorResult(err.Error())
 	}
 
-	if err := s.toutiaoService.PublishArticle(ctx, title, content, opts); err != nil {
+	res, err := s.toutiaoService.PublishArticle(ctx, title, content, opts)
+	if err != nil {
 		return NewErrorResult(err.Error())
 	}
 
-	return NewTextResult(`{"success": true, "message": "Article published"}`)
+	data, _ := json.Marshal(res)
+	return NewTextResult(string(data))
 }
 
 // handleUpdateArticle 处理文章修改
@@ -165,12 +170,17 @@ func (s *AppServer) handleUpdateArticle(ctx context.Context, args map[string]int
 	if publishTime, ok := args["publish_time"]; ok {
 		opts.PublishTime = publishTime
 	}
+	if saveDraft, ok := args["save_as_draft"].(bool); ok {
+		opts.SaveAsDraft = saveDraft
+	}
 
-	if err := s.toutiaoService.UpdateArticle(ctx, articleID, title, content, opts); err != nil {
+	res, err := s.toutiaoService.UpdateArticle(ctx, articleID, title, content, opts)
+	if err != nil {
 		return NewErrorResult(err.Error())
 	}
 
-	return NewTextResult(`{"success": true, "message": "Article updated"}`)
+	data, _ := json.Marshal(res)
+	return NewTextResult(string(data))
 }
 
 // handleGetArticleList 处理文章列表查询

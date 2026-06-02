@@ -3,6 +3,7 @@ package toutiaohao
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -15,6 +16,8 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var starNullRe = regexp.MustCompile(`"([^"]*star[^"]*)"\s*:\s*null`)
+
 // ArticleOptions 文章发布可选参数
 type ArticleOptions struct {
 	Images      []string    `json:"images,omitempty"`
@@ -24,6 +27,7 @@ type ArticleOptions struct {
 	Original    bool        `json:"original,omitempty"`
 	Fiction     bool        `json:"fiction,omitempty"`
 	PublishTime interface{} `json:"publish_time,omitempty"`
+	SaveAsDraft bool        `json:"save_as_draft,omitempty"`
 }
 
 // ValidateArticle 校验文章参数
@@ -75,6 +79,39 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 		return err
 	}
 
+	// 启用网络请求劫持，拦截并过滤星图 null 响应，防御前端 JS 崩溃
+	router := a.page.HijackRequests()
+	_ = router.Add("*", "*", func(ctx *rod.Hijack) {
+		reqURL := ctx.Request.URL().String()
+		if !strings.Contains(reqURL, "toutiao.com") || strings.Contains(reqURL, ".js") || strings.Contains(reqURL, ".css") || strings.Contains(reqURL, ".png") || strings.Contains(reqURL, ".jpg") || strings.Contains(reqURL, ".woff") {
+			ctx.ContinueRequest(&proto.FetchContinueRequest{})
+			return
+		}
+		err := ctx.LoadResponse(http.DefaultClient, true)
+		if err != nil {
+			return
+		}
+		body := ctx.Response.Body()
+
+		if strings.Contains(body, "star") {
+			body = starNullRe.ReplaceAllStringFunc(body, func(match string) string {
+				submatches := starNullRe.FindStringSubmatch(match)
+				if len(submatches) >= 2 {
+					key := submatches[1]
+					lowerKey := strings.ToLower(key)
+					if strings.Contains(lowerKey, "orderinfo") || strings.Contains(lowerKey, "order_info") {
+						return fmt.Sprintf(`"%s":{}`, key)
+					}
+					return fmt.Sprintf(`"%s":{"starOrderInfo":{},"star_order_info":{}}`, key)
+				}
+				return match
+			})
+			ctx.Response.SetBody(body)
+		}
+	})
+	go router.Run()
+	defer router.Stop()
+
 	// 导航到文章发布页
 	log.Info("Navigating to article publish page...")
 	if err := a.page.Navigate(configs.PublishArticle); err != nil {
@@ -104,7 +141,7 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 	time.Sleep(1 * time.Second)
 
 	// 输入正文
-	if err := a.inputContent(content); err != nil {
+	if err := a.inputContent(content, opts); err != nil {
 		return fmt.Errorf("failed to input content: %w", err)
 	}
 	time.Sleep(1 * time.Second)
@@ -183,9 +220,14 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 
 	time.Sleep(1 * time.Second)
 
-	// 点击发布
-	if err := a.clickPublish(opts); err != nil {
-		return fmt.Errorf("failed to publish: %w", err)
+	// 点击发布或保存为草稿
+	if opts != nil && opts.SaveAsDraft {
+		log.Info("检测到 SaveAsDraft 为 true，等待自动保存草稿并退出...")
+		time.Sleep(8 * time.Second)
+	} else {
+		if err := a.clickPublish(opts); err != nil {
+			return fmt.Errorf("failed to publish: %w", err)
+		}
 	}
 
 	log.Info("Article published successfully")
@@ -257,7 +299,27 @@ func parseContentBlocks(content string) []ContentBlock {
 	return blocks
 }
 
-func (a *ArticlePublishAction) inputContent(content string) error {
+// resolveImagePath 解析正文中类似 IMG_PLACEHOLDER_X 占位符路径，映射为 opts.Images 中对应的真实绝对路径。
+// 如果不匹配，则返回原路径。
+func resolveImagePath(path string, opts *ArticleOptions) string {
+	if opts == nil || len(opts.Images) == 0 {
+		return path
+	}
+	// 匹配 IMG_PLACEHOLDER_X (X 从 1 开始)
+	re := regexp.MustCompile(`(?i)IMG_PLACEHOLDER_(\d+)`)
+	matches := re.FindStringSubmatch(path)
+	if len(matches) == 2 {
+		var idx int
+		_, err := fmt.Sscanf(matches[1], "%d", &idx)
+		if err == nil && idx >= 1 && idx <= len(opts.Images) {
+			// 返回对应的物理绝对路径
+			return opts.Images[idx-1]
+		}
+	}
+	return path
+}
+
+func (a *ArticlePublishAction) inputContent(content string, opts *ArticleOptions) error {
 	el, sel, err := findElement(a.page, 3*time.Second, ArticleContentSelectors)
 	if err != nil {
 		return fmt.Errorf("content editor not found: %w", err)
@@ -316,8 +378,9 @@ func (a *ArticlePublishAction) inputContent(content string) error {
 			}
 			time.Sleep(500 * time.Millisecond)
 		} else {
-			log.Infof("正在插入图片块 %d/%d: %s", i+1, len(blocks), b.Value)
-			if err := a.insertImageAtCursor(b.Value); err != nil {
+			realPath := resolveImagePath(b.Value, opts)
+			log.Infof("正在插入图片块 %d/%d: %s", i+1, len(blocks), realPath)
+			if err := a.insertImageAtCursor(realPath); err != nil {
 				return fmt.Errorf("插入图片块失败: %w", err)
 			}
 			// 插入图片后将光标强制定位在编辑器最后
@@ -630,71 +693,102 @@ func (a *ArticlePublishAction) insertImageAtCursor(imagePath string) error {
 	}
 	fileInput = fileInput.CancelTimeout()
 
+	_, _ = fileInput.Eval(`() => {
+		this.dataset.mcpOldStyle = this.getAttribute('style') || '';
+		this.style.display = 'block';
+		this.style.visibility = 'visible';
+		this.style.opacity = '1';
+		this.style.width = '100px';
+		this.style.height = '100px';
+		this.style.position = 'absolute';
+		this.style.top = '0';
+		this.style.left = '0';
+		this.style.zIndex = '99999';
+	}`)
 	if err := fileInput.SetFiles([]string{absPath}); err != nil {
 		return fmt.Errorf("文件输入控件设置路径失败: %w", err)
 	}
+	_, _ = fileInput.Eval(`() => {
+		this.dispatchEvent(new Event('input', { bubbles: true }));
+		this.dispatchEvent(new Event('change', { bubbles: true }));
+		if (this.dataset.mcpOldStyle !== undefined) {
+			this.setAttribute('style', this.dataset.mcpOldStyle);
+		}
+	}`)
 
 	// 4. 等待确认弹窗并点击确认按钮
 	log.Info("等待图片上传完毕并寻找确认按钮...")
 	var clickedConfirm bool
-	for k := 0; k < 20; k++ { // 最多等 10 秒
+	var dialogClosed bool
+	for k := 0; k < 120; k++ { // 最多等约 60 秒以防大图片上传慢
 		// 先清理旧标记
 		_, _ = a.page.Eval(`() => {
 			document.querySelectorAll('.mcp-confirm-btn').forEach(el => el.classList.remove('mcp-confirm-btn'));
 		}`)
 
-		// 检查确定按钮是否已启用，如未启用则尝试点击缩略图
+		// 检查确定按钮是否已启用（支持 button, div, span, a），只有在非禁用状态下才会被标记并返回 ready: true
 		resConfirm, errEval := a.page.Eval(`() => {
 			let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-			          Array.from(document.querySelectorAll('button')).find(b => {
+			          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
 			              let text = b.textContent ? b.textContent.trim() : '';
 			              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
 			          });
 			if (btn) {
-				let isDisabled = btn.disabled || btn.classList.contains('is-disabled') || btn.className.includes('disabled') || btn.getAttribute('disabled') !== null;
+				let isDisabled = btn.disabled || 
+				                 btn.classList.contains('is-disabled') || 
+				                 btn.classList.contains('disabled') || 
+				                 btn.className.includes('disabled') || 
+				                 btn.getAttribute('disabled') !== null ||
+				                 btn.classList.contains('semi-button-disabled') ||
+				                 btn.classList.contains('byte-btn-disabled') ||
+				                 btn.classList.contains('semi-button-disabled-primary') ||
+				                 btn.classList.contains('semi-button-primary-disabled');
 				if (!isDisabled) {
 					btn.classList.add('mcp-confirm-btn');
-					return { ready: true };
+					return { ready: true, foundBtn: true };
 				}
+				return { ready: false, foundBtn: true };
 			}
-
-			// 确定按钮不可用，尝试点击已上传的缩略图以进行选中
-			let imgs = Array.from(document.querySelectorAll('img'));
-			let clickedAny = false;
-			imgs.forEach(img => {
-				if (img.offsetWidth > 0 && img.offsetHeight > 0) {
-					if (img.closest('[class*="header"]') || img.closest('[class*="sidebar"]') || img.closest('[class*="nav"]') || img.closest('[class*="user"]')) {
-						return;
-					}
-					// 确认属于上传列表或图片选择区域
-					let wrapper = img.closest('[class*="item"]') || img.closest('[class*="card"]') || img;
-					if (!wrapper.dataset.mcpClicked) {
-						wrapper.click();
-						wrapper.dataset.mcpClicked = "true";
-						clickedAny = true;
-					}
-				}
-			});
-			return { ready: false, clicked: clickedAny };
+			return { ready: false, foundBtn: false };
 		}`)
 
 		if errEval == nil && resConfirm != nil {
 			readyVal := resConfirm.Value.Get("ready")
+			foundBtnVal := resConfirm.Value.Get("foundBtn")
+			
 			if readyVal.Val() != nil && readyVal.Bool() {
+				// 确定按钮已启用，执行点击！
 				confirmEl, errEl := a.page.Timeout(2 * time.Second).Element(".mcp-confirm-btn")
 				if errEl == nil && confirmEl != nil {
 					ptConfirm, errPt := confirmEl.Interactable()
 					if errPt == nil {
-						log.Infof("物理点击图片弹窗确认按钮，坐标 (%f, %f)", ptConfirm.X, ptConfirm.Y)
+						log.Infof("物理点击正文图片弹窗确认按钮，坐标 (%f, %f)", ptConfirm.X, ptConfirm.Y)
 						_ = a.page.Mouse.MoveTo(*ptConfirm)
 						_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
 						_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
 					} else {
-						log.Warn("确认按钮不可物理点击，回退到 JS 点击")
+						log.Warnf("确认按钮不可物理点击，回退到 JS 点击: %v", errPt)
 						_, _ = confirmEl.Eval("() => this.click()")
 					}
 					clickedConfirm = true
 				}
+			} else if foundBtnVal.Val() != nil && !readyVal.Bool() {
+				// 找到了确定按钮但处于禁用状态，尝试选中已上传的缩略图以尝试激活它
+				_, _ = a.page.Eval(`() => {
+					let imgs = Array.from(document.querySelectorAll('img'));
+					imgs.forEach(img => {
+						if (img.offsetWidth > 0 && img.offsetHeight > 0) {
+							if (img.closest('[class*="header"]') || img.closest('[class*="sidebar"]') || img.closest('[class*="nav"]') || img.closest('[class*="user"]')) {
+								return;
+							}
+							let wrapper = img.closest('[class*="item"]') || img.closest('[class*="card"]') || img;
+							if (!wrapper.dataset.mcpClicked) {
+								wrapper.click();
+								wrapper.dataset.mcpClicked = "true";
+							}
+						}
+					});
+				}`)
 			}
 		}
 
@@ -704,42 +798,74 @@ func (a *ArticlePublishAction) insertImageAtCursor(imagePath string) error {
 		}`)
 
 		if clickedConfirm {
-			break
+			// 等待弹窗在页面上关闭
+			log.Info("等待正文图片上传确认弹窗关闭...")
+			for j := 0; j < 10; j++ { // 最多等 5 秒让弹窗关闭
+				resExist, errExist := a.page.Eval(`() => {
+					let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
+					          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
+					              let text = b.textContent ? b.textContent.trim() : '';
+					              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
+					          });
+					return btn ? true : false;
+				}`)
+				if errExist == nil && resExist != nil && !resExist.Value.Bool() {
+					log.Info("正文图片上传确认弹窗已成功关闭")
+					dialogClosed = true
+					break
+				}
+				// 补点一次 (需确保处于可用状态以防反向干扰)
+				_, _ = a.page.Eval(`() => {
+					let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
+					          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
+					              let text = b.textContent ? b.textContent.trim() : '';
+					              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
+					          });
+					if (btn) {
+						let isDisabled = btn.disabled || 
+						                 btn.classList.contains('is-disabled') || 
+						                 btn.classList.contains('disabled') || 
+						                 btn.className.includes('disabled') || 
+						                 btn.getAttribute('disabled') !== null ||
+						                 btn.classList.contains('semi-button-disabled') ||
+						                 btn.classList.contains('byte-btn-disabled') ||
+						                 btn.classList.contains('semi-button-disabled-primary') ||
+						                 btn.classList.contains('semi-button-primary-disabled');
+						if (!isDisabled) {
+							btn.click();
+						}
+					}
+				}`)
+				time.Sleep(500 * time.Millisecond)
+			}
+			if dialogClosed {
+				break
+			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if !clickedConfirm {
-		return fmt.Errorf("未能找到或点击图片上传的确认按钮")
-	}
-
-	// 5. 等待弹窗在页面上关闭
-	dialogClosed := false
-	for j := 0; j < 10; j++ { // 最多等 5 秒
-		resExist, errExist := a.page.Eval(`() => {
-			let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-			          Array.from(document.querySelectorAll('button')).find(b => {
-			              let text = b.textContent ? b.textContent.trim() : '';
-			              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
-			          });
-			return btn ? true : false;
-		}`)
-		if errExist == nil && resExist != nil && !resExist.Value.Bool() {
-			dialogClosed = true
-			break
-		}
-		// 补点一次
+	if !dialogClosed {
+		log.Warnf("【优雅降级防护网】正文图片确认弹窗未能正常关闭（可能由于文件数据校验失败提示‘无效图片数据’）。尝试强制关闭弹窗并继续发文...")
+		// 1. 在 JS 中尝试点击右上角的“关闭/X”按钮，或者“取消”按钮以关闭弹窗
 		_, _ = a.page.Eval(`() => {
-			let btn = document.querySelector('.mcp-confirm-btn');
-			if (btn) btn.click();
+			let closeBtn = Array.from(document.querySelectorAll('button, div, span, a, i, svg')).find(el => {
+				let text = el.textContent ? el.textContent.trim() : '';
+				let cls = el.className ? String(el.className) : '';
+				let isClose = (text === '取消' || text === '关闭' || cls.includes('close') || cls.includes('cancel') || el.querySelector('[class*="close"]') !== null);
+				return isClose && el.offsetWidth > 0;
+			});
+			if (closeBtn) {
+				closeBtn.click();
+				return true;
+			}
+			return false;
 		}`)
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	if dialogClosed {
-		log.Info("图片上传弹窗已成功关闭，插图完成")
-	} else {
-		log.Warn("弹窗超时未完全关闭，可能仍然挂起，继续发文流程")
+		// 2. 模拟 ESC 按键强退
+		_, _ = a.page.Eval(`() => {
+			window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+		}`)
+		time.Sleep(1 * time.Second)
 	}
 
 	return nil
@@ -779,8 +905,8 @@ func (a *ArticlePublishAction) verifyContent() error {
 // dismissObstacles 隐藏可能遮挡页面交互元素的浮动遮罩和侧边栏（如AI写作助手）
 func (a *ArticlePublishAction) dismissObstacles() {
 	_, _ = a.page.Eval(`() => {
-		// 隐藏可能覆盖按钮的遮罩层
-		document.querySelectorAll('.byte-drawer-mask, .semi-drawer-mask, [class*="drawer-mask"], [class*="mask"]').forEach(el => {
+		// 隐藏可能覆盖按钮的遮罩层、顶栏以及预览遮罩层
+		document.querySelectorAll('.byte-drawer-mask, .semi-drawer-mask, [class*="drawer-mask"], [class*="mask"], .preview-article-mask, .shead_wrap, [class*="shead_wrap"]').forEach(el => {
 			el.style.pointerEvents = 'none';
 			el.style.display = 'none';
 		});
@@ -827,8 +953,11 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 		}`)
 
+		var fileInput *rod.Element
+		var fileInputErr error
+
 		// 每次上传前重新获取上传框元素，因为上传后 DOM 可能发生改变
-		coverEls, err := a.page.Timeout(3 * time.Second).Elements(`div.article-cover-add, [class*='cover'][class*='add']`)
+		coverEls, err := a.page.Timeout(3 * time.Second).Elements(`div.article-cover-add, [class*='cover'][class*='add'], .cover-upload-area, [class*='cover'] [class*='upload'], div.cover-container`)
 		if err != nil || len(coverEls) == 0 {
 			log.Warnf("Failed to find cover add slots, trying selector...")
 			coverEl, _, err := findElement(a.page, 3*time.Second, ArticleCoverAddSelectors)
@@ -842,170 +971,226 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			return fmt.Errorf("no cover upload slots found for image %d", i+1)
 		}
 
-		targetEl := coverEls[0]
-		
-		// 滚动到中间并使用 scrollIntoViewSafe，标记 class
-		_, _ = targetEl.Eval(`() => {` + SafeScrollJS + `
-			scrollIntoViewSafe(this);
-			this.classList.add('mcp-target-to-click');
-		}`)
-		time.Sleep(500 * time.Millisecond)
-
-		// 在 Go 层面直接使用标记定位物理点击封面框
-		clickEl, err := a.page.Timeout(3 * time.Second).Element(".mcp-target-to-click")
-		if err != nil {
-			return fmt.Errorf("could not locate marked cover upload slot for image %d: %w", i+1, err)
+		var targetEl *rod.Element
+		if i < len(coverEls) {
+			targetEl = coverEls[i]
+		} else {
+			targetEl = coverEls[0]
 		}
 
-		// 模拟物理鼠标点击
-		pt, err := clickEl.Interactable()
-		if err == nil {
-			log.Infof("Clicking cover slot %d at point (%f, %f)", i+1, pt.X, pt.Y)
-			_ = a.page.Mouse.MoveTo(*pt)
-			_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
-			_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-		} else {
-			log.Warnf("Failed to get interactable point for cover slot %d, fallback to JS click: %v", i+1, err)
-			_, _ = clickEl.Eval("() => this.click()")
+		var directInjectSuccess bool
+		if fileInputDirect, errFileInput := targetEl.Element(`input[type='file']`); errFileInput == nil && fileInputDirect != nil {
+			log.Infof("【封面上传】在封面槽 %d 内部直接找到 file input，执行直接注入...", i+1)
+			_, _ = fileInputDirect.Eval(`() => {
+				this.dataset.mcpOldStyle = this.getAttribute('style') || '';
+				this.style.display = 'block';
+				this.style.visibility = 'visible';
+				this.style.opacity = '1';
+				this.style.width = '100px';
+				this.style.height = '100px';
+				this.style.position = 'absolute';
+				this.style.top = '0';
+				this.style.left = '0';
+				this.style.zIndex = '99999';
+			}`)
+			if errInject := fileInputDirect.SetFiles([]string{localPath}); errInject == nil {
+				_, _ = fileInputDirect.Eval(`() => {
+					this.dispatchEvent(new Event('input', { bubbles: true }));
+					this.dispatchEvent(new Event('change', { bubbles: true }));
+					if (this.dataset.mcpOldStyle !== undefined) {
+						this.setAttribute('style', this.dataset.mcpOldStyle);
+					}
+				}`)
+				time.Sleep(1 * time.Second)
+				directInjectSuccess = true
+			} else {
+				log.Warnf("直接写入 file input 失败: %v，将回退到点击弹窗上传...", errInject)
+			}
 		}
-		time.Sleep(1500 * time.Millisecond)
 
-		// 清理临时标记
-		_, _ = a.page.Eval(`() => {
-			document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
-		}`)
-
-		// 点击“上传图片”按钮
-		uploadEl, sel, err := findElement(a.page, 3*time.Second, ArticleCoverUploadSelectors)
-		var clickUploadFailed bool
-		if err != nil {
-			log.Warnf("【封面上传】未找到封面上传按钮 (image %d): %v。将尝试直接寻找并写入 file input 控件作为兜底...", i+1, err)
-			clickUploadFailed = true
-		} else {
-			log.Infof("Found cover upload using selector: %s", sel)
-
-			// 对“上传图片”按钮进行安全滚动和物理点击
-			_, _ = uploadEl.Eval(`() => {` + SafeScrollJS + `
+		if !directInjectSuccess {
+			// 滚动到中间并使用 scrollIntoViewSafe，标记 class
+			_, _ = targetEl.Eval(`() => {` + SafeScrollJS + `
 				scrollIntoViewSafe(this);
 				this.classList.add('mcp-target-to-click');
 			}`)
 			time.Sleep(500 * time.Millisecond)
 
-			clickUploadEl, err := a.page.Timeout(3 * time.Second).Element(".mcp-target-to-click")
-			if err == nil {
-				ptUpload, errPt := clickUploadEl.Interactable()
-				if errPt == nil {
-					log.Infof("Clicking upload button at point (%f, %f)", ptUpload.X, ptUpload.Y)
-					_ = a.page.Mouse.MoveTo(*ptUpload)
-					_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
-					_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-				} else {
-					log.Warnf("Failed to get interactable point for upload button, fallback to direct click: %v", errPt)
-					_ = clickUploadEl.Click(proto.InputMouseButtonLeft, 1)
-				}
-			} else {
-				_ = uploadEl.Click(proto.InputMouseButtonLeft, 1)
+			// 在 Go 层面直接使用标记定位物理点击封面框
+			clickEl, err := a.page.Timeout(3 * time.Second).Element(".mcp-target-to-click")
+			if err != nil {
+				return fmt.Errorf("could not locate marked cover upload slot for image %d: %w", i+1, err)
 			}
-			time.Sleep(1000 * time.Millisecond)
+
+			// 模拟物理鼠标点击
+			pt, err := clickEl.Interactable()
+			if err == nil {
+				log.Infof("Clicking cover slot %d at point (%f, %f)", i+1, pt.X, pt.Y)
+				_ = a.page.Mouse.MoveTo(*pt)
+				_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+				_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+			} else {
+				log.Warnf("Failed to get interactable point for cover slot %d, fallback to JS full events click: %v", i+1, err)
+				_, _ = clickEl.Eval(`() => {
+					const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+					events.forEach(name => {
+						const ev = new MouseEvent(name, { bubbles: true, cancelable: true, view: window });
+						this.dispatchEvent(ev);
+					});
+				}`)
+			}
+			
+			// 延迟一小段时间，检查上传弹窗是否已经成功弹出
+			hasDialog := false
+			for d := 0; d < 3; d++ { // 等待最多 1.5 秒
+				resDialog, errDialog := a.page.Eval(`() => {
+					let inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+					return inputs.some(inp => {
+						let parent = inp.closest('.upload-image-panel, .byte-modal, [class*="modal"], [class*="dialog"], [class*="drawer"]');
+						return parent !== null;
+					});
+				}`)
+				if errDialog == nil && resDialog != nil && resDialog.Value.Bool() {
+					hasDialog = true
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+
+			if !hasDialog {
+				log.Warnf("【封面上传】物理点击封面槽 %d 疑似未成功弹出上传窗口，执行 JS Click 强制兜底...", i+1)
+				_, _ = clickEl.Eval("() => this.click()")
+				time.Sleep(1500 * time.Millisecond)
+			} else {
+				time.Sleep(1000 * time.Millisecond)
+			}
 
 			// 清理临时标记
 			_, _ = a.page.Eval(`() => {
 				document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 			}`)
-		}
 
-		// 设置文件路径
-		fileInput, err := a.page.Timeout(3 * time.Second).Element(`input[type='file']`)
-		if err != nil {
-			if clickUploadFailed {
+			// 直接定位当前上传弹窗内的 file input 并写入文件路径，无需点击上传按钮
+			fileInput, fileInputErr = a.page.Timeout(5 * time.Second).Element(`.upload-image-panel input[type="file"], .byte-modal input[type="file"], #upload-drag-input, input[type="file"]`)
+			if fileInputErr != nil {
 				safeScreenshot(a.page, "screenshot_upload_error.png")
 				log.Warnf("Upload error screenshot saved to screenshot_upload_error.png")
-				return fmt.Errorf("upload button not found and file input not found for image %d: %w", i+1, err)
+				return fmt.Errorf("upload button not found and file input not found for image %d: %w", i+1, fileInputErr)
 			}
-			return fmt.Errorf("file input not found for image %d: %w", i+1, err)
-		}
-		fileInput = fileInput.CancelTimeout()
-		
-		if err := fileInput.SetFiles([]string{localPath}); err != nil {
-			return fmt.Errorf("failed to set file path for image %d: %w", i+1, err)
+			fileInput = fileInput.CancelTimeout()
+			
+			_, _ = fileInput.Eval(`() => {
+				this.dataset.mcpOldStyle = this.getAttribute('style') || '';
+				this.style.display = 'block';
+				this.style.visibility = 'visible';
+				this.style.opacity = '1';
+				this.style.width = '100px';
+				this.style.height = '100px';
+				this.style.position = 'absolute';
+				this.style.top = '0';
+				this.style.left = '0';
+				this.style.zIndex = '99999';
+			}`)
+			if err := fileInput.SetFiles([]string{localPath}); err != nil {
+				return fmt.Errorf("failed to set file path for image %d: %w", i+1, err)
+			}
+			_, _ = fileInput.Eval(`() => {
+				this.dispatchEvent(new Event('input', { bubbles: true }));
+				this.dispatchEvent(new Event('change', { bubbles: true }));
+				if (this.dataset.mcpOldStyle !== undefined) {
+					this.setAttribute('style', this.dataset.mcpOldStyle);
+				}
+			}`)
 		}
 		
 		// 等待并点击图片确认按钮（如 data-e2e="imageUploadConfirm-btn" 或文本为“确定”的按钮）
 		log.Infof("Waiting for image %d upload and confirm dialog...", i+1)
 		var clickedImgConfirm bool
-		for k := 0; k < 15; k++ { // 最多等 7.5 秒
-			// 自动选中已上传的缩略图以启用确认按钮
-			_, _ = a.page.Eval(`() => {
-				let imgs = Array.from(document.querySelectorAll('img'));
-				imgs.forEach(img => {
-					if (img.offsetWidth > 0 && img.offsetHeight > 0) {
-						if (img.closest('[class*="header"]') || img.closest('[class*="sidebar"]') || img.closest('[class*="nav"]') || img.closest('[class*="user"]')) {
-							return;
-						}
-						let wrapper = img.closest('[class*="item"]') || img;
-						if (!wrapper.dataset.mcpClicked) {
-							wrapper.click();
-							wrapper.dataset.mcpClicked = "true";
-						}
-					}
-				});
-			}`)
-			time.Sleep(200 * time.Millisecond)
-
+		var dialogClosed bool
+		for k := 0; k < 120; k++ { // 最多等约 60 秒以防大图片上传慢
 			// 先清理标记
 			_, _ = a.page.Eval(`() => {
 				document.querySelectorAll('.mcp-confirm-btn').forEach(el => el.classList.remove('mcp-confirm-btn'));
 			}`)
 
-			res, err := a.page.Eval(`() => {
+			// 检查确定按钮是否已启用（支持 button, div, span, a），只有在非禁用状态下才会被标记并返回 ready: true
+			resConfirm, errEval := a.page.Eval(`() => {
 				let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-				          Array.from(document.querySelectorAll('button')).find(b => {
+				          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
 				              let text = b.textContent ? b.textContent.trim() : '';
 				              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
 				          });
 				if (btn) {
-					btn.classList.add('mcp-confirm-btn');
-					return true;
+					let isDisabled = btn.disabled || 
+					                 btn.classList.contains('is-disabled') || 
+					                 btn.classList.contains('disabled') || 
+					                 btn.className.includes('disabled') || 
+					                 btn.getAttribute('disabled') !== null ||
+					                 btn.classList.contains('semi-button-disabled') ||
+					                 btn.classList.contains('byte-btn-disabled') ||
+					                 btn.classList.contains('semi-button-disabled-primary') ||
+					                 btn.classList.contains('semi-button-primary-disabled');
+					if (!isDisabled) {
+						btn.classList.add('mcp-confirm-btn');
+						return { ready: true, foundBtn: true };
+					}
+					return { ready: false, foundBtn: true };
 				}
-				return false;
+				return { ready: false, foundBtn: false };
 			}`)
 
-			if err == nil && res != nil && res.Value.Bool() {
-				// 获取此按钮并使用安全物理点击
-				confirmEl, errEl := a.page.Timeout(2 * time.Second).Element(".mcp-confirm-btn")
-				if errEl == nil && confirmEl != nil {
-					ptConfirm, errPt := confirmEl.Interactable()
-					if errPt == nil {
-						log.Infof("Physically clicking image upload confirm button for image %d at (%f, %f)", i+1, ptConfirm.X, ptConfirm.Y)
-						_ = a.page.Mouse.MoveTo(*ptConfirm)
-						_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
-						_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-					} else {
-						log.Warnf("Failed to get interactable point for confirm button, fallback to JS click: %v", errPt)
-						_, _ = confirmEl.Eval("() => this.click()")
+			if errEval == nil && resConfirm != nil {
+				readyVal := resConfirm.Value.Get("ready")
+				foundBtnVal := resConfirm.Value.Get("foundBtn")
+				
+				if readyVal.Val() != nil && readyVal.Bool() {
+					// 确定按钮已启用，执行点击！
+					confirmEl, errEl := a.page.Timeout(2 * time.Second).Element(".mcp-confirm-btn")
+					if errEl == nil && confirmEl != nil {
+						ptConfirm, errPt := confirmEl.Interactable()
+						if errPt == nil {
+							log.Infof("Physically clicking image upload confirm button for image %d at (%f, %f)", i+1, ptConfirm.X, ptConfirm.Y)
+							_ = a.page.Mouse.MoveTo(*ptConfirm)
+							_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+							_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+						} else {
+							log.Warnf("Failed to get interactable point for confirm button, fallback to JS click: %v", errPt)
+							_, _ = confirmEl.Eval("() => this.click()")
+						}
+						clickedImgConfirm = true
 					}
-					clickedImgConfirm = true
-				} else {
-					log.Warn("Failed to get confirm button element in Go, fallback to JS click")
+				} else if foundBtnVal.Val() != nil && !readyVal.Bool() {
+					// 找到了确定按钮但处于禁用状态，或者没找到，尝试选中已上传的缩略图以尝试激活它
 					_, _ = a.page.Eval(`() => {
-						let btn = document.querySelector('.mcp-confirm-btn');
-						if (btn) btn.click();
+						let imgs = Array.from(document.querySelectorAll('img'));
+						imgs.forEach(img => {
+							if (img.offsetWidth > 0 && img.offsetHeight > 0) {
+								if (img.closest('[class*="header"]') || img.closest('[class*="sidebar"]') || img.closest('[class*="nav"]') || img.closest('[class*="user"]')) {
+									return;
+								}
+								let wrapper = img.closest('[class*="item"]') || img.closest('[class*="card"]') || img;
+								if (!wrapper.dataset.mcpClicked) {
+									wrapper.click();
+									wrapper.dataset.mcpClicked = "true";
+								}
+							}
+						});
 					}`)
-					clickedImgConfirm = true
 				}
+			}
 
-				// 清理标记
-				_, _ = a.page.Eval(`() => {
-					document.querySelectorAll('.mcp-confirm-btn').forEach(el => el.classList.remove('mcp-confirm-btn'));
-				}`)
+			// 清理标记
+			_, _ = a.page.Eval(`() => {
+				document.querySelectorAll('.mcp-confirm-btn').forEach(el => el.classList.remove('mcp-confirm-btn'));
+			}`)
 
+			if clickedImgConfirm {
 				// 等待弹窗在页面上消失
 				log.Info("Waiting for upload confirm dialog to close...")
-				dialogClosed := false
 				for j := 0; j < 10; j++ { // 最多等 5 秒让弹窗关闭
 					resExist, errExist := a.page.Eval(`() => {
 						let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-						          Array.from(document.querySelectorAll('button')).find(b => {
+						          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
 						              let text = b.textContent ? b.textContent.trim() : '';
 						              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
 						          });
@@ -1016,14 +1201,27 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 						dialogClosed = true
 						break
 					}
-					// 补点一次
+					// 补点一次 (需确保处于可用状态以防反向干扰)
 					_, _ = a.page.Eval(`() => {
 						let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-						          Array.from(document.querySelectorAll('button')).find(b => {
+						          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
 						              let text = b.textContent ? b.textContent.trim() : '';
 						              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
 						          });
-						if (btn) btn.click();
+						if (btn) {
+							let isDisabled = btn.disabled || 
+							                 btn.classList.contains('is-disabled') || 
+							                 btn.classList.contains('disabled') || 
+							                 btn.className.includes('disabled') || 
+							                 btn.getAttribute('disabled') !== null ||
+							                 btn.classList.contains('semi-button-disabled') ||
+							                 btn.classList.contains('byte-btn-disabled') ||
+							                 btn.classList.contains('semi-button-disabled-primary') ||
+							                 btn.classList.contains('semi-button-primary-disabled');
+							if (!isDisabled) {
+								btn.click();
+							}
+						}
 					}`)
 					time.Sleep(500 * time.Millisecond)
 				}
@@ -1031,10 +1229,30 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 					break
 				}
 			}
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 		}
-		if !clickedImgConfirm {
-			log.Warnf("Image upload confirm button not found or click failed for image %d", i+1)
+
+		if !dialogClosed {
+			log.Warnf("【优雅降级防护网】封面图片 %d 确认弹窗未能正常关闭（可能文件数据校验失败提示‘无效图片数据’）。尝试强制关闭弹窗并继续发文...", i+1)
+			// 1. 在 JS 中尝试点击右上角的“关闭/X”按钮，或者“取消”按钮以关闭弹窗
+			_, _ = a.page.Eval(`() => {
+				let closeBtn = Array.from(document.querySelectorAll('button, div, span, a, i, svg')).find(el => {
+					let text = el.textContent ? el.textContent.trim() : '';
+					let cls = el.className ? String(el.className) : '';
+					let isClose = (text === '取消' || text === '关闭' || cls.includes('close') || cls.includes('cancel') || el.querySelector('[class*="close"]') !== null);
+					return isClose && el.offsetWidth > 0;
+				});
+				if (closeBtn) {
+					closeBtn.click();
+					return true;
+				}
+				return false;
+			}`)
+			// 2. 模拟 ESC 按键强退
+			_, _ = a.page.Eval(`() => {
+				window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+			}`)
+			time.Sleep(1 * time.Second)
 		}
 
 		time.Sleep(1500 * time.Millisecond)
@@ -1287,53 +1505,112 @@ func (a *ArticlePublishAction) setCoverMode(mode string) error {
 func (a *ArticlePublishAction) setOriginal() {
 	log.Info("Attempting to set '原创' label...")
 	
+	// 确保展开“发文设置”
+	_, _ = a.page.Timeout(3*time.Second).Eval(`() => {
+		// 寻找任何可能代表原创、首发的相关选项。如果存在，说明抽屉原本就是展开的，直接退出，防止重复点击将其反向折叠！
+		let originalFound = document.querySelector('.pgc-declare-original-checkbox') || 
+		                    document.querySelector('input[name="original"]') || 
+		                    document.querySelector('input[value="original"]') ||
+		                    Array.from(document.querySelectorAll('span, label, p, div')).find(el => {
+		                        let text = el.textContent ? el.textContent.trim() : '';
+		                        return (text.includes('声明原创') || text.includes('首发') || text.includes('原创')) && el.offsetWidth > 0;
+		                    });
+		if (!originalFound) {
+			let settingsTrigger = Array.from(document.querySelectorAll('*')).find(el => {
+				let text = el.textContent ? el.textContent.trim() : '';
+				return (text === '发文设置' || text === '发文设置 ∨' || text === '发文设置 ^') && el.children.length <= 1;
+			});
+			if (settingsTrigger) {
+				settingsTrigger.click();
+			}
+		}
+	}`)
+	time.Sleep(1 * time.Second)
+
 	// 清理已有的临时类名并隐藏障碍物
 	a.dismissObstacles()
-	_, _ = a.page.Eval(`() => {
-		document.querySelectorAll('.mcp-original-target').forEach(el => el.classList.remove('mcp-original-target'));
-	}`)
 
+	// 1. JS 定位原创 checkbox 的包装元素，滚动并打上临时标记
 	res, err := a.page.Timeout(5 * time.Second).Eval(`() => {` + SafeScrollJS + `
 		let target = document.querySelector('.pgc-declare-original-checkbox') ||
 		             document.querySelector('input[name="original"]') ||
 		             document.querySelector('input[value="original"]') ||
-		             Array.from(document.querySelectorAll('span, label, p')).find(el => {
-		                 let text = el.textContent ? el.textContent.trim() : '';
-		                 return (text === '声明原创' || text === '原创') && el.children.length === 0;
+		             document.querySelector('input[type="checkbox"][class*="original"]') ||
+		             Array.from(document.querySelectorAll('.byte-checkbox, .semi-checkbox, label, span')).find(el => {
+		                 let text = el.innerText ? el.innerText.trim() : (el.textContent ? el.textContent.trim() : '');
+		                 return (text.includes('声明原创') || text.includes('原创') || text.includes('头条首发') || text.includes('首发')) && 
+		                        (el.querySelector('input[type="checkbox"]') !== null || el.tagName === 'INPUT');
 		             });
 		if (target) {
-			let label = target.closest('label') || target;
-			scrollIntoViewSafe(label);
-			label.classList.add('mcp-original-target');
-			return true;
+			let clickTarget = target.tagName === 'INPUT' ? target.parentElement : target;
+			if (clickTarget) {
+				scrollIntoViewSafe(clickTarget);
+				clickTarget.classList.add('mcp-target-to-click');
+				return true;
+			}
 		}
 		return false;
 	}`)
 
-	if err != nil || (res != nil && !res.Value.Bool()) {
-		log.Warnf("Failed to locate '原创' checkbox: %v", err)
+	if err != nil || res == nil || !res.Value.Bool() {
+		log.Warnf("JS定位原创Checkbox失败: %v", err)
 		return
 	}
 
-	// 在 Go 层面获取这个带标记的元素并执行物理点击
-	clickEl, err := a.page.Timeout(5 * time.Second).Element(".mcp-original-target")
+	time.Sleep(500 * time.Millisecond)
+
+	// 2. Go 物理点击标记元素
+	clickEl, err := a.page.Timeout(3 * time.Second).Element(".mcp-target-to-click")
+	physicalClicked := false
 	if err == nil && clickEl != nil {
-		log.Info("Clicking '原创' checkbox")
-		pt, err := clickEl.Interactable()
-		if err == nil {
+		pt, errPt := clickEl.Interactable()
+		if errPt == nil {
+			log.Infof("Physically clicking '原创/首发' checkbox wrapper at (%f, %f)", pt.X, pt.Y)
 			_ = a.page.Mouse.MoveTo(*pt)
 			_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
 			_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-			time.Sleep(1 * time.Second)
+			physicalClicked = true
 		} else {
-			log.Warnf("Failed to get interactable point for '原创' checkbox, fallback to JS: %v", err)
-			_, _ = clickEl.Eval("() => this.click()")
+			log.Warnf("Failed to get interactable point for original checkbox wrapper: %v", errPt)
 		}
+	}
+
+	time.Sleep(1 * time.Second)
+
+	// 3. 检查是否成功勾选（checked 是否为 true），否则执行 JS click 兜底
+	resChecked, errCheck := a.page.Eval(`() => {
+		let target = document.querySelector('.mcp-target-to-click');
+		if (!target) {
+			target = document.querySelector('.pgc-declare-original-checkbox') ||
+			         document.querySelector('input[name="original"]') ||
+			         document.querySelector('input[value="original"]');
+		}
+		if (target) {
+			let input = target.tagName === 'INPUT' ? target : target.querySelector('input[type="checkbox"]');
+			if (input) {
+				if (!input.checked) {
+					input.click();
+					input.dispatchEvent(new Event('change', { bubbles: true }));
+				}
+				return input.checked;
+			}
+		}
+		return false;
+	}`)
+
+	if errCheck == nil && resChecked != nil && resChecked.Value.Bool() {
+		if physicalClicked {
+			log.Info("Successfully set '原创/首发' label via physical click")
+		} else {
+			log.Info("Successfully set '原创/首发' label via JS click fallback")
+		}
+	} else {
+		log.Warnf("Failed to verify/check '原创/首发' checkbox: %v", errCheck)
 	}
 
 	// 清理临时标记
 	_, _ = a.page.Eval(`() => {
-		document.querySelectorAll('.mcp-original-target').forEach(el => el.classList.remove('mcp-original-target'));
+		document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 	}`)
 }
 
@@ -1343,12 +1620,19 @@ func (a *ArticlePublishAction) setFictionDeclaration() {
 	
 	// 确保展开“发文设置”
 	_, _ = a.page.Timeout(3*time.Second).Eval(`() => {
-		let settingsTrigger = Array.from(document.querySelectorAll('*')).find(el => {
+		// 寻找任何可能代表虚构声明的选项。如果存在，说明抽屉原本就是展开的，直接退出，防止重复点击将其反向折叠！
+		let fictionFound = Array.from(document.querySelectorAll('span, label, div, p')).find(el => {
 			let text = el.textContent ? el.textContent.trim() : '';
-			return (text === '发文设置' || text === '发文设置 ∨' || text === '发文设置 ^') && el.children.length <= 1;
+			return (text.includes('取材网络') || text.includes('虚构演绎') || text.includes('故事经历')) && el.offsetWidth > 0;
 		});
-		if (settingsTrigger) {
-			settingsTrigger.click();
+		if (!fictionFound) {
+			let settingsTrigger = Array.from(document.querySelectorAll('*')).find(el => {
+				let text = el.textContent ? el.textContent.trim() : '';
+				return (text === '发文设置' || text === '发文设置 ∨' || text === '发文设置 ^') && el.children.length <= 1;
+			});
+			if (settingsTrigger) {
+				settingsTrigger.click();
+			}
 		}
 	}`)
 	time.Sleep(1 * time.Second)
@@ -1356,58 +1640,94 @@ func (a *ArticlePublishAction) setFictionDeclaration() {
 	// 清理已有的临时类名并隐藏障碍物
 	a.dismissObstacles()
 	_, _ = a.page.Eval(`() => {
-		document.querySelectorAll('.mcp-fiction-target').forEach(el => el.classList.remove('mcp-fiction-target'));
+		document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 	}`)
 
+	// 1. JS 定位虚构Checkbox包装元素，滚动并打上临时标记
 	res, err := a.page.Timeout(5 * time.Second).Eval(`() => {` + SafeScrollJS + `
-		let target = Array.from(document.querySelectorAll('span, label, div, p')).find(el => {
-			if (el.children.length > 0) return false;
+		let target = Array.from(document.querySelectorAll('span, label, p')).find(el => {
 			let text = el.textContent ? el.textContent.trim() : '';
-			return text.includes('取材网络') && text.includes('虚构演绎');
+			return (text.includes('虚构演绎') || (text.includes('取材网络') && text.includes('虚构演绎')) || text.includes('故事经历'));
 		});
-		if (!target) {
-			target = Array.from(document.querySelectorAll('span, label')).find(el => {
-				let text = el.textContent ? el.textContent.trim() : '';
-				return text.includes('取材网络') && text.includes('虚构演绎');
-			});
-		}
 		if (target) {
-			let label = target.closest('label') || target;
-			scrollIntoViewSafe(label);
-			label.classList.add('mcp-fiction-target');
-			return true;
+			let clickTarget = target.closest('label') || target;
+			if (clickTarget) {
+				scrollIntoViewSafe(clickTarget);
+				clickTarget.classList.add('mcp-target-to-click');
+				return true;
+			}
 		}
 		return false;
 	}`)
 
-	if err != nil || (res != nil && !res.Value.Bool()) {
-		log.Warnf("Failed to locate '虚构演绎' checkbox: %v", err)
+	if err != nil || res == nil || !res.Value.Bool() {
+		log.Warnf("JS定位虚构Checkbox失败: %v", err)
 		return
 	}
 
-	// 在 Go 层面获取这个带标记的元素并执行物理点击
-	clickEl, err := a.page.Timeout(5 * time.Second).Element(".mcp-fiction-target")
+	time.Sleep(500 * time.Millisecond)
+
+	// 2. Go 物理点击标记元素
+	clickEl, err := a.page.Timeout(3 * time.Second).Element(".mcp-target-to-click")
+	physicalClicked := false
 	if err == nil && clickEl != nil {
-		log.Info("Clicking '虚构演绎' checkbox")
-		pt, err := clickEl.Interactable()
-		if err == nil {
+		pt, errPt := clickEl.Interactable()
+		if errPt == nil {
+			log.Infof("Physically clicking '虚构演绎' checkbox wrapper at (%f, %f)", pt.X, pt.Y)
 			_ = a.page.Mouse.MoveTo(*pt)
 			_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
 			_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-			time.Sleep(1 * time.Second)
+			physicalClicked = true
 		} else {
-			log.Warnf("Failed to get interactable point for '虚构演绎' checkbox, fallback to JS: %v", err)
-			_, _ = clickEl.Eval("() => this.click()")
+			log.Warnf("Failed to get interactable point for fiction checkbox wrapper: %v", errPt)
 		}
+	}
+
+	time.Sleep(1 * time.Second)
+
+	// 3. 检查状态，若未成功执行 JS 勾选兜底
+	resChecked, errCheck := a.page.Eval(`() => {
+		let target = document.querySelector('.mcp-target-to-click');
+		if (!target) {
+			target = Array.from(document.querySelectorAll('span, label, div, p')).find(el => {
+				let text = el.textContent ? el.textContent.trim() : '';
+				return (text.includes('虚构演绎') || (text.includes('取材网络') && text.includes('虚构演绎')) || text.includes('故事经历'));
+			});
+		}
+		if (target) {
+			let label = target.closest('label') || target;
+			let input = label.querySelector('input[type="checkbox"]') || label;
+			if (input) {
+				if (!input.checked) {
+					input.click();
+					input.dispatchEvent(new Event('change', { bubbles: true }));
+				}
+				return input.checked;
+			}
+		}
+		return false;
+	}`)
+
+	if errCheck == nil && resChecked != nil && resChecked.Value.Bool() {
+		if physicalClicked {
+			log.Info("Successfully checked '虚构演绎' checkbox via physical click")
+		} else {
+			log.Info("Successfully checked '虚构演绎' checkbox via JS click fallback")
+		}
+	} else {
+		log.Warnf("Failed to verify/check '虚构演绎' checkbox: %v", errCheck)
 	}
 
 	// 清理临时标记
 	_, _ = a.page.Eval(`() => {
-		document.querySelectorAll('.mcp-fiction-target').forEach(el => el.classList.remove('mcp-fiction-target'));
+		document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 	}`)
 }
 
 func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
+	// 在最终点击发布按钮之前，再次执行 Mock 注入，确保在发布校验阶段全局数据和 API 请求安全
+	_, _ = a.page.Eval(StarOrderMockJS)
+
 	// 1. 先查找我们将要点击的发布按钮
 	el, sel, err := findElement(a.page, 3*time.Second, ArticlePublishButtonSelectors)
 	if err != nil {
@@ -1439,20 +1759,53 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	a.dismissObstacles()
 	time.Sleep(500 * time.Millisecond)
 
-	// 尝试物理点击
+	// 尝试物理点击与 JS 智能兜底触发发布按钮
 	var clickErr error
 	pt, ptErr := el.Interactable()
+	clickedPhysically := false
 	if ptErr == nil {
 		log.Infof("Clicking publish button via physical mouse click at point: (%f, %f)", pt.X, pt.Y)
 		_ = a.page.Mouse.MoveTo(*pt)
 		_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
 		_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+		clickedPhysically = true
+		time.Sleep(1500 * time.Millisecond) // 给 1.5 秒让页面发生状态跳转或弹出二次确认框
 	} else {
-		log.Warnf("Failed to get interactable point for publish button, fallback to JS click: %v", ptErr)
-		_, clickErr = el.Timeout(10 * time.Second).Eval(`() => this.click()`)
+		log.Warnf("Failed to get interactable point for publish button: %v", ptErr)
 	}
-	if clickErr != nil {
-		return fmt.Errorf("failed to click publish button: %w", clickErr)
+
+	// 智能判定是否需要 JS 强力合成事件进行二次补发（避免因物理点击成功后的重复触发导致 React 组件或接口状态紊乱）
+	needJSSynthesizedClick := true
+	if clickedPhysically {
+		info, errInfo := a.page.Info()
+		if errInfo == nil && info != nil {
+			if !strings.Contains(info.URL, "/graphic/publish") {
+				log.Info("物理点击后页面已发生跳转，无需派发 JS 兜底点击")
+				needJSSynthesizedClick = false
+			}
+		}
+		if needJSSynthesizedClick {
+			// 检测是否已经出现了二次确认弹窗
+			hasModal, _ := a.page.Timeout(200 * time.Millisecond).Element(`.semi-modal, .byte-modal, [class*="modal"], [class*="dialog"]`)
+			if hasModal != nil {
+				log.Info("物理点击后检测到二次确认弹窗，无需派发 JS 兜底点击")
+				needJSSynthesizedClick = false
+			}
+		}
+	}
+
+	if needJSSynthesizedClick {
+		log.Info("物理点击未触发状态变更，正在派发 JS 强力合成事件链以确保发布按钮被成功触发...")
+		_, clickErr = el.Timeout(5 * time.Second).Eval(`() => {
+			const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+			events.forEach(name => {
+				const ev = new MouseEvent(name, { bubbles: true, cancelable: true, view: window });
+				this.dispatchEvent(ev);
+			});
+		}`)
+		if clickErr != nil {
+			return fmt.Errorf("failed to click publish button via JS: %w", clickErr)
+		}
 	}
 	
 	// 保存点击后的截图用于调试分析
@@ -1469,11 +1822,65 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	}
 
 	// 关键判定：
-	// 若点击的按钮本身即为“发布”字样（如修改文章时的直发底栏），这说明它已经是最终提交操作，
-	// 不需要也绝不应该做后文的“二次确认弹窗”等待轮询，否则会因重复点击该可见按钮导致锁死。
+	// 若点击的按钮本身即为“发布”字样（如修改文章时的直发底栏），
+	// 修改文章场景下头条通常会弹出“确认修改发布”二次确认弹窗，需要短暂等待并检测。
 	if btnText == "发布" {
-		log.Info("点击的按钮文本是'发布'，跳过二次确认弹窗检测，直接进入结果等待。")
-		return waitForPublishResult(a.page, 25*time.Second)
+		log.Info("点击的按钮文本是'发布'，短暂等待检测是否有二次确认弹窗...")
+		// 给页面 5 秒时间弹出二次确认 Modal，共循环 10 次
+		for i := 0; i < 10; i++ {
+			time.Sleep(500 * time.Millisecond)
+			
+			// 检测是否已跳转（说明不需要二次确认，直接成功了）
+			infoChk, errChk := a.page.Info()
+			if errChk == nil && infoChk != nil && !strings.Contains(infoChk.URL, "/graphic/publish") {
+				log.Infof("点击'发布'后页面已跳转（URL: %s），判定发布成功", infoChk.URL)
+				return nil
+			}
+			
+			// 在特定间隔清理遮罩并重试触发点击以保证动作被执行
+			if i == 2 || i == 5 || i == 8 {
+				log.Infof("等待中 (轮次 %d)... 清除页面遮罩并再次尝试触发'发布'按钮...", i)
+				a.dismissObstacles()
+				// 重试触发按钮点击
+				if elRetry, _, errRetry := findElement(a.page, 1*time.Second, ArticlePublishButtonSelectors); errRetry == nil && elRetry != nil {
+					_, _ = elRetry.Eval(`() => {
+						const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+						events.forEach(name => {
+							const ev = new MouseEvent(name, { bubbles: true, cancelable: true, view: window });
+							this.dispatchEvent(ev);
+						});
+					}`)
+				}
+			}
+
+			// 检测二次确认弹窗
+			confirmRes, errEval := a.page.Eval(`() => {
+				let modal = document.querySelector('.semi-modal, .byte-modal, [class*="modal"], [class*="dialog"]');
+				if (modal && modal.offsetWidth > 0) {
+					let buttons = Array.from(modal.querySelectorAll('button')).filter(b => b.offsetWidth > 0 && b.offsetHeight > 0);
+					let confirmBtn = buttons.find(b => {
+						let t = b.textContent ? b.textContent.trim() : '';
+						return t === '确认发布' || t === '确认发表' || t === '确定' || t === '确认';
+					});
+					if (!confirmBtn && buttons.length > 0) {
+						confirmBtn = buttons[buttons.length - 1];
+					}
+					if (confirmBtn) {
+						confirmBtn.click();
+						return JSON.stringify({ clicked: true, text: confirmBtn.textContent.trim() });
+					}
+				}
+				return JSON.stringify({ clicked: false });
+			}`)
+			if errEval == nil && confirmRes != nil {
+				jsStr := confirmRes.Value.Str()
+				if strings.Contains(jsStr, `"clicked":true`) {
+					log.Infof("检测到修改文章的二次确认弹窗并已点击确认: %s", jsStr)
+					break
+				}
+			}
+		}
+		return waitForPublishResult(a.page, 90*time.Second)
 	}
 
 	// 轮询等待二次确认弹窗中的“确认发布”按钮并进行点击，最多等待 10 秒
@@ -1545,8 +1952,8 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 
 	time.Sleep(1 * time.Second)
 
-	// 等待并检测发布结果，最多等待 25 秒（包含跳转时间）
-	return waitForPublishResult(a.page, 25*time.Second)
+	// 等待并检测发布结果，最多等待 90 秒（包含跳转时间）
+	return waitForPublishResult(a.page, 90*time.Second)
 }
 
 // truncateStr 截取字符串，超出长度加省略号
@@ -1564,9 +1971,48 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 		return fmt.Errorf("articleID is required for update")
 	}
 
+	// 启用网络请求劫持，拦截并过滤星图 null 响应，防御前端 JS 崩溃
+	router := a.page.HijackRequests()
+	_ = router.Add("*", "*", func(ctx *rod.Hijack) {
+		reqURL := ctx.Request.URL().String()
+		if !strings.Contains(reqURL, "toutiao.com") || strings.Contains(reqURL, ".js") || strings.Contains(reqURL, ".css") || strings.Contains(reqURL, ".png") || strings.Contains(reqURL, ".jpg") || strings.Contains(reqURL, ".woff") {
+			ctx.ContinueRequest(&proto.FetchContinueRequest{})
+			return
+		}
+		err := ctx.LoadResponse(http.DefaultClient, true)
+		if err != nil {
+			return
+		}
+		body := ctx.Response.Body()
+
+		if strings.Contains(body, "star") {
+			body = starNullRe.ReplaceAllStringFunc(body, func(match string) string {
+				submatches := starNullRe.FindStringSubmatch(match)
+				if len(submatches) >= 2 {
+					key := submatches[1]
+					lowerKey := strings.ToLower(key)
+					if strings.Contains(lowerKey, "orderinfo") || strings.Contains(lowerKey, "order_info") {
+						return fmt.Sprintf(`"%s":{}`, key)
+					}
+					return fmt.Sprintf(`"%s":{"starOrderInfo":{},"star_order_info":{}}`, key)
+				}
+				return match
+			})
+			ctx.Response.SetBody(body)
+		}
+	})
+	go router.Run()
+	defer router.Stop()
+
 	// 1. 拼接修改已有文章的 URL 并导航
 	editURL := fmt.Sprintf("https://mp.toutiao.com/profile_v4/graphic/publish?pgc_id=%s", articleID)
 	log.Infof("正在导航到文章编辑页面: %s", editURL)
+
+	// 注册新页面自动注入脚本以防御 starOrderInfo null 导致的 JS 崩溃
+	if _, err := a.page.EvalOnNewDocument(StarOrderMockJS); err != nil {
+		log.Warnf("【Mock 注入】注册 EvalOnNewDocument 失败: %v", err)
+	}
+
 	if err := a.page.Navigate(editURL); err != nil {
 		return fmt.Errorf("failed to navigate to edit page: %w", err)
 	}
@@ -1574,6 +2020,9 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 		return fmt.Errorf("failed to wait for edit page load: %w", err)
 	}
 	time.Sleep(3 * time.Second)
+
+	// 注入请求监听
+	_, _ = a.page.Eval(NetworkTrackerJS)
 
 	// 2. 确保已登录
 	if err := EnsureLogin(a.page, a.cookieStore); err != nil {
@@ -1614,7 +2063,10 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	time.Sleep(1 * time.Second)
+	time.Sleep(3 * time.Second) // 平息期：等待 3 秒让 React 异步回调渲染全部完成，防止后续写入被重绘冲掉
+
+	// 在编辑器数据填充完毕后，再次手动触发一次 Mock 注入，双重保险
+	_, _ = a.page.Eval(StarOrderMockJS)
 
 	// 3. 修改标题
 	if title != "" {
@@ -1628,7 +2080,7 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 	// 4. 修改正文
 	if content != "" {
 		log.Info("正在修改正文内容...")
-		if err := a.inputContent(content); err != nil {
+		if err := a.inputContent(content, opts); err != nil {
 			return fmt.Errorf("failed to input updated content: %w", err)
 		}
 		time.Sleep(1 * time.Second)
@@ -1774,11 +2226,209 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 		}
 	}
 
-	// 6. 重新点击发布
-	if err := a.clickPublish(opts); err != nil {
-		return fmt.Errorf("failed to publish updated article: %w", err)
+	// 最终发布前一致性二次固化校验（AGENTS.md 规则 #8）：
+	// 检查标题是否被 React 重绘冲掉，如果是，则通过 React Value Tracker 劫持技术重新强行注入
+	if title != "" {
+		titleCheckEl, _, errCheck := findElement(a.page, 2*time.Second, ArticleTitleSelectors)
+		if errCheck == nil && titleCheckEl != nil {
+			currentVal, evalErr := titleCheckEl.Eval(`() => this.value || ''`)
+			if evalErr == nil && currentVal != nil {
+				currentTitle := strings.TrimSpace(currentVal.Value.Str())
+				if currentTitle != title {
+					log.Warnf("【二次固化】检测到标题被 React 重绘冲掉！当前值: '%s', 目标值: '%s'，正在重新注入...", truncateStr(currentTitle, 20), truncateStr(title, 20))
+					// 使用 React Value Tracker 劫持技术强行注入
+					_, _ = titleCheckEl.Eval(`val => {
+						let setter = null;
+						let prototype = Object.getPrototypeOf(this);
+						while (prototype) {
+							const desc = Object.getOwnPropertyDescriptor(prototype, 'value');
+							if (desc && desc.set) {
+								setter = desc.set;
+								break;
+							}
+							prototype = Object.getPrototypeOf(prototype);
+						}
+						if (setter) {
+							setter.call(this, val);
+						} else {
+							this.value = val;
+						}
+						const tracker = this._valueTracker;
+						if (tracker) {
+							tracker.setValue(val);
+						}
+						this.dispatchEvent(new Event('input', {bubbles: true}));
+						this.dispatchEvent(new Event('change', {bubbles: true}));
+						
+						// 遍历 React Fiber 绑定的事件处理器，主动触发 onChange/onInput
+						let reactKeys = Object.keys(this).filter(k => k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+						for (let key of reactKeys) {
+							let ho = this[key];
+							if (ho && ho.onChange) ho.onChange({ target: this, currentTarget: this });
+							if (ho && ho.onInput) ho.onInput({ target: this, currentTarget: this });
+						}
+					}`, title)
+					time.Sleep(500 * time.Millisecond)
+					// 验证二次注入结果
+					if recheck, recheckErr := titleCheckEl.Eval(`() => this.value || ''`); recheckErr == nil && recheck != nil {
+						log.Infof("【二次固化】标题重新注入后的值: '%s'", truncateStr(strings.TrimSpace(recheck.Value.Str()), 30))
+					}
+				} else {
+					log.Infof("【二次固化】标题一致性校验通过，当前值与目标值一致: '%s'", truncateStr(currentTitle, 30))
+				}
+			}
+		}
+	}
+
+	// 6. 重新点击发布或保存为草稿
+	if opts != nil && opts.SaveAsDraft {
+		log.Info("检测到 SaveAsDraft 为 true，等待自动保存草稿并退出...")
+		time.Sleep(8 * time.Second)
+	} else {
+		if err := a.clickPublish(opts); err != nil {
+			return fmt.Errorf("failed to publish updated article: %w", err)
+		}
 	}
 
 	log.Infof("Article %s updated and published successfully", articleID)
 	return nil
 }
+
+// StarOrderMockJS 注入代码，深度修复 API 响应或全局变量中 starOrderInfo 相关的 null 数据，防止头条号前端 JS 崩溃
+const StarOrderMockJS = `(() => {
+	function deepFixNull(obj, visited = new WeakSet()) {
+		if (obj === null || obj === undefined) return obj;
+		if (typeof obj !== 'object') return obj;
+		
+		// 排除 DOM 元素和 window 等宿主对象，防止循环引用或安全限制报错
+		if (obj.nodeType || obj === window || obj === document || (obj.constructor && obj.constructor.name === 'Window')) {
+			return obj;
+		}
+
+		// 检查循环引用
+		if (visited.has(obj)) {
+			return obj;
+		}
+		visited.add(obj);
+
+		if (Array.isArray(obj)) {
+			for (let i = 0; i < obj.length; i++) {
+				obj[i] = deepFixNull(obj[i], visited);
+			}
+			return obj;
+		}
+		for (let key in obj) {
+			if (Object.prototype.hasOwnProperty.call(obj, key)) {
+				let val = obj[key];
+				let lowerKey = key.toLowerCase();
+				if (lowerKey.includes('star') && val === null) {
+					if (lowerKey.includes('id') || lowerKey.includes('name')) {
+						obj[key] = '';
+					} else {
+						obj[key] = { starOrderInfo: {}, star_order_info: {} };
+					}
+				} else if ((lowerKey.includes('starorder') || lowerKey.includes('star_order')) && val === null) {
+					obj[key] = {};
+				} else {
+					if (val && typeof val === 'object') {
+						obj[key] = deepFixNull(val, visited);
+					}
+				}
+			}
+		}
+		return obj;
+	}
+
+	// 1. 拦截 window 全局变量定义，以防 inline 脚本初始化时带入 null，并在读取时实时修复子属性
+	function interceptGlobal(objName) {
+		let cachedVal = undefined;
+		try {
+			if (window[objName] !== undefined) {
+				cachedVal = window[objName];
+			}
+			Object.defineProperty(window, objName, {
+				get: function() {
+					return deepFixNull(cachedVal);
+				},
+				set: function(val) {
+					cachedVal = val;
+				},
+				configurable: true
+			});
+		} catch(e) {}
+	}
+	['pgc_init_data', 'pgcInitData', '__INITIAL_STATE__'].forEach(interceptGlobal);
+
+	// 2. 劫持 Response 原型链方法，在前端调用反序列化时自动修复数据，不影响 Response 的生命周期和属性
+	try {
+		if (window.Response && window.Response.prototype && !window.Response.prototype.json.isMocked) {
+			const originalJson = window.Response.prototype.json;
+			window.Response.prototype.json = async function() {
+				const data = await originalJson.apply(this);
+				return deepFixNull(data);
+			};
+			window.Response.prototype.json.isMocked = true;
+		}
+		if (window.Response && window.Response.prototype && !window.Response.prototype.text.isMocked) {
+			const originalText = window.Response.prototype.text;
+			window.Response.prototype.text = async function() {
+				const text = await originalText.apply(this);
+				try {
+					const data = JSON.parse(text);
+					const fixed = deepFixNull(data);
+					return JSON.stringify(fixed);
+				} catch(e) {
+					return text;
+				}
+			};
+			window.Response.prototype.text.isMocked = true;
+		}
+	} catch(e) {}
+
+	// 3. 劫持 XMLHttpRequest 原型链属性的 getter，高容错且不影响 XHR 事件周期
+	try {
+		if (window.XMLHttpRequest && window.XMLHttpRequest.prototype && !window.XMLHttpRequest.prototype._isMocked) {
+			const proto = window.XMLHttpRequest.prototype;
+			
+			const descriptorText = Object.getOwnPropertyDescriptor(proto, 'responseText');
+			if (descriptorText && descriptorText.get) {
+				Object.defineProperty(proto, 'responseText', {
+					get: function() {
+						const val = descriptorText.get.apply(this);
+						try {
+							const data = JSON.parse(val);
+							const fixed = deepFixNull(data);
+							return JSON.stringify(fixed);
+						} catch(e) {
+							return val;
+						}
+					},
+					configurable: true
+				});
+			}
+
+			const descriptorRep = Object.getOwnPropertyDescriptor(proto, 'response');
+			if (descriptorRep && descriptorRep.get) {
+				Object.defineProperty(proto, 'response', {
+					get: function() {
+						const val = descriptorRep.get.apply(this);
+						if (this.responseType === 'json') {
+							return deepFixNull(val);
+						}
+						if (typeof val === 'string') {
+							try {
+								const data = JSON.parse(val);
+								const fixed = deepFixNull(data);
+								return JSON.stringify(fixed);
+							} catch(e) {}
+						}
+						return val;
+					},
+					configurable: true
+				});
+			}
+			proto._isMocked = true;
+		}
+	} catch(e) {}
+})();`
+

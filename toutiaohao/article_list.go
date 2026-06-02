@@ -11,6 +11,7 @@ import (
 
 	"github.com/example/toutiaohao-mcp-server/configs"
 	"github.com/example/toutiaohao-mcp-server/cookies"
+	"github.com/go-rod/rod"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -154,9 +155,18 @@ func DeleteArticle(ctx context.Context, articleID string, cookieStore cookies.Co
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("delete failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// 头条API可能返回HTTP 200但code非0（如user not login）
+	var apiResp struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err == nil && apiResp.Code != 0 {
+		return fmt.Errorf("delete API returned error code %d: %s", apiResp.Code, string(respBody))
 	}
 
 	return nil
@@ -208,4 +218,100 @@ func injectCookies(req *http.Request, cookieData []byte) {
 	for _, c := range cookieList {
 		req.AddCookie(&http.Cookie{Name: c.Name, Value: c.Value})
 	}
+}
+
+// DeleteDraftByBrowser 用浏览器删除草稿（HTTP API 不支持删除草稿状态的文章）
+func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string) error {
+	log.Infof("正在用浏览器删除草稿: %s", articleID)
+
+	// 导航到头条号主页，确保 cookie 生效
+	if err := page.Navigate("https://mp.toutiao.com"); err != nil {
+		return fmt.Errorf("导航到头条主页失败: %w", err)
+	}
+	_ = page.Timeout(10 * time.Second).WaitLoad()
+	time.Sleep(3 * time.Second)
+
+	// 导航到草稿列表页
+	if err := page.Navigate("https://mp.toutiao.com/profile_v4/graphic/list?status=1"); err != nil {
+		return fmt.Errorf("导航到草稿列表页失败: %w", err)
+	}
+	_ = page.Timeout(10 * time.Second).WaitLoad()
+	time.Sleep(4 * time.Second)
+
+
+	// 输出页面标题和 URL 以确认已登录
+	url, _ := page.Eval(`() => window.location.href`)
+	title, _ := page.Eval(`() => document.title`)
+	log.Infof("当前页面URL: %v, 标题: %v", url, title)
+
+	// 查找文章列表中的"更多"操作菜单和"删除"按钮
+	// 头条草稿列表中每个文章卡片通常有一个"更多"按钮或直接有删除/编辑按钮
+	log.Info("尝试定位并点击删除按钮...")
+
+	// JS: 通过文章标题找到对应的卡片，再找卡片内的删除按钮
+	// 测试文章的标题含"测试"
+	result, err := page.Eval(`(articleID) => {
+		// 获取所有可见的卡片元素
+		let cards = document.querySelectorAll('div[class*="item"], div[class*="card"], li[class*="item"], tr');
+		for (let card of cards) {
+			let html = card.innerHTML || '';
+			let text = (card.textContent || '').trim();
+			if (html.includes(articleID) || text.includes(articleID)) {
+				// 找到了！在该卡片范围内找删除按钮
+				let btns = card.querySelectorAll('button, span, a');
+				for (let btn of btns) {
+					let t = (btn.textContent || '').trim();
+					if (t === '删除' && btn.offsetParent !== null) {
+						btn.click();
+						return 'clicked delete';
+					}
+				}
+				// 没找到删除，找更多/操作
+				for (let btn of btns) {
+					let t = (btn.textContent || '').trim();
+					if ((t === '更多' || t === '⋮' || t === '···') && btn.offsetParent !== null) {
+						btn.click();
+						return 'clicked more';
+					}
+				}
+			}
+		}
+		return 'no matching card found';
+	}`, articleID)
+	if err != nil {
+		log.Warnf("查找文章卡片失败: %v", err)
+	}
+	log.Infof("查找结果: %v", result)
+	time.Sleep(2 * time.Second)
+
+	// 如果点了更多，等待菜单弹出后再点删除
+	page.Eval(`() => {
+		let btns = document.querySelectorAll('span, button, a');
+		for (let btn of btns) {
+			let t = (btn.textContent || '').trim();
+			if (t === '删除' && btn.offsetParent !== null) {
+				btn.click();
+				return 'clicked delete after more';
+			}
+		}
+		return 'no delete after more';
+	}`)
+	time.Sleep(2 * time.Second)
+
+	// 确认弹窗
+	page.Eval(`() => {
+		let btns = document.querySelectorAll('button, span');
+		for (let btn of btns) {
+			let t = (btn.textContent || '').trim();
+			if (t === '确认' || t === '确定' || t.includes('确认删除')) {
+				btn.click();
+				return 'confirmed';
+			}
+		}
+		return 'no confirm';
+	}`)
+	time.Sleep(2 * time.Second)
+
+	log.Infof("草稿删除操作完成（结果需通过列表确认）")
+	return nil
 }

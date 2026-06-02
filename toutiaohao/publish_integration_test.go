@@ -20,16 +20,32 @@ func TestPublishArticleManual(t *testing.T) {
 	if err := os.MkdirAll(testdataDir, 0755); err != nil {
 		t.Fatalf("创建临时测试目录失败: %v", err)
 	}
-	// 写入一个 100 字节的伪 PNG 数据，确保图片能够正常上传
-	dummyPNG := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82")
-	if err := os.WriteFile(testImagePath, dummyPNG, 0644); err != nil {
-		t.Fatalf("创建临时测试图片失败: %v", err)
+	// 优先复制已有的真实合规图片
+	copied := false
+	possibleImages := []string{"../scratch_insert_result.png", "../scratch_save_draft_result.png", "../screenshot_upload_error.png", "../publish_after_first_click.png"}
+	for _, pImg := range possibleImages {
+		if _, err := os.Stat(pImg); err == nil {
+			input, errRead := os.ReadFile(pImg)
+			if errRead == nil {
+				errWrite := os.WriteFile(testImagePath, input, 0644)
+				if errWrite == nil {
+					copied = true
+					log.Infof("成功从 %s 复制真实合规图片用于上传测试", pImg)
+					break
+				}
+			}
+		}
 	}
-	// 测试结束时自动删除
-	defer func() {
-		_ = os.RemoveAll(testdataDir)
-	}()
 
+	if !copied {
+		log.Warn("无法复制真实图片，回退到写入 Dummy 图片数据")
+		dummyPNG := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82")
+		if err := os.WriteFile(testImagePath, dummyPNG, 0644); err != nil {
+			t.Fatalf("创建临时测试图片失败: %v", err)
+		}
+	}
+
+	var articleID string
 	// 设置环境变量以便内部 browser 加载根目录下的 cookies.json
 	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
 
@@ -45,6 +61,21 @@ func TestPublishArticleManual(t *testing.T) {
 
 	page := b.NewPage()
 	defer page.Close()
+
+	// 测试结束时自动删除本地图片和线上临时草稿
+	defer func() {
+		_ = os.RemoveAll(testdataDir)
+		if articleID != "" {
+			log.Infof("测试结束，正在自动清理（删除）临时草稿文章 %s ...", articleID)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if delErr := DeleteDraftByBrowser(ctx, page, articleID); delErr != nil {
+				log.Warnf("清理临时草稿文章失败: %v", delErr)
+			} else {
+				log.Info("临时测试草稿文章已通过浏览器物理删除成功。")
+			}
+		}
+	}()
 
 	a := NewArticlePublishAction(page, store)
 
@@ -72,9 +103,10 @@ func TestPublishArticleManual(t *testing.T) {
 	}
 	time.Sleep(3 * time.Second)
 
-	// 输入标题
-	log.Info("正在输入测试标题...")
-	if err := a.inputTitle("移动云智能新空间：开启AI算力与模型服务的新篇章"); err != nil {
+	// 输入标题（每次测试加上时间戳使其唯一）
+	uniqueTitle := fmt.Sprintf("测试移动云发布%d", time.Now().Unix()%100000)
+	log.Infof("正在输入测试标题: %s", uniqueTitle)
+	if err := a.inputTitle(uniqueTitle); err != nil {
 		info, _ := page.Info()
 		currentURL := ""
 		if info != nil {
@@ -90,17 +122,23 @@ func TestPublishArticleManual(t *testing.T) {
 	content := "随着人工智能与大语言模型的快速发展，算力调度与高效的模型服务已经成为企业智能转型的核心基础设施。\n\n" +
 		"移动云智能新空间不仅提供了强大的算力支撑，还通过一站式的模型服务工具，降低了开发者与企业应用AI的门槛。无论是模型微调还是快速部署，均能在这里得到高效解决。"
 
-	if err := a.inputContent(content); err != nil {
+	if err := a.inputContent(content, nil); err != nil {
 		t.Fatalf("输入正文失败: %v", err)
 	}
 	time.Sleep(2 * time.Second)
 
-	// 显式设置封面模式为无封面，规避因为没有封面图被前端拦截导致点击发布按钮无效的问题
-	log.Info("正在设置封面模式为“无封面”...")
-	if err := a.setCoverMode("无封面"); err != nil {
+	// 显式设置封面模式为单图，测试封面上传
+	log.Info("正在设置封面模式为“单图”...")
+	if err := a.setCoverMode("单图"); err != nil {
 		t.Fatalf("设置封面模式失败: %v", err)
 	}
 	time.Sleep(1 * time.Second)
+
+	log.Info("正在上传测试封面图片...")
+	if err := a.uploadCovers([]string{testImagePath}, false); err != nil {
+		t.Fatalf("上传封面失败: %v", err)
+	}
+	time.Sleep(2 * time.Second)
 
 	// 验证内容是否真正写入
 	if err := a.verifyContent(); err != nil {
@@ -111,6 +149,11 @@ func TestPublishArticleManual(t *testing.T) {
 	screenshotPath := "../scratch_insert_result.png"
 	_ = page.MustScreenshot(screenshotPath)
 	log.Infof("已保存测试插图截图至: %s", screenshotPath)
+
+	// 尝试设置原创/首发选项
+	log.Info("正在测试设置原创/首发标记...")
+	a.setOriginal()
+	time.Sleep(2 * time.Second)
 
 	// 尝试点击底部的“定时发布”按钮以弹出时间设置弹窗
 	log.Info("正在点击底部的定时发布大按钮以弹出时间选择...")
@@ -145,7 +188,32 @@ func TestPublishArticleManual(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second)
 
-	time.Sleep(3 * time.Second)
+	// 等待编辑器保存草稿
+	log.Info("等待编辑器自动保存草稿以获取文章 ID...")
+	time.Sleep(5 * time.Second)
+
+	// 获取文章列表以提取新建文章的 ID，供 defer 清理
+	log.Info("从列表中寻找新建的临时文章以获取 ID 用于清理...")
+	ctxList, cancelList := context.WithTimeout(context.Background(), 1*time.Minute)
+	params := &ArticleListParams{
+		Status:   "all",
+		Page:     1,
+		PageSize: 5,
+	}
+	resp, errList := GetArticleList(ctxList, params, store)
+	cancelList()
+	if errList == nil && resp != nil {
+		for _, art := range resp.Articles {
+			if art.Title == uniqueTitle {
+				articleID = art.ArticleID
+				log.Infof("成功捕获新建草稿文章 ID: %s，将在测试退出时自动清理", articleID)
+				break
+			}
+		}
+	} else {
+		log.Warnf("获取文章列表以提取 ID 失败（不影响发文测试结果，但需要手动清理草稿 %s）: %v", uniqueTitle, errList)
+	}
+
 	// 再次截图，确认是否保存成功
 	_ = page.MustScreenshot("../scratch_save_draft_result.png")
 	log.Info("测试完成")
@@ -158,10 +226,29 @@ func TestPublishMicroManual(t *testing.T) {
 	if err := os.MkdirAll(testdataDir, 0755); err != nil {
 		t.Fatalf("创建临时测试目录失败: %v", err)
 	}
-	// 写入伪 PNG 数据
-	dummyPNG := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82")
-	if err := os.WriteFile(testImagePath, dummyPNG, 0644); err != nil {
-		t.Fatalf("创建临时测试图片失败: %v", err)
+	// 优先复制已有的真实合规图片
+	copied := false
+	possibleImages := []string{"../scratch_insert_result.png", "../scratch_save_draft_result.png", "../screenshot_upload_error.png", "../publish_after_first_click.png"}
+	for _, pImg := range possibleImages {
+		if _, err := os.Stat(pImg); err == nil {
+			input, errRead := os.ReadFile(pImg)
+			if errRead == nil {
+				errWrite := os.WriteFile(testImagePath, input, 0644)
+				if errWrite == nil {
+					copied = true
+					log.Infof("成功从 %s 复制真实合规图片用于上传测试", pImg)
+					break
+				}
+			}
+		}
+	}
+
+	if !copied {
+		log.Warn("无法复制真实图片，回退到写入 Dummy 图片数据")
+		dummyPNG := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82")
+		if err := os.WriteFile(testImagePath, dummyPNG, 0644); err != nil {
+			t.Fatalf("创建临时测试图片失败: %v", err)
+		}
 	}
 	// 提供一个网络图片 URL
 	webImageURL := "https://www.baidu.com/img/flexible/logo/pc/index.png"
@@ -277,7 +364,7 @@ func TestUpdateArticleManual(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	tempContent := "这是一篇临时创建的用于修改功能测试的文章。\n\n我们将在此文章发布后，通过接口对它执行二次修改，以验证修改接口的高容错性。"
-	if err := a.inputContent(tempContent); err != nil {
+	if err := a.inputContent(tempContent, nil); err != nil {
 		t.Fatalf("输入临时正文失败: %v", err)
 	}
 	time.Sleep(1 * time.Second)
@@ -287,15 +374,12 @@ func TestUpdateArticleManual(t *testing.T) {
 		t.Fatalf("设置无封面失败: %v", err)
 	}
 
-	// 点击发布
-	log.Info("发布临时文章...")
-	if err := a.clickPublish(nil); err != nil {
-		t.Fatalf("发布临时文章失败: %v", err)
-	}
-	time.Sleep(5 * time.Second)
+	// 保存为草稿
+	log.Info("等待草稿自动保存并退出...")
+	time.Sleep(8 * time.Second)
 
-	// 4. 从文章列表拉取，寻找刚发布的文章以获取其 pgc_id
-	log.Info("获取文章列表以提取新建文章的 ID...")
+	// 4. 从文章列表拉取，寻找刚生成的草稿以获取其 pgc_id
+	log.Info("获取文章列表以提取新建草稿的 ID...")
 	params := &ArticleListParams{
 		Status:   "all",
 		Page:     1,
@@ -314,31 +398,31 @@ func TestUpdateArticleManual(t *testing.T) {
 		}
 	}
 	if articleID == "" {
-		t.Fatalf("未能从文章列表中提取到刚发布的临时文章 ID (标题: %s)", uniqueTitle)
+		t.Fatalf("未能从文章列表中提取到刚生成的临时草稿 ID (标题: %s)", uniqueTitle)
 	}
-	log.Infof("成功获取新建临时文章 ID: %s", articleID)
+	log.Infof("成功获取新建临时草稿 ID: %s", articleID)
 
-	// 测试结束时，自动清理（删除）这篇临时文章！
+	// 测试结束时，自动清理（删除）这篇临时草稿！
 	defer func() {
-		log.Infof("测试结束，正在自动清理（删除）临时文章 %s ...", articleID)
-		if delErr := DeleteArticle(ctx, articleID, store); delErr != nil {
-			log.Warnf("清理临时文章失败: %v", delErr)
+		log.Infof("测试结束，正在自动清理（删除）临时草稿 %s ...", articleID)
+		if delErr := DeleteDraftByBrowser(ctx, page, articleID); delErr != nil {
+			log.Warnf("清理临时草稿失败: %v", delErr)
 		} else {
-			log.Info("临时测试文章已物理删除成功，无测试垃圾残留。")
+			log.Info("临时测试草稿已物理删除成功，无测试垃圾残留。")
 		}
 	}()
 
-	// 5. 对这篇临时文章执行修改测试
+	// 5. 对这篇临时草稿执行修改测试
 	newTitle := fmt.Sprintf("修改测试iOS27倒计时%d", time.Now().Unix()%10000)
-	newContent := "【修改测试成功】这是一次对刚刚临时新建文章的编辑修改测试，修改后的标题和这一段内容已成功生效！"
+	newContent := "【修改测试成功】这是一次对刚刚临时新建草稿的编辑修改测试，修改后的标题和这一段内容已成功生效！"
 
-	log.Infof("准备对文章 %s 开展修改测试，新标题: %s", articleID, newTitle)
+	log.Infof("准备对草稿 %s 开展修改测试，新标题: %s", articleID, newTitle)
 
-	// 调用 a.Update
-	if err := a.Update(ctx, articleID, newTitle, newContent, &ArticleOptions{}); err != nil {
-		t.Fatalf("修改临时文章失败: %v", err)
+	// 调用 a.Update，同样保存为草稿，不发布
+	if err := a.Update(ctx, articleID, newTitle, newContent, &ArticleOptions{SaveAsDraft: true}); err != nil {
+		t.Fatalf("修改临时草稿失败: %v", err)
 	}
 
-	log.Info("修改/更新文章集成测试圆满成功！")
+	log.Info("修改/更新文章集成测试（全草稿沙盒）圆满成功！")
 }
 
