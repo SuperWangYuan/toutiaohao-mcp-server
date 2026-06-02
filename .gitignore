@@ -32,3 +32,8 @@ cookies_*.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Workspace Temp Uploads
+temp_uploads/
+tmp/
+.tmp/

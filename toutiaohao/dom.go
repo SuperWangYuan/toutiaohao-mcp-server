@@ -81,7 +81,7 @@ const NetworkTrackerJS = `(() => {
 })()`
 
 func getLocalTempDir() string {
-	tempDir := "./.tmp"
+	tempDir := "./temp_uploads"
 	_ = os.MkdirAll(tempDir, 0755)
 	return tempDir
 }

@@ -1728,6 +1728,13 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	// 在最终点击发布按钮之前，再次执行 Mock 注入，确保在发布校验阶段全局数据和 API 请求安全
 	_, _ = a.page.Eval(StarOrderMockJS)
 
+	// 0. 如果需要定时发布，在点击任何发布按钮前设置定时发布时间（确保在页面大遮罩弹出前在底页完成设置）
+	if opts != nil && opts.PublishTime != nil {
+		if err := setPublishTime(a.page, opts.PublishTime); err != nil {
+			log.Warnf("设置定时发布时间失败: %v", err)
+		}
+	}
+
 	// 1. 先查找我们将要点击的发布按钮
 	el, sel, err := findElement(a.page, 3*time.Second, ArticlePublishButtonSelectors)
 	if err != nil {
@@ -1813,13 +1820,6 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	time.Sleep(1 * time.Second) // 稍微等一秒再截图，防止截到空白
 	_ = a.page.MustScreenshot(screenshotPath)
 	log.Infof("Saved first-click screenshot to: %s", screenshotPath)
-
-	// 如果需要定时发布，在确认发布前设置定时发布时间
-	if opts != nil && opts.PublishTime != nil {
-		if err := setPublishTime(a.page, opts.PublishTime); err != nil {
-			log.Warnf("设置定时发布时间失败: %v", err)
-		}
-	}
 
 	// 关键判定：
 	// 若点击的按钮本身即为“发布”字样（如修改文章时的直发底栏），
