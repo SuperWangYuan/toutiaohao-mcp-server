@@ -63,18 +63,18 @@ func ArticleStatusIsDraft(status interface{}) bool {
 	}
 }
 
-// ArticleStatusIsPublished 判断头条列表项是否为真正已发布状态。
+// ArticleStatusIsPublished 判断头条列表项是否为发布成功后的非草稿状态。
 func ArticleStatusIsPublished(status interface{}) bool {
 	switch v := status.(type) {
 	case float64:
-		return int(v) == 3
+		return int(v) == 3 || int(v) == 6
 	case int:
-		return v == 3
+		return v == 3 || v == 6
 	case int64:
-		return v == 3
+		return v == 3 || v == 6
 	case string:
 		normalized := strings.TrimSpace(strings.ToLower(v))
-		return normalized == "3" || normalized == "published" || normalized == "已发布"
+		return normalized == "3" || normalized == "6" || normalized == "published" || normalized == "已发布" || normalized == "审核中" || normalized == "已提交"
 	default:
 		return false
 	}
@@ -295,6 +295,9 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 	time.Sleep(3 * time.Second)
 
 	draftURLs := []string{
+		"https://mp.toutiao.com/profile_v4/graphic/articles?status=draft",
+		"https://mp.toutiao.com/profile_v4/graphic/articles?status=1",
+		"https://mp.toutiao.com/profile_v4/graphic/articles",
 		"https://mp.toutiao.com/profile_v4/graphic/list?status=draft",
 		"https://mp.toutiao.com/profile_v4/graphic/list?status=1",
 		"https://mp.toutiao.com/profile_v4/graphic/manage?status=draft",
@@ -313,6 +316,10 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 		url, _ := page.Eval(`() => window.location.href`)
 		title, _ := page.Eval(`() => document.title`)
 		log.Infof("当前页面URL: %v, 标题: %v", url, title)
+		if navInfo, errNav := clickDraftNavigation(page); errNav == nil && navInfo != "" {
+			log.Infof("草稿箱导航点击结果: %s", navInfo)
+			time.Sleep(4 * time.Second)
+		}
 		log.Info("尝试定位并点击删除按钮...")
 
 		var err error
@@ -393,6 +400,35 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 
 	log.Infof("草稿删除操作完成并通过列表复核")
 	return nil
+}
+
+func clickDraftNavigation(page *rod.Page) (string, error) {
+	result, err := page.Eval(`() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
+		const candidates = Array.from(document.querySelectorAll('a, span, div, li, button, [role="button"]')).filter(el => {
+			const text = normalize(el.textContent);
+			return visible(el) && (text === '草稿箱' || text.includes('草稿箱'));
+		});
+		for (const el of candidates) {
+			el.scrollIntoView({ block: 'center', inline: 'center' });
+			el.click();
+			return 'clicked draft navigation';
+		}
+		return 'draft navigation not found';
+	}`)
+	if err != nil {
+		return "", err
+	}
+	if result == nil {
+		return "", nil
+	}
+	return result.Value.Str(), nil
 }
 
 func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle string) (string, error) {

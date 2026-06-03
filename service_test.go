@@ -25,7 +25,7 @@ func TestArticleStatusIsDraftFalse(t *testing.T) {
 }
 
 func TestArticleStatusIsPublished(t *testing.T) {
-	cases := []interface{}{float64(3), int(3), int64(3), "3", "published", "已发布"}
+	cases := []interface{}{float64(3), int(3), int64(3), float64(6), int(6), int64(6), "3", "6", "published", "已发布", "审核中", "已提交"}
 	for _, tc := range cases {
 		if !toutiaohao.ArticleStatusIsPublished(tc) {
 			t.Fatalf("expected %v to be treated as published", tc)
