@@ -12,6 +12,7 @@ import (
 	"github.com/example/toutiaohao-mcp-server/configs"
 	"github.com/example/toutiaohao-mcp-server/cookies"
 	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -492,6 +493,9 @@ func clickDraftNavigation(page *rod.Page) (string, error) {
 
 func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle string) (string, error) {
 	result, err := page.Eval(`(articleID, articleTitle) => {
+		document.querySelectorAll('.mcp-draft-action-delete, .mcp-draft-action-more').forEach(el => {
+			el.classList.remove('mcp-draft-action-delete', 'mcp-draft-action-more');
+		});
 		const visible = (el) => {
 			if (!el) return false;
 			const style = window.getComputedStyle(el);
@@ -509,11 +513,6 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 				(title && text.includes(title)) ||
 				(titlePrefix && text.includes(titlePrefix)) ||
 				(titleLoose && text.includes(titleLoose));
-		};
-		const clickLikeUser = (el) => {
-			['pointerover', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
-				el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
-			});
 		};
 		const leafSelectors = 'a, span, div, p, h1, h2, h3, td, [href], [class*="title"]';
 		const leaves = Array.from(document.querySelectorAll(leafSelectors)).filter(el => visible(el) && matches(el));
@@ -541,19 +540,25 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 			const btns = Array.from(card.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible);
 			const deleteBtn = btns.find(btn => normalize(btn.textContent) === '删除' || normalize(btn.getAttribute('aria-label')).includes('删除') || String(btn.className || '').includes('delete'));
 			if (deleteBtn) {
-				clickLikeUser(deleteBtn.closest('button, a, [role="button"]') || deleteBtn);
-				return 'clicked delete';
+				const target = deleteBtn.closest('button, a, [role="button"]') || deleteBtn;
+				target.classList.add('mcp-draft-action-delete');
+				return 'marked delete';
 			}
 			const moreBtn = btns.find(btn => {
 				const text = normalize(btn.textContent);
 				const cls = String(btn.className || '').toLowerCase();
 				const aria = normalize(btn.getAttribute('aria-label'));
-				return text === '更多' || text === '···' || text === '...' || text.includes('更多') || aria.includes('更多') ||
-					cls.includes('more') || cls.includes('operation') || cls.includes('action');
+				const titleText = normalize(btn.getAttribute('title'));
+				const rect = btn.getBoundingClientRect();
+				const compact = rect.width > 0 && rect.width <= 96 && rect.height > 0 && rect.height <= 48;
+				return text === '更多' || text === '···' || text === '...' || text === '⋯' ||
+					text.includes('更多') || aria.includes('更多') || titleText.includes('更多') ||
+					(cls.includes('more') && compact);
 			});
 			if (moreBtn) {
-				clickLikeUser(moreBtn.closest('button, a, [role="button"]') || moreBtn);
-				return 'clicked more';
+				const target = moreBtn.closest('button, a, [role="button"]') || moreBtn;
+				target.classList.add('mcp-draft-action-more');
+				return 'marked more';
 			}
 		}
 		return 'no matching card found';
@@ -564,5 +569,41 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 	if result == nil {
 		return "", nil
 	}
-	return result.Value.Str(), nil
+	resultStr := result.Value.Str()
+	switch resultStr {
+	case "marked delete":
+		if err := physicalClickMarkedElement(page, ".mcp-draft-action-delete"); err != nil {
+			return resultStr, err
+		}
+		return "clicked delete", nil
+	case "marked more":
+		if err := physicalClickMarkedElement(page, ".mcp-draft-action-more"); err != nil {
+			return resultStr, err
+		}
+		return "clicked more", nil
+	default:
+		return resultStr, nil
+	}
+}
+
+func physicalClickMarkedElement(page *rod.Page, selector string) error {
+	el, err := page.Timeout(3 * time.Second).Element(selector)
+	if err != nil {
+		return fmt.Errorf("定位标记元素失败 %s: %w", selector, err)
+	}
+	pt, err := el.Interactable()
+	if err != nil {
+		log.Warnf("标记元素无法物理点击，回退 JS 点击 %s: %v", selector, err)
+		_, jsErr := el.Eval(`() => {
+			['pointerover', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
+				this.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+			});
+		}`)
+		return jsErr
+	}
+	log.Infof("物理点击草稿操作按钮 %s，坐标 (%f, %f)", selector, pt.X, pt.Y)
+	_ = page.Mouse.MoveTo(*pt)
+	_ = page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+	_ = page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+	return nil
 }
