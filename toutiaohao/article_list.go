@@ -294,111 +294,68 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 	_ = page.Timeout(10 * time.Second).WaitLoad()
 	time.Sleep(3 * time.Second)
 
-	// 导航到草稿列表页
-	if err := page.Navigate("https://mp.toutiao.com/profile_v4/graphic/list?status=1"); err != nil {
-		return fmt.Errorf("导航到草稿列表页失败: %w", err)
+	draftURLs := []string{
+		"https://mp.toutiao.com/profile_v4/graphic/list?status=draft",
+		"https://mp.toutiao.com/profile_v4/graphic/list?status=1",
+		"https://mp.toutiao.com/profile_v4/graphic/manage?status=draft",
+		"https://mp.toutiao.com/profile_v4/graphic/manage?status=1",
 	}
-	_ = page.Timeout(10 * time.Second).WaitLoad()
-	time.Sleep(4 * time.Second)
 
-	// 输出页面标题和 URL 以确认已登录
-	url, _ := page.Eval(`() => window.location.href`)
-	title, _ := page.Eval(`() => document.title`)
-	log.Infof("当前页面URL: %v, 标题: %v", url, title)
-
-	// 查找文章列表中的"更多"操作菜单和"删除"按钮
-	// 头条草稿列表中每个文章卡片通常有一个"更多"按钮或直接有删除/编辑按钮
-	log.Info("尝试定位并点击删除按钮...")
-
-	// JS: 通过文章标题找到对应的卡片，再找卡片内的删除按钮
-	// 测试文章的标题含"测试"
-	result, err := page.Eval(`(articleID, articleTitle) => {
-		const visible = (el) => {
-			if (!el) return false;
-			const style = window.getComputedStyle(el);
-			const rect = el.getBoundingClientRect();
-			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-		};
-		const matches = (el) => {
-			let html = el.innerHTML || '';
-			let text = (el.textContent || '').trim();
-			return (articleID && (html.includes(articleID) || text.includes(articleID))) ||
-				(articleTitle && text.includes(articleTitle));
-		};
-		const findCardFromLeaf = () => {
-			const leaves = Array.from(document.querySelectorAll('a, span, div, p, h1, h2, h3, td')).filter(el => visible(el) && matches(el));
-			for (const leaf of leaves) {
-				let cur = leaf;
-				for (let depth = 0; cur && depth < 8; depth++, cur = cur.parentElement) {
-					const cls = String(cur.className || '');
-					if (cur.tagName === 'TR' || cur.tagName === 'LI' || cls.includes('item') || cls.includes('card') || cls.includes('article')) {
-						return cur;
-					}
-				}
-			}
-			return null;
-		};
-
-		let cards = Array.from(document.querySelectorAll('div[class*="item"], div[class*="card"], li[class*="item"], tr, article'));
-		const leafCard = findCardFromLeaf();
-		if (leafCard && !cards.includes(leafCard)) cards.unshift(leafCard);
-		for (let card of cards) {
-			if (matches(card)) {
-				card.scrollIntoView({ block: 'center', inline: 'center' });
-				card.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true, view: window }));
-				card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
-				// 找到了！在该卡片范围内找删除按钮
-				let btns = card.querySelectorAll('button, span, a');
-				for (let btn of btns) {
-					let t = (btn.textContent || '').trim();
-					if (t === '删除' && visible(btn)) {
-						btn.click();
-						return 'clicked delete';
-					}
-				}
-				// 没找到删除，找更多/操作
-				for (let btn of btns) {
-					let t = (btn.textContent || '').trim();
-					if ((t === '更多' || t === '⋮' || t === '···' || t.includes('更多')) && visible(btn)) {
-						btn.click();
-						return 'clicked more';
-					}
-				}
-			}
+	var resultStr string
+	for _, draftURL := range draftURLs {
+		if err := page.Navigate(draftURL); err != nil {
+			log.Warnf("导航到草稿列表页失败 %s: %v", draftURL, err)
+			continue
 		}
-		return 'no matching card found';
-	}`, articleID, articleTitle)
-	if err != nil {
-		log.Warnf("查找文章卡片失败: %v", err)
+		_ = page.Timeout(10 * time.Second).WaitLoad()
+		time.Sleep(4 * time.Second)
+
+		url, _ := page.Eval(`() => window.location.href`)
+		title, _ := page.Eval(`() => document.title`)
+		log.Infof("当前页面URL: %v, 标题: %v", url, title)
+		log.Info("尝试定位并点击删除按钮...")
+
+		var err error
+		resultStr, err = clickDraftDeleteOnCurrentPage(page, articleID, articleTitle)
+		if err != nil {
+			log.Warnf("查找文章卡片失败: %v", err)
+			continue
+		}
+		log.Infof("查找结果: %s", resultStr)
+		if resultStr != "" && !strings.Contains(resultStr, "no matching") {
+			break
+		}
 	}
-	resultStr := ""
-	if result != nil {
-		resultStr = result.Value.Str()
-	}
-	log.Infof("查找结果: %s", resultStr)
 	if resultStr == "" || strings.Contains(resultStr, "no matching") {
-		return fmt.Errorf("未在草稿列表中找到待删除文章: id=%s title=%s", articleID, articleTitle)
+		safeScreenshot(page, "./screenshot_delete_draft_not_found.png")
+		return fmt.Errorf("未在草稿列表中找到待删除文章: id=%s title=%s，已保存截图 screenshot_delete_draft_not_found.png", articleID, articleTitle)
 	}
 	time.Sleep(2 * time.Second)
 
-	// 如果点了更多，等待菜单弹出后再点删除
-	menuRes, _ := page.Eval(`() => {
-		const visible = (el) => {
-			if (!el) return false;
-			const style = window.getComputedStyle(el);
-			const rect = el.getBoundingClientRect();
-			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-		};
-		let btns = document.querySelectorAll('span, button, a');
-		for (let btn of btns) {
-			let t = (btn.textContent || '').trim();
-			if (t === '删除' && visible(btn)) {
-				btn.click();
-				return 'clicked delete after more';
+	// 如果点了更多，等待菜单弹出后再点删除。直接点到删除时不要再全页面扫，防止误点下一篇。
+	menuResult := ""
+	if strings.Contains(resultStr, "clicked more") {
+		menuRes, _ := page.Eval(`() => {
+			const visible = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			};
+			let btns = document.querySelectorAll('span, button, a, div, [role="button"]');
+			for (let btn of btns) {
+				let t = (btn.textContent || '').trim();
+				if (t === '删除' && visible(btn)) {
+					btn.click();
+					return 'clicked delete after more';
+				}
 			}
+			return 'no delete after more';
+		}`)
+		if menuRes != nil {
+			menuResult = menuRes.Value.Str()
 		}
-		return 'no delete after more';
-	}`)
+	}
 	time.Sleep(2 * time.Second)
 
 	// 确认弹窗
@@ -414,8 +371,8 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 		return 'no confirm';
 	}`)
 	time.Sleep(2 * time.Second)
-	if menuRes != nil {
-		log.Infof("删除菜单点击结果: %s", menuRes.Value.Str())
+	if menuResult != "" {
+		log.Infof("删除菜单点击结果: %s", menuResult)
 	}
 	if confirmRes != nil {
 		log.Infof("删除确认点击结果: %s", confirmRes.Value.Str())
@@ -436,4 +393,76 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 
 	log.Infof("草稿删除操作完成并通过列表复核")
 	return nil
+}
+
+func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle string) (string, error) {
+	result, err := page.Eval(`(articleID, articleTitle) => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const normalize = (s) => String(s || '').replace(/\s+/g, '').replace(/…|\.{3}/g, '').trim();
+		const title = normalize(articleTitle);
+		const titlePrefix = title.length > 10 ? title.slice(0, 10) : title;
+		const titleLoose = title.length > 6 ? title.slice(0, 6) : title;
+		const matches = (el) => {
+			const html = normalize(el.innerHTML || '');
+			const text = normalize(el.textContent || '');
+			return (articleID && (html.includes(articleID) || text.includes(articleID))) ||
+				(title && text.includes(title)) ||
+				(titlePrefix && text.includes(titlePrefix)) ||
+				(titleLoose && text.includes(titleLoose));
+		};
+		const leafSelectors = 'a, span, div, p, h1, h2, h3, td, [href], [class*="title"]';
+		const leaves = Array.from(document.querySelectorAll(leafSelectors)).filter(el => visible(el) && matches(el));
+		const cards = [];
+		for (const leaf of leaves) {
+			let cur = leaf;
+			for (let depth = 0; cur && depth < 10; depth++, cur = cur.parentElement) {
+				const cls = String(cur.className || '').toLowerCase();
+				const text = normalize(cur.textContent || '');
+				if (cur.tagName === 'TR' || cur.tagName === 'LI' || cls.includes('item') || cls.includes('card') ||
+					cls.includes('article') || cls.includes('work') || cls.includes('list') || text.includes('编辑')) {
+					if (!cards.includes(cur)) cards.push(cur);
+					break;
+				}
+			}
+		}
+		for (const card of Array.from(document.querySelectorAll('div[class*="item"], div[class*="card"], div[class*="article"], div[class*="work"], li[class*="item"], tr, article'))) {
+			if (visible(card) && matches(card) && !cards.includes(card)) cards.push(card);
+		}
+		for (const card of cards) {
+			card.scrollIntoView({ block: 'center', inline: 'center' });
+			['pointerover', 'mouseover', 'mouseenter'].forEach(name => {
+				card.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+			});
+			const btns = Array.from(card.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible);
+			const deleteBtn = btns.find(btn => normalize(btn.textContent) === '删除' || normalize(btn.getAttribute('aria-label')).includes('删除') || String(btn.className || '').includes('delete'));
+			if (deleteBtn) {
+				deleteBtn.click();
+				return 'clicked delete';
+			}
+			const moreBtn = btns.find(btn => {
+				const text = normalize(btn.textContent);
+				const cls = String(btn.className || '').toLowerCase();
+				const aria = normalize(btn.getAttribute('aria-label'));
+				return text === '更多' || text === '···' || text === '...' || text.includes('更多') || aria.includes('更多') ||
+					cls.includes('more') || cls.includes('operation') || cls.includes('action');
+			});
+			if (moreBtn) {
+				moreBtn.click();
+				return 'clicked more';
+			}
+		}
+		return 'no matching card found';
+	}`, articleID, articleTitle)
+	if err != nil {
+		return "", err
+	}
+	if result == nil {
+		return "", nil
+	}
+	return result.Value.Str(), nil
 }

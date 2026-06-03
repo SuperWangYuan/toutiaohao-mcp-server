@@ -218,15 +218,25 @@ func (s *ToutiaoService) GetArticleList(ctx context.Context, params *toutiaohao.
 
 // DeleteArticle 删除文章
 func (s *ToutiaoService) DeleteArticle(ctx context.Context, articleID string) error {
-	// 先用 HTTP API 尝试删除（适用于已发布/审核中的文章）
-	err := toutiaohao.DeleteArticle(ctx, articleID, s.cookieStore)
-	if err == nil {
-		return nil
+	articleTitle := s.findArticleTitleForDelete(ctx, articleID)
+
+	// 先用 HTTP API 尝试删除（适用于已发布/审核中的文章），但必须复核，因为草稿删除可能返回成功却不生效。
+	errAPI := toutiaohao.DeleteArticle(ctx, articleID, s.cookieStore)
+	if errAPI == nil {
+		time.Sleep(2 * time.Second)
+		exists, detail := s.articleStillExistsForDelete(ctx, articleID, articleTitle)
+		if !exists {
+			log.Infof("HTTP API 删除完成并通过列表复核: %s", articleID)
+			return nil
+		}
+		log.Warnf("HTTP API 删除返回成功但列表复核仍存在，回退浏览器删除: %s", detail)
+	} else {
+		log.Warnf("HTTP API 删除失败: %v，回退到浏览器自动化删除...", errAPI)
 	}
 
-	// 如果 HTTP 删除失败（可能是草稿/待审核状态），回退到浏览器自动化
-	log.Warnf("HTTP API 删除失败: %v，回退到浏览器自动化删除...", err)
-	articleTitle := s.findArticleTitleForDelete(ctx, articleID)
+	if articleTitle == "" {
+		articleTitle = s.findArticleTitleForDelete(ctx, articleID)
+	}
 
 	b := browser.NewBrowser(false)
 	defer b.Close()
@@ -234,13 +244,41 @@ func (s *ToutiaoService) DeleteArticle(ctx context.Context, articleID string) er
 	page := b.NewPage()
 	defer page.Close()
 
-	return toutiaohao.DeleteDraftByBrowserWithTitle(ctx, page, articleID, articleTitle)
+	if err := toutiaohao.DeleteDraftByBrowserWithTitle(ctx, page, articleID, articleTitle); err != nil {
+		return err
+	}
+
+	time.Sleep(2 * time.Second)
+	exists, detail := s.articleStillExistsForDelete(ctx, articleID, articleTitle)
+	if exists {
+		return fmt.Errorf("删除操作完成后列表复核仍存在: %s", detail)
+	}
+	log.Infof("文章删除完成并通过 API 列表复核: %s", articleID)
+	return nil
+}
+
+func (s *ToutiaoService) articleStillExistsForDelete(ctx context.Context, articleID, articleTitle string) (bool, string) {
+	statuses := []string{"draft", "all", "published", "review"}
+	for _, status := range statuses {
+		resp, err := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 50, Status: status})
+		if err != nil || resp == nil {
+			continue
+		}
+		for _, article := range resp.Articles {
+			matchesID := article.ArticleID == articleID || article.ID == articleID || strings.Contains(article.ArticleURL, articleID)
+			matchesTitle := articleTitle != "" && article.Title == articleTitle
+			if matchesID || matchesTitle {
+				return true, fmt.Sprintf("status=%s article_id=%s title=%s raw_status=%v", status, article.ArticleID, article.Title, article.Status)
+			}
+		}
+	}
+	return false, ""
 }
 
 func (s *ToutiaoService) findArticleTitleForDelete(ctx context.Context, articleID string) string {
-	statuses := []string{"draft", "all"}
+	statuses := []string{"draft", "all", "published", "review"}
 	for _, status := range statuses {
-		resp, err := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 20, Status: status})
+		resp, err := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 50, Status: status})
 		if err != nil || resp == nil {
 			continue
 		}
