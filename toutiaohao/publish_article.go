@@ -271,7 +271,11 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 		}
 	}
 
-	log.Info("Article published successfully")
+	if opts != nil && opts.SaveAsDraft {
+		log.Info("Article draft save browser flow completed")
+	} else {
+		log.Info("Article publish browser flow completed, waiting for service-level verification")
+	}
 	return nil
 }
 

@@ -46,6 +46,55 @@ type ArticleItem struct {
 	ArticleURL      string      `json:"article_url"`
 }
 
+// ArticleStatusIsDraft 判断头条列表项是否仍处于草稿状态。
+func ArticleStatusIsDraft(status interface{}) bool {
+	switch v := status.(type) {
+	case float64:
+		return int(v) == 1
+	case int:
+		return v == 1
+	case int64:
+		return v == 1
+	case string:
+		normalized := strings.TrimSpace(strings.ToLower(v))
+		return normalized == "1" || normalized == "draft" || normalized == "草稿"
+	default:
+		return false
+	}
+}
+
+// ArticleStatusIsPublished 判断头条列表项是否为真正已发布状态。
+func ArticleStatusIsPublished(status interface{}) bool {
+	switch v := status.(type) {
+	case float64:
+		return int(v) == 3
+	case int:
+		return v == 3
+	case int64:
+		return v == 3
+	case string:
+		normalized := strings.TrimSpace(strings.ToLower(v))
+		return normalized == "3" || normalized == "published" || normalized == "已发布"
+	default:
+		return false
+	}
+}
+
+func articleStatusMatchesFilter(status interface{}, filter string) bool {
+	switch strings.TrimSpace(strings.ToLower(filter)) {
+	case "", "all":
+		return true
+	case "draft":
+		return ArticleStatusIsDraft(status)
+	case "published":
+		return ArticleStatusIsPublished(status)
+	case "review":
+		return !ArticleStatusIsDraft(status) && !ArticleStatusIsPublished(status)
+	default:
+		return true
+	}
+}
+
 // NewArticleListParams 创建文章列表参数（含默认值）
 func NewArticleListParams(args map[string]interface{}) *ArticleListParams {
 	params := &ArticleListParams{
@@ -114,16 +163,25 @@ func GetArticleList(ctx context.Context, params *ArticleListParams, cookieStore 
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	// 设置 article_id（优先用 id 字段，回退到 pgc_id）
+	// 设置 article_id（优先用 id 字段，回退到 pgc_id），并对头条偶发忽略 status 参数的返回做客户端兜底过滤。
+	filtered := make([]ArticleItem, 0, len(resp.Data.Articles))
 	for i := range resp.Data.Articles {
 		if resp.Data.Articles[i].ID != "" {
 			resp.Data.Articles[i].ArticleID = resp.Data.Articles[i].ID
 		}
+		if articleStatusMatchesFilter(resp.Data.Articles[i].Status, params.Status) {
+			filtered = append(filtered, resp.Data.Articles[i])
+		}
+	}
+
+	total := resp.Data.Total
+	if strings.TrimSpace(strings.ToLower(params.Status)) != "all" {
+		total = len(filtered)
 	}
 
 	return &ArticleListResponse{
-		Articles: resp.Data.Articles,
-		Total:    resp.Data.Total,
+		Articles: filtered,
+		Total:    total,
 	}, nil
 }
 

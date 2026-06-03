@@ -143,17 +143,30 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 		return nil, err
 	}
 
+	if opts != nil && opts.SaveAsDraft {
+		log.Info("[Step 6/7] 文章已按请求保存为草稿，跳过发布状态校验。")
+		return &toutiaohao.PublishResult{
+			Success:        true,
+			Message:        "文章已保存为草稿",
+			CoverStatus:    "草稿未校验封面状态",
+			OriginalStatus: "草稿未校验原创状态",
+		}, nil
+	}
+
 	log.Info("[Step 6/7] 物理发布指令提交完毕，等待同步进行发布后验证...")
 	log.Info("文章发布完成，等待3秒后获取最新列表进行核对...")
 	time.Sleep(3 * time.Second) // 等待后台同步
 
 	coverStatus := "无封面"
+	hasInlineImages := strings.Contains(content, "![") && strings.Contains(content, "](")
 	if opts != nil {
-		if len(opts.Images) >= 3 {
-			coverStatus = "三图"
-		} else if opts.CoverImage != "" || len(opts.Images) > 0 {
+		if opts.CoverImage != "" {
 			coverStatus = "单图"
-		} else if strings.Contains(content, "![") && strings.Contains(content, "](") {
+		} else if len(opts.Images) >= 3 && !hasInlineImages {
+			coverStatus = "三图"
+		} else if len(opts.Images) > 0 && !hasInlineImages {
+			coverStatus = "单图"
+		} else if hasInlineImages {
 			coverStatus = "自适应封面"
 		} else {
 			coverStatus = "无封面 (未提供任何封面图片)"
@@ -167,14 +180,19 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 		originalStatus = "原创"
 	}
 
-	respList, errList := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 5, Status: "all"})
+	respList, errList := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 20, Status: "all"})
 	if errList == nil && respList != nil && len(respList.Articles) > 0 {
 		for _, art := range respList.Articles {
 			if art.Title == title {
-				if articleStatusIsDraft(art.Status) {
+				if toutiaohao.ArticleStatusIsDraft(art.Status) {
 					errDraft := fmt.Errorf("文章提交后仍为草稿状态，ArticleID=%s status=%v", art.ArticleID, art.Status)
 					log.Errorf("发布后核对失败：%v", errDraft)
 					return nil, errDraft
+				}
+				if !toutiaohao.ArticleStatusIsPublished(art.Status) {
+					errStatus := fmt.Errorf("文章提交后未达到已发布状态，ArticleID=%s status=%v", art.ArticleID, art.Status)
+					log.Errorf("发布后核对失败：%v", errStatus)
+					return nil, errStatus
 				}
 				log.Infof("发布后核对验证成功：列表中已找到标题为「%s」的文章，ArticleID 为 %s", title, art.ArticleID)
 				return &toutiaohao.PublishResult{
@@ -188,29 +206,9 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 		}
 	}
 
-	log.Warn("在最新列表中未匹配到刚才发布的文章，可能存在网络或系统同步延迟")
-	return &toutiaohao.PublishResult{
-		Success:        true,
-		Message:        "文章发布完成，但暂未在列表中检测到，可能存在延迟",
-		CoverStatus:    coverStatus,
-		OriginalStatus: originalStatus,
-	}, nil
-}
-
-func articleStatusIsDraft(status interface{}) bool {
-	switch v := status.(type) {
-	case float64:
-		return int(v) == 1
-	case int:
-		return v == 1
-	case int64:
-		return v == 1
-	case string:
-		normalized := strings.TrimSpace(strings.ToLower(v))
-		return normalized == "1" || normalized == "draft" || normalized == "草稿"
-	default:
-		return false
-	}
+	errVerify := fmt.Errorf("发布后未在最新文章列表中匹配到标题「%s」，不能确认发布成功", title)
+	log.Errorf("发布后核对失败：%v", errVerify)
+	return nil, errVerify
 }
 
 // GetArticleList 获取文章列表
