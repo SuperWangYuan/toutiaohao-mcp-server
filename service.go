@@ -207,6 +207,7 @@ func (s *ToutiaoService) DeleteArticle(ctx context.Context, articleID string) er
 
 	// 如果 HTTP 删除失败（可能是草稿/待审核状态），回退到浏览器自动化
 	log.Warnf("HTTP API 删除失败: %v，回退到浏览器自动化删除...", err)
+	articleTitle := s.findArticleTitleForDelete(ctx, articleID)
 
 	b := browser.NewBrowser(false)
 	defer b.Close()
@@ -214,7 +215,25 @@ func (s *ToutiaoService) DeleteArticle(ctx context.Context, articleID string) er
 	page := b.NewPage()
 	defer page.Close()
 
-	return toutiaohao.DeleteDraftByBrowser(ctx, page, articleID)
+	return toutiaohao.DeleteDraftByBrowserWithTitle(ctx, page, articleID, articleTitle)
+}
+
+func (s *ToutiaoService) findArticleTitleForDelete(ctx context.Context, articleID string) string {
+	statuses := []string{"draft", "all"}
+	for _, status := range statuses {
+		resp, err := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 20, Status: status})
+		if err != nil || resp == nil {
+			continue
+		}
+		for _, article := range resp.Articles {
+			if article.ArticleID == articleID || article.ID == articleID || strings.Contains(article.ArticleURL, articleID) {
+				log.Infof("删除回退定位到文章标题: %s", article.Title)
+				return article.Title
+			}
+		}
+	}
+	log.Warnf("删除回退未能从列表定位文章标题，仅使用 ID 删除: %s", articleID)
+	return ""
 }
 
 // GetAccountOverview 获取账户概览（通过浏览器自动化）

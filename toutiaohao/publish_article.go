@@ -1799,6 +1799,26 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	// 在最终点击发布按钮之前，再次执行 Mock 注入，确保在发布校验阶段全局数据和 API 请求安全
 	_, _ = a.page.Eval(StarOrderMockJS)
 
+	if opts != nil && opts.PublishTime != nil {
+		clickedSchedule, scheduleInfo, errSchedule := clickVisiblePageButtonByText(
+			a.page,
+			[]string{"定时发布", "预览并定时发布"},
+			[]string{"预览并发布", "确认发布", "确认发表", "返回编辑", "取消"},
+			"initial scheduled publish button",
+		)
+		if errSchedule == nil && scheduleInfo != "" {
+			log.Infof("定时发布首选按钮点击结果: %s", scheduleInfo)
+		}
+		if errSchedule == nil && clickedSchedule {
+			time.Sleep(1500 * time.Millisecond)
+			screenshotPath := "./publish_after_first_click.png"
+			_ = a.page.MustScreenshot(screenshotPath)
+			log.Infof("Saved first-click screenshot to: %s", screenshotPath)
+			return a.clickScheduledPublishConfirm(opts.PublishTime)
+		}
+		log.Warnf("未能直接点击编辑页定时发布按钮，将回退到预览并发布流程: %v", errSchedule)
+	}
+
 	// 1. 先查找我们将要点击的发布按钮
 	el, sel, err := findElement(a.page, 3*time.Second, ArticlePublishButtonSelectors)
 	if err != nil {
@@ -2075,7 +2095,21 @@ func (a *ArticlePublishAction) clickScheduledPublishConfirm(publishTime interfac
 		}
 		if !onPreviewPage {
 			if i == 6 {
-				log.Warnf("点击预览并发布后仍未进入预览确认页，跳过定时设置并等待页面发布结果。最后状态: %s", lastResult)
+				clickedPreview, previewInfo, errPreview := clickVisiblePageButtonByText(
+					a.page,
+					[]string{"预览并发布", "发布"},
+					[]string{"定时发布", "预览并定时发布", "确认发布", "返回编辑", "取消"},
+					"scheduled fallback preview publish button",
+				)
+				if errPreview == nil && previewInfo != "" {
+					lastResult = previewInfo
+					log.Warnf("定时发布按钮未触发弹窗或确认页，已改点预览并发布兜底: %s", previewInfo)
+				}
+				if errPreview == nil && clickedPreview {
+					time.Sleep(1500 * time.Millisecond)
+					continue
+				}
+				log.Warnf("点击发布主按钮后仍未进入预览确认页，跳过定时设置并等待页面发布结果。最后状态: %s", lastResult)
 				return waitForPublishResult(a.page, 45*time.Second)
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -2103,6 +2137,20 @@ func (a *ArticlePublishAction) clickScheduledPublishConfirm(publishTime interfac
 				}
 				return nil
 			}
+		}
+
+		clickedConfirm, confirmInfo, errConfirm := clickVisiblePageButtonByText(
+			a.page,
+			[]string{"确认发布", "确定发布", "发布文章", "发布"},
+			[]string{"预览并发布", "预览并定时发布", "返回编辑", "取消"},
+			"scheduled publish fallback confirm page",
+		)
+		if errConfirm == nil && confirmInfo != "" {
+			lastResult = confirmInfo
+		}
+		if errConfirm == nil && clickedConfirm {
+			log.Warnf("预览确认页未找到定时发布按钮，已降级点击确认发布: %s", confirmInfo)
+			return waitForPublishResult(a.page, 90*time.Second)
 		}
 
 		if i == 5 || i == 12 {

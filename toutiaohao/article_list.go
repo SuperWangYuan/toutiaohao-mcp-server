@@ -34,16 +34,16 @@ type ArticleListResponse struct {
 
 // ArticleItem 文章条目
 type ArticleItem struct {
-	ArticleID     string      `json:"article_id"`
-	ID            string      `json:"id"`
-	Title         string      `json:"title"`
-	Status        interface{} `json:"status"`
-	CreateTime    interface{} `json:"create_time"`
-	ReadCount     int         `json:"go_detail_count_v2"`
-	CommentCount  int         `json:"comment_count"`
-	DiggCount     int         `json:"digg_count"`
-	ImpressionCount int       `json:"impression_count"`
-	ArticleURL    string      `json:"article_url"`
+	ArticleID       string      `json:"article_id"`
+	ID              string      `json:"id"`
+	Title           string      `json:"title"`
+	Status          interface{} `json:"status"`
+	CreateTime      interface{} `json:"create_time"`
+	ReadCount       int         `json:"go_detail_count_v2"`
+	CommentCount    int         `json:"comment_count"`
+	DiggCount       int         `json:"digg_count"`
+	ImpressionCount int         `json:"impression_count"`
+	ArticleURL      string      `json:"article_url"`
 }
 
 // NewArticleListParams 创建文章列表参数（含默认值）
@@ -222,7 +222,12 @@ func injectCookies(req *http.Request, cookieData []byte) {
 
 // DeleteDraftByBrowser 用浏览器删除草稿（HTTP API 不支持删除草稿状态的文章）
 func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string) error {
-	log.Infof("正在用浏览器删除草稿: %s", articleID)
+	return DeleteDraftByBrowserWithTitle(ctx, page, articleID, "")
+}
+
+// DeleteDraftByBrowserWithTitle 用浏览器删除草稿，支持通过文章标题定位列表卡片。
+func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleID string, articleTitle string) error {
+	log.Infof("正在用浏览器删除草稿: %s 标题: %s", articleID, articleTitle)
 
 	// 导航到头条号主页，确保 cookie 生效
 	if err := page.Navigate("https://mp.toutiao.com"); err != nil {
@@ -238,7 +243,6 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 	_ = page.Timeout(10 * time.Second).WaitLoad()
 	time.Sleep(4 * time.Second)
 
-
 	// 输出页面标题和 URL 以确认已登录
 	url, _ := page.Eval(`() => window.location.href`)
 	title, _ := page.Eval(`() => document.title`)
@@ -250,18 +254,46 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 
 	// JS: 通过文章标题找到对应的卡片，再找卡片内的删除按钮
 	// 测试文章的标题含"测试"
-	result, err := page.Eval(`(articleID) => {
-		// 获取所有可见的卡片元素
-		let cards = document.querySelectorAll('div[class*="item"], div[class*="card"], li[class*="item"], tr');
+	result, err := page.Eval(`(articleID, articleTitle) => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const matches = (el) => {
+			let html = el.innerHTML || '';
+			let text = (el.textContent || '').trim();
+			return (articleID && (html.includes(articleID) || text.includes(articleID))) ||
+				(articleTitle && text.includes(articleTitle));
+		};
+		const findCardFromLeaf = () => {
+			const leaves = Array.from(document.querySelectorAll('a, span, div, p, h1, h2, h3, td')).filter(el => visible(el) && matches(el));
+			for (const leaf of leaves) {
+				let cur = leaf;
+				for (let depth = 0; cur && depth < 8; depth++, cur = cur.parentElement) {
+					const cls = String(cur.className || '');
+					if (cur.tagName === 'TR' || cur.tagName === 'LI' || cls.includes('item') || cls.includes('card') || cls.includes('article')) {
+						return cur;
+					}
+				}
+			}
+			return null;
+		};
+
+		let cards = Array.from(document.querySelectorAll('div[class*="item"], div[class*="card"], li[class*="item"], tr, article'));
+		const leafCard = findCardFromLeaf();
+		if (leafCard && !cards.includes(leafCard)) cards.unshift(leafCard);
 		for (let card of cards) {
-			let html = card.innerHTML || '';
-			let text = (card.textContent || '').trim();
-			if (html.includes(articleID) || text.includes(articleID)) {
+			if (matches(card)) {
+				card.scrollIntoView({ block: 'center', inline: 'center' });
+				card.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true, view: window }));
+				card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
 				// 找到了！在该卡片范围内找删除按钮
 				let btns = card.querySelectorAll('button, span, a');
 				for (let btn of btns) {
 					let t = (btn.textContent || '').trim();
-					if (t === '删除' && btn.offsetParent !== null) {
+					if (t === '删除' && visible(btn)) {
 						btn.click();
 						return 'clicked delete';
 					}
@@ -269,7 +301,7 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 				// 没找到删除，找更多/操作
 				for (let btn of btns) {
 					let t = (btn.textContent || '').trim();
-					if ((t === '更多' || t === '⋮' || t === '···') && btn.offsetParent !== null) {
+					if ((t === '更多' || t === '⋮' || t === '···' || t.includes('更多')) && visible(btn)) {
 						btn.click();
 						return 'clicked more';
 					}
@@ -277,19 +309,32 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 			}
 		}
 		return 'no matching card found';
-	}`, articleID)
+	}`, articleID, articleTitle)
 	if err != nil {
 		log.Warnf("查找文章卡片失败: %v", err)
 	}
-	log.Infof("查找结果: %v", result)
+	resultStr := ""
+	if result != nil {
+		resultStr = result.Value.Str()
+	}
+	log.Infof("查找结果: %s", resultStr)
+	if resultStr == "" || strings.Contains(resultStr, "no matching") {
+		return fmt.Errorf("未在草稿列表中找到待删除文章: id=%s title=%s", articleID, articleTitle)
+	}
 	time.Sleep(2 * time.Second)
 
 	// 如果点了更多，等待菜单弹出后再点删除
-	page.Eval(`() => {
+	menuRes, _ := page.Eval(`() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
 		let btns = document.querySelectorAll('span, button, a');
 		for (let btn of btns) {
 			let t = (btn.textContent || '').trim();
-			if (t === '删除' && btn.offsetParent !== null) {
+			if (t === '删除' && visible(btn)) {
 				btn.click();
 				return 'clicked delete after more';
 			}
@@ -299,7 +344,7 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 	time.Sleep(2 * time.Second)
 
 	// 确认弹窗
-	page.Eval(`() => {
+	confirmRes, _ := page.Eval(`() => {
 		let btns = document.querySelectorAll('button, span');
 		for (let btn of btns) {
 			let t = (btn.textContent || '').trim();
@@ -311,7 +356,26 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 		return 'no confirm';
 	}`)
 	time.Sleep(2 * time.Second)
+	if menuRes != nil {
+		log.Infof("删除菜单点击结果: %s", menuRes.Value.Str())
+	}
+	if confirmRes != nil {
+		log.Infof("删除确认点击结果: %s", confirmRes.Value.Str())
+	}
 
-	log.Infof("草稿删除操作完成（结果需通过列表确认）")
+	_ = page.Reload()
+	_ = page.Timeout(10 * time.Second).WaitLoad()
+	time.Sleep(3 * time.Second)
+	existsRes, _ := page.Eval(`(articleID, articleTitle) => {
+		const html = document.body ? document.body.innerHTML || '' : '';
+		const text = document.body ? document.body.innerText || '' : '';
+		return (articleID && (html.includes(articleID) || text.includes(articleID))) ||
+			(articleTitle && text.includes(articleTitle));
+	}`, articleID, articleTitle)
+	if existsRes != nil && existsRes.Value.Bool() {
+		return fmt.Errorf("草稿删除后复核仍存在: id=%s title=%s", articleID, articleTitle)
+	}
+
+	log.Infof("草稿删除操作完成并通过列表复核")
 	return nil
 }
