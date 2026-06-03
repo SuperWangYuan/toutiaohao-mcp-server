@@ -1055,10 +1055,10 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 		}`)
 
-		// 每次上传前重新获取上传框元素，因为上传后 DOM 可能发生改变
-		coverEls, err := a.page.Timeout(3 * time.Second).Elements(`div.article-cover-add, [class*='cover'][class*='add'], .cover-upload-area, [class*='cover'] [class*='upload'], div.cover-container`)
+		// 每次上传前重新获取“空封面槽”，避免宽泛选择器命中外层容器后重复点击同一张封面。
+		coverEls, err := a.page.Timeout(3 * time.Second).Elements(`div.article-cover-add`)
 		if err != nil || len(coverEls) == 0 {
-			log.Warnf("Failed to find cover add slots, trying selector...")
+			log.Warnf("Failed to find exact cover add slots, trying fallback selectors...")
 			coverEl, _, err := findElement(a.page, 3*time.Second, ArticleCoverAddSelectors)
 			if err != nil {
 				return fmt.Errorf("cover area not found for image %d: %w", i+1, err)
@@ -1073,8 +1073,10 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 		var targetEl *rod.Element
 		if i < len(coverEls) {
 			targetEl = coverEls[i]
+		} else if len(coverEls) > 0 {
+			targetEl = coverEls[len(coverEls)-1]
 		} else {
-			targetEl = coverEls[0]
+			return fmt.Errorf("no available empty cover upload slot for image %d", i+1)
 		}
 
 		// 滚动到中间并使用 scrollIntoViewSafe，标记 class
@@ -1768,13 +1770,6 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	// 在最终点击发布按钮之前，再次执行 Mock 注入，确保在发布校验阶段全局数据和 API 请求安全
 	_, _ = a.page.Eval(StarOrderMockJS)
 
-	// 0. 如果需要定时发布，在点击任何发布按钮前设置定时发布时间（确保在页面大遮罩弹出前在底页完成设置）
-	if opts != nil && opts.PublishTime != nil {
-		if err := setPublishTime(a.page, opts.PublishTime); err != nil {
-			log.Warnf("设置定时发布时间失败: %v", err)
-		}
-	}
-
 	// 1. 先查找我们将要点击的发布按钮
 	el, sel, err := findElement(a.page, 3*time.Second, ArticlePublishButtonSelectors)
 	if err != nil {
@@ -1874,6 +1869,10 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	time.Sleep(1 * time.Second) // 稍微等一秒再截图，防止截到空白
 	_ = a.page.MustScreenshot(screenshotPath)
 	log.Infof("Saved first-click screenshot to: %s", screenshotPath)
+
+	if opts != nil && opts.PublishTime != nil {
+		return a.clickScheduledPublishConfirm(opts.PublishTime)
+	}
 
 	// 关键判定：
 	// 若点击的按钮本身即为“发布”字样（如修改文章时的直发底栏），
@@ -2010,6 +2009,81 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	time.Sleep(1 * time.Second)
 
 	// 等待并检测发布结果，最多等待 90 秒（包含跳转时间）
+	return waitForPublishResult(a.page, 90*time.Second)
+}
+
+func (a *ArticlePublishAction) clickScheduledPublishConfirm(publishTime interface{}) error {
+	log.Info("检测到定时发布参数，进入预览确认页后的定时发布流程...")
+	var lastResult string
+
+	for i := 0; i < 20; i++ {
+		info, errInfo := a.page.Info()
+		if errInfo == nil && info != nil && !strings.Contains(info.URL, "/graphic/publish") {
+			log.Infof("定时发布确认前页面已跳转（当前 URL: %s），判定流程已提交", info.URL)
+			return nil
+		}
+
+		if modalEl, errModal := findExistingTimingModal(a.page, "scheduled-confirm-loop"); errModal == nil && modalEl != nil {
+			if err := setPublishTime(a.page, publishTime); err != nil {
+				lastResult = err.Error()
+				log.Warnf("预览页定时弹窗设置失败: %v", err)
+			} else {
+				if err := waitForPublishResult(a.page, 25*time.Second); err != nil {
+					log.Warnf("定时发布提交后未检测到跳转或成功提示，继续交由发布后列表校验确认: %v", err)
+				}
+				return nil
+			}
+		}
+
+		clicked, infoClick, errClick := clickVisiblePageButtonByText(
+			a.page,
+			[]string{"预览并定时发布", "定时发布"},
+			[]string{"预览并发布", "确认发布", "确认发表", "立即发布", "返回编辑", "取消"},
+			"scheduled publish confirm page",
+		)
+		if errClick == nil && infoClick != "" {
+			lastResult = infoClick
+		}
+		if errClick == nil && clicked {
+			log.Infof("已点击预览确认页定时发布按钮: %s", infoClick)
+			time.Sleep(1500 * time.Millisecond)
+			if err := setPublishTime(a.page, publishTime); err != nil {
+				lastResult = err.Error()
+				log.Warnf("点击定时发布按钮后设置时间失败: %v", err)
+			} else {
+				if err := waitForPublishResult(a.page, 25*time.Second); err != nil {
+					log.Warnf("定时发布提交后未检测到跳转或成功提示，继续交由发布后列表校验确认: %v", err)
+				}
+				return nil
+			}
+		}
+
+		if i == 5 || i == 12 {
+			resRetry, errRetry := a.page.Eval(`() => {
+				const visible = (el) => {
+					if (!el) return false;
+					const style = window.getComputedStyle(el);
+					const rect = el.getBoundingClientRect();
+					return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+				};
+				const btn = Array.from(document.querySelectorAll('button, [role="button"], .byte-btn, .semi-button')).find(el => {
+					const text = (el.textContent || '').replace(/\s+/g, '').trim();
+					return visible(el) && (text === '预览并发布' || text === '预览并定时发布');
+				});
+				if (!btn) return JSON.stringify({ clicked: false });
+				btn.click();
+				return JSON.stringify({ clicked: true, text: (btn.textContent || '').trim() });
+			}`)
+			if errRetry == nil && resRetry != nil {
+				log.Infof("定时发布流程重试底部主按钮结果: %s", resRetry.Value.Str())
+				lastResult = resRetry.Value.Str()
+			}
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	log.Warnf("定时发布确认按钮未能完成点击或识别，最后结果: %s", lastResult)
 	return waitForPublishResult(a.page, 90*time.Second)
 }
 

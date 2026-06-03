@@ -976,6 +976,65 @@ func parsePublishTime(publishTime interface{}) (string, error) {
 	return targetTime.Format("2006-01-02 15:04"), nil
 }
 
+func findExistingTimingModal(page *rod.Page, stage string) (*rod.Element, error) {
+	modalScan, _ := page.Eval(`() => {
+		document.querySelectorAll('.mcp-timing-modal').forEach(el => el.classList.remove('mcp-timing-modal'));
+		const usable = (el) => {
+			if (!el) return false;
+			let cur = el;
+			while (cur && cur !== document.documentElement) {
+				const style = window.getComputedStyle(cur);
+				if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+				cur = cur.parentElement;
+			}
+			return true;
+		};
+		const selectors = [
+			'.byte-modal-wrapper[style*="display: block"] .common-timing-picker',
+			'.common-timing-picker',
+			'[class*="timing-picker"]',
+			'.byte-modal',
+			'[role="dialog"]',
+			'.semi-modal'
+		];
+		const seen = new Set();
+		const candidates = [];
+		for (const sel of selectors) {
+			for (const el of document.querySelectorAll(sel)) {
+				if (seen.has(el)) continue;
+				seen.add(el);
+				const text = (el.textContent || '').replace(/\s+/g, '').trim();
+				if (!text) continue;
+				candidates.push({
+					el,
+					selector: sel,
+					text,
+					usable: usable(el),
+					className: String(el.className || '').slice(0, 120)
+				});
+			}
+		}
+		const modalCandidate = candidates.find(item => item.usable && (item.text.includes('定时发布') || item.text.includes('预览并定时发布')));
+		if (modalCandidate) {
+			modalCandidate.el.classList.add('mcp-timing-modal');
+			return JSON.stringify({ found: true, selector: modalCandidate.selector, className: modalCandidate.className, text: modalCandidate.text.slice(0, 120) });
+		}
+		return JSON.stringify({
+			found: false,
+			candidates: candidates.map(item => ({
+				selector: item.selector,
+				className: item.className,
+				usable: item.usable,
+				text: item.text.slice(0, 80)
+			})).slice(0, 12)
+		});
+	}`)
+	if modalScan != nil {
+		log.Infof("定时发布 Modal 扫描结果[%s]: %s", stage, modalScan.Value.Str())
+	}
+	return page.Timeout(2 * time.Second).Element(`.mcp-timing-modal`)
+}
+
 // setPublishTime 浏览器自动化设置定时发布时间
 func setPublishTime(page *rod.Page, publishTime interface{}) error {
 	timeStr, err := parsePublishTime(publishTime)
@@ -988,8 +1047,10 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 
 	log.Infof("检测到定时发布选项，目标时间: %s", timeStr)
 
-	// 确保展开“发文设置”以露出定时发布选项
-	_, _ = page.Timeout(3 * time.Second).Eval(`() => {
+	modalEl, errModal := findExistingTimingModal(page, "initial")
+	if errModal != nil || modalEl == nil {
+		// 确保展开“发文设置”以露出定时发布选项
+		_, _ = page.Timeout(3 * time.Second).Eval(`() => {
 		// 先看当前页面上能不能找到含有“定时发布”或“立即发布”相关的可见元素。如果能找到，说明“发文设置”可能已经是展开的，无需再次点击。
 		let timeFound = Array.from(document.querySelectorAll('span, label, p, div')).find(el => {
 			let text = el.textContent ? el.textContent.trim() : '';
@@ -1007,31 +1068,31 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 			}
 		}
 	}`)
-	time.Sleep(1 * time.Second)
+		time.Sleep(1 * time.Second)
 
-	// 1. 定位并点击“定时发布”单选标签/大按钮
-	scheduleRadioSelectors := []string{
-		`//label[contains(., '定时发布')]`,
-		`//span[contains(text(), '定时发布') and not(ancestor::button)]`,
-		`//span[contains(text(), '定时')]/preceding-sibling::span/input[@type='radio']`,
-		`[class*='radio'] input[value='1']`, // 有时头条定时发布单选框 value 为 1
-	}
-
-	log.Info("正在勾选“定时发布”单选按钮...")
-	elRadio, selRadio, err := findElement(page, 5*time.Second, scheduleRadioSelectors)
-	if err != nil {
-		safeScreenshot(page, "./screenshot_publish_time_radio_error.png")
-		htmlVal, _ := page.Eval(`() => document.body.innerHTML`)
-		if htmlVal != nil {
-			_ = os.WriteFile("./dom_dump_radio.html", []byte(htmlVal.Value.Str()), 0644)
-			log.Warn("已保存 DOM Dump 至 ./dom_dump_radio.html")
+		// 1. 定位并点击“定时发布”单选标签/大按钮
+		scheduleRadioSelectors := []string{
+			`//label[contains(., '定时发布')]`,
+			`//span[contains(text(), '定时发布') and not(ancestor::button)]`,
+			`//span[contains(text(), '定时')]/preceding-sibling::span/input[@type='radio']`,
+			`[class*='radio'] input[value='1']`, // 有时头条定时发布单选框 value 为 1
 		}
-		return fmt.Errorf("未找到“定时发布”按钮/选项: %w (已保存调试截图至 screenshot_publish_time_radio_error.png 并保存 DOM Dump 至 ./dom_dump_radio.html)", err)
-	}
-	log.Infof("已找到定时发布按钮，使用选择器: %s，正在执行 JS 点击...", selRadio)
 
-	// 滚动并触发 JS 点击
-	_, _ = elRadio.Eval(`() => {` + SafeScrollJS + `
+		log.Info("正在勾选“定时发布”单选按钮...")
+		elRadio, selRadio, err := findElement(page, 5*time.Second, scheduleRadioSelectors)
+		if err != nil {
+			safeScreenshot(page, "./screenshot_publish_time_radio_error.png")
+			htmlVal, _ := page.Eval(`() => document.body.innerHTML`)
+			if htmlVal != nil {
+				_ = os.WriteFile("./dom_dump_radio.html", []byte(htmlVal.Value.Str()), 0644)
+				log.Warn("已保存 DOM Dump 至 ./dom_dump_radio.html")
+			}
+			return fmt.Errorf("未找到“定时发布”按钮/选项: %w (已保存调试截图至 screenshot_publish_time_radio_error.png 并保存 DOM Dump 至 ./dom_dump_radio.html)", err)
+		}
+		log.Infof("已找到定时发布按钮，使用选择器: %s，正在执行 JS 点击...", selRadio)
+
+		// 滚动并触发 JS 点击
+		_, _ = elRadio.Eval(`() => {` + SafeScrollJS + `
 		let btn = this.tagName === 'BUTTON' ? this : this.closest('button') || this;
 		scrollIntoViewSafe(btn);
 		const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
@@ -1040,13 +1101,14 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 			btn.dispatchEvent(ev);
 		});
 	}`)
-	time.Sleep(3000 * time.Millisecond) // 等待时间选择弹窗渲染出来
+		time.Sleep(3000 * time.Millisecond) // 等待时间选择弹窗渲染出来
 
-	// 【诊断截图与 DOM Dump】
-	safeScreenshot(page, "./screenshot_after_radio_click.png")
-	if htmlVal, _ := page.Eval(`() => document.body.innerHTML`); htmlVal != nil {
-		_ = os.WriteFile("./dom_dump_after_radio_click.html", []byte(htmlVal.Value.Str()), 0644)
-		log.Warn("已保存勾选定时发布后的瞬时 DOM Dump 至 ./dom_dump_after_radio_click.html")
+		// 【诊断截图与 DOM Dump】
+		safeScreenshot(page, "./screenshot_after_radio_click.png")
+		if htmlVal, _ := page.Eval(`() => document.body.innerHTML`); htmlVal != nil {
+			_ = os.WriteFile("./dom_dump_after_radio_click.html", []byte(htmlVal.Value.Str()), 0644)
+			log.Warn("已保存勾选定时发布后的瞬时 DOM Dump 至 ./dom_dump_after_radio_click.html")
+		}
 	}
 
 	// 2. 检查并操作定时发布弹窗（byte-select 新版结构）
@@ -1114,7 +1176,7 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 	if modalScan != nil {
 		log.Infof("定时发布 Modal 扫描结果: %s", modalScan.Value.Str())
 	}
-	modalEl, errModal := page.Timeout(2 * time.Second).Element(`.mcp-timing-modal`)
+	modalEl, errModal = page.Timeout(2 * time.Second).Element(`.mcp-timing-modal`)
 	if errModal != nil || modalEl == nil {
 		clickedTiming, timingInfo, errTimingClick := clickVisiblePageButtonByText(page, []string{"定时发布"}, []string{"预览并定时发布", "预览并发布", "立即发布"}, "open timing modal fallback")
 		if errTimingClick == nil && clickedTiming {

@@ -93,6 +93,7 @@ func (s *ToutiaoService) CheckArticleExists(ctx context.Context, title string) (
 // PublishArticle 发布文章
 func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content string, opts *toutiaohao.ArticleOptions) (*toutiaohao.PublishResult, error) {
 	log.Infof("[Step 1/7] 开始发布文章校验，标题: %s", title)
+	content = ensureInlineImages(content, opts)
 	if err := toutiaohao.ValidateArticle(title, content, opts); err != nil {
 		log.Errorf("[Step 1/7] 参数校验失败: %v", err)
 		return nil, err
@@ -194,6 +195,32 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 // GetArticleList 获取文章列表
 func (s *ToutiaoService) GetArticleList(ctx context.Context, params *toutiaohao.ArticleListParams) (*toutiaohao.ArticleListResponse, error) {
 	return toutiaohao.GetArticleList(ctx, params, s.cookieStore)
+}
+
+func ensureInlineImages(content string, opts *toutiaohao.ArticleOptions) string {
+	if opts == nil || len(opts.Images) == 0 {
+		return content
+	}
+	if strings.Contains(content, "![") && strings.Contains(content, "](") {
+		return content
+	}
+
+	var b strings.Builder
+	b.WriteString(strings.TrimRight(content, "\n"))
+	appendCount := 0
+	for _, imagePath := range opts.Images {
+		imagePath = strings.TrimSpace(imagePath)
+		if imagePath == "" {
+			continue
+		}
+		appendCount++
+		b.WriteString("\n\n")
+		b.WriteString(fmt.Sprintf("![配图%d](%s)", appendCount, imagePath))
+	}
+	if appendCount > 0 {
+		log.Infof("[Step 4/7] 检测到 images 参数但正文缺少 Markdown 图片，已自动追加 %d 张正文插图占位", appendCount)
+	}
+	return b.String()
 }
 
 // DeleteArticle 删除文章
@@ -341,13 +368,13 @@ func (s *ToutiaoService) QrCodeLogin(ctx context.Context) error {
 
 		currentInfo, err := page.Info()
 		if err == nil {
-			if toutiaohao.IsLoginSuccessURL(currentInfo.URL) || 
-			   (!strings.Contains(currentInfo.URL, "login") && !strings.Contains(currentInfo.URL, "auth") && strings.Contains(currentInfo.URL, "mp.toutiao.com")) {
+			if toutiaohao.IsLoginSuccessURL(currentInfo.URL) ||
+				(!strings.Contains(currentInfo.URL, "login") && !strings.Contains(currentInfo.URL, "auth") && strings.Contains(currentInfo.URL, "mp.toutiao.com")) {
 				log.Info("检测到扫码登录成功！")
-				
+
 				// 延迟一秒等待 Cookie 完全写入浏览器内存
 				time.Sleep(1 * time.Second)
-				
+
 				// 自动回写 Cookie 到本地
 				if err := toutiaohao.SaveBrowserCookies(page, s.cookieStore); err != nil {
 					return fmt.Errorf("自动保存新 Cookie 失败: %w", err)
