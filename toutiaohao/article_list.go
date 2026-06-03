@@ -320,6 +320,13 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 			log.Infof("草稿箱导航点击结果: %s", navInfo)
 			time.Sleep(4 * time.Second)
 		}
+		_, _ = page.Eval(`() => {
+			window.scrollTo(0, window.scrollY || 0);
+			document.scrollingElement && (document.scrollingElement.scrollLeft = 0);
+			document.querySelectorAll('*').forEach(el => {
+				if (el.scrollLeft) el.scrollLeft = 0;
+			});
+		}`)
 		log.Info("尝试定位并点击删除按钮...")
 
 		var err error
@@ -355,27 +362,33 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 					el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
 				});
 			};
-			const roots = Array.from(document.querySelectorAll('.byte-popover, .semi-popover, [class*="popover"], [class*="dropdown"], [class*="menu"], [role="menu"], [role="listbox"]')).filter(visible);
+			const roots = Array.from(document.querySelectorAll('.byte-popover, .semi-popover, .byte-dropdown, .semi-dropdown, [class*="popover"], [class*="dropdown"], [class*="menu"], [class*="option"], [role="menu"], [role="listbox"]')).filter(visible);
 			for (const root of roots) {
-				const items = Array.from(root.querySelectorAll('li, button, span, a, div, [role="menuitem"], [role="button"]')).filter(visible);
+				const items = Array.from(root.querySelectorAll('li, button, span, a, div, p, [role="menuitem"], [role="option"], [role="button"]')).filter(visible);
 				for (const item of items) {
-					const text = normalize(item.textContent);
-					if (text.includes('删除') && text.length <= 12) {
+					const text = normalize(item.textContent || item.getAttribute('aria-label') || item.getAttribute('title'));
+					const cls = String(item.className || '').toLowerCase();
+					if ((text.includes('删除') || cls.includes('delete')) && text.length <= 16) {
 						const target = item.closest('li, button, a, [role="menuitem"], [role="button"]') || item;
 						clickLikeUser(target);
 						return 'clicked delete after more';
 					}
 				}
 			}
-			const btns = Array.from(document.querySelectorAll('li, button, span, a, div, [role="menuitem"], [role="button"]')).filter(visible);
+			const btns = Array.from(document.querySelectorAll('li, button, span, a, div, p, [role="menuitem"], [role="option"], [role="button"]')).filter(visible);
 			for (const btn of btns) {
-				const text = normalize(btn.textContent);
-				if (text.includes('删除') && text.length <= 12) {
+				const text = normalize(btn.textContent || btn.getAttribute('aria-label') || btn.getAttribute('title'));
+				const cls = String(btn.className || '').toLowerCase();
+				if ((text.includes('删除') || cls.includes('delete')) && text.length <= 16) {
 					clickLikeUser(btn);
 					return 'clicked delete after more fallback';
 				}
 			}
-			return 'no delete after more';
+			const rootTexts = roots.map(root => normalize(root.textContent).slice(0, 80)).filter(Boolean).slice(0, 8);
+			const visibleTexts = Array.from(document.querySelectorAll('li, button, span, a, div, p, [role="menuitem"], [role="option"], [role="button"]'))
+				.filter(visible).map(el => normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')))
+				.filter(text => text && text.length <= 20).slice(0, 40);
+			return 'no delete after more; roots=' + JSON.stringify(rootTexts) + '; visible=' + JSON.stringify(visibleTexts);
 		}`)
 		if menuRes != nil {
 			menuResult = menuRes.Value.Str()
@@ -497,6 +510,11 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 				(titlePrefix && text.includes(titlePrefix)) ||
 				(titleLoose && text.includes(titleLoose));
 		};
+		const clickLikeUser = (el) => {
+			['pointerover', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
+				el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+			});
+		};
 		const leafSelectors = 'a, span, div, p, h1, h2, h3, td, [href], [class*="title"]';
 		const leaves = Array.from(document.querySelectorAll(leafSelectors)).filter(el => visible(el) && matches(el));
 		const cards = [];
@@ -523,7 +541,7 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 			const btns = Array.from(card.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible);
 			const deleteBtn = btns.find(btn => normalize(btn.textContent) === '删除' || normalize(btn.getAttribute('aria-label')).includes('删除') || String(btn.className || '').includes('delete'));
 			if (deleteBtn) {
-				deleteBtn.click();
+				clickLikeUser(deleteBtn.closest('button, a, [role="button"]') || deleteBtn);
 				return 'clicked delete';
 			}
 			const moreBtn = btns.find(btn => {
@@ -534,7 +552,7 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 					cls.includes('more') || cls.includes('operation') || cls.includes('action');
 			});
 			if (moreBtn) {
-				moreBtn.click();
+				clickLikeUser(moreBtn.closest('button, a, [role="button"]') || moreBtn);
 				return 'clicked more';
 			}
 		}
