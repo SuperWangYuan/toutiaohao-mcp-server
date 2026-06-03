@@ -540,8 +540,7 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 			const btns = Array.from(card.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible);
 			const deleteBtn = btns.find(btn => normalize(btn.textContent) === '删除' || normalize(btn.getAttribute('aria-label')).includes('删除') || String(btn.className || '').includes('delete'));
 			if (deleteBtn) {
-				const target = deleteBtn.closest('button, a, [role="button"]') || deleteBtn;
-				target.classList.add('mcp-draft-action-delete');
+				deleteBtn.classList.add('mcp-draft-action-delete');
 				return 'marked delete';
 			}
 			const moreBtn = btns.find(btn => {
@@ -556,8 +555,7 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 					(cls.includes('more') && compact);
 			});
 			if (moreBtn) {
-				const target = moreBtn.closest('button, a, [role="button"]') || moreBtn;
-				target.classList.add('mcp-draft-action-more');
+				moreBtn.classList.add('mcp-draft-action-more');
 				return 'marked more';
 			}
 		}
@@ -591,6 +589,21 @@ func physicalClickMarkedElement(page *rod.Page, selector string) error {
 	if err != nil {
 		return fmt.Errorf("定位标记元素失败 %s: %w", selector, err)
 	}
+	_, _ = el.Eval(`() => {
+		this.scrollIntoView({ block: 'center', inline: 'center' });
+		let p = this.parentElement;
+		while (p) {
+			if (p.scrollLeft) {
+				const rect = this.getBoundingClientRect();
+				const parentRect = p.getBoundingClientRect();
+				if (rect.left < parentRect.left || rect.right > parentRect.right) {
+					p.scrollLeft += rect.left - parentRect.left - Math.max(24, parentRect.width / 2);
+				}
+			}
+			p = p.parentElement;
+		}
+	}`)
+	time.Sleep(300 * time.Millisecond)
 	pt, err := el.Interactable()
 	if err != nil {
 		log.Warnf("标记元素无法物理点击，回退 JS 点击 %s: %v", selector, err)
