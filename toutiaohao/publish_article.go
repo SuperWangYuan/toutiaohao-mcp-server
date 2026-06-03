@@ -198,21 +198,21 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 	var targetCovers []string
 	var isAutoCover bool
 
-	if opts != nil && (opts.CoverImage != "" || len(opts.Images) > 0) {
-		// 1. 如果显式指定了封面参数，以 opts 参数为准
+	if opts != nil && opts.CoverImage != "" {
+		// 1. CoverImage 是明确的封面意图，优先使用。
+		targetCoverMode = "单图"
+		targetCovers = []string{opts.CoverImage}
+	} else if opts != nil && len(opts.Images) > 0 && len(inlineImages) == 0 {
+		// 2. 没有 Markdown 内嵌图时，Images 兼容旧调用作为封面备选。
 		if len(opts.Images) >= 3 {
 			targetCoverMode = "三图"
 			targetCovers = opts.Images[:3]
 		} else {
 			targetCoverMode = "单图"
-			coverImg := opts.CoverImage
-			if coverImg == "" && len(opts.Images) > 0 {
-				coverImg = opts.Images[0]
-			}
-			targetCovers = []string{coverImg}
+			targetCovers = []string{opts.Images[0]}
 		}
 	} else {
-		// 2. 如果未显式指定封面参数，则根据正文中的插图数量智能自适应
+		// 3. 有 Markdown 内嵌图时，Images 属于正文配图来源，封面从正文图片自适应提取，避免重复上传同一批图。
 		if len(inlineImages) >= 3 {
 			targetCoverMode = "三图"
 			targetCovers = inlineImages[:3]
@@ -824,42 +824,30 @@ func (a *ArticlePublishAction) insertImageAtCursor(imagePath string) error {
 		if clickedConfirm {
 			// 等待弹窗在页面上关闭
 			log.Info("等待正文图片上传确认弹窗关闭...")
-			for j := 0; j < 10; j++ { // 最多等 5 秒让弹窗关闭
+			for j := 0; j < 20; j++ { // 最多等 10 秒让弹窗关闭
 				resExist, errExist := a.page.Eval(`() => {
-					let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-					          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
-					              let text = b.textContent ? b.textContent.trim() : '';
-					              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
-					          });
-					return btn ? true : false;
+					const visible = (el) => {
+						if (!el) return false;
+						const style = getComputedStyle(el);
+						return el.offsetWidth > 0 && el.offsetHeight > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+					};
+					const roots = Array.from(document.querySelectorAll('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"]')).filter(visible);
+					for (const root of roots) {
+						const btn = root.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
+							Array.from(root.querySelectorAll('button, div, span, a')).find(b => {
+								const text = b.textContent ? b.textContent.trim() : '';
+								return (text === '确定' || text === '确认') && visible(b);
+							});
+						if (btn && visible(btn)) return true;
+					}
+					const globalBtn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]');
+					return visible(globalBtn);
 				}`)
 				if errExist == nil && resExist != nil && !resExist.Value.Bool() {
 					log.Info("正文图片上传确认弹窗已成功关闭")
 					dialogClosed = true
 					break
 				}
-				// 补点一次 (需确保处于可用状态以防反向干扰)
-				_, _ = a.page.Eval(`() => {
-					let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-					          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
-					              let text = b.textContent ? b.textContent.trim() : '';
-					              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
-					          });
-					if (btn) {
-						let isDisabled = btn.disabled || 
-						                 btn.classList.contains('is-disabled') || 
-						                 btn.classList.contains('disabled') || 
-						                 btn.className.includes('disabled') || 
-						                 btn.getAttribute('disabled') !== null ||
-						                 btn.classList.contains('semi-button-disabled') ||
-						                 btn.classList.contains('byte-btn-disabled') ||
-						                 btn.classList.contains('semi-button-disabled-primary') ||
-						                 btn.classList.contains('semi-button-primary-disabled');
-						if (!isDisabled) {
-							btn.click();
-						}
-					}
-				}`)
 				time.Sleep(500 * time.Millisecond)
 			}
 			if dialogClosed {
@@ -1246,42 +1234,30 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			if clickedImgConfirm {
 				// 等待弹窗在页面上消失
 				log.Info("Waiting for upload confirm dialog to close...")
-				for j := 0; j < 10; j++ { // 最多等 5 秒让弹窗关闭
+				for j := 0; j < 20; j++ { // 最多等 10 秒让弹窗关闭
 					resExist, errExist := a.page.Eval(`() => {
-						let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-						          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
-						              let text = b.textContent ? b.textContent.trim() : '';
-						              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
-						          });
-						return btn ? true : false;
+						const visible = (el) => {
+							if (!el) return false;
+							const style = getComputedStyle(el);
+							return el.offsetWidth > 0 && el.offsetHeight > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+						};
+						const roots = Array.from(document.querySelectorAll('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"]')).filter(visible);
+						for (const root of roots) {
+							const btn = root.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
+								Array.from(root.querySelectorAll('button, div, span, a')).find(b => {
+									const text = b.textContent ? b.textContent.trim() : '';
+									return (text === '确定' || text === '确认') && visible(b);
+								});
+							if (btn && visible(btn)) return true;
+						}
+						const globalBtn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]');
+						return visible(globalBtn);
 					}`)
 					if errExist == nil && resExist != nil && !resExist.Value.Bool() {
 						log.Info("Upload confirm dialog closed successfully")
 						dialogClosed = true
 						break
 					}
-					// 补点一次 (需确保处于可用状态以防反向干扰)
-					_, _ = a.page.Eval(`() => {
-						let btn = document.querySelector('[data-e2e="imageUploadConfirm-btn"]') ||
-						          Array.from(document.querySelectorAll('button, div, span, a')).find(b => {
-						              let text = b.textContent ? b.textContent.trim() : '';
-						              return (text === '确定' || text === '确认') && b.offsetWidth > 0;
-						          });
-						if (btn) {
-							let isDisabled = btn.disabled || 
-							                 btn.classList.contains('is-disabled') || 
-							                 btn.classList.contains('disabled') || 
-							                 btn.className.includes('disabled') || 
-							                 btn.getAttribute('disabled') !== null ||
-							                 btn.classList.contains('semi-button-disabled') ||
-							                 btn.classList.contains('byte-btn-disabled') ||
-							                 btn.classList.contains('semi-button-disabled-primary') ||
-							                 btn.classList.contains('semi-button-primary-disabled');
-							if (!isDisabled) {
-								btn.click();
-							}
-						}
-					}`)
 					time.Sleep(500 * time.Millisecond)
 				}
 				if dialogClosed {
@@ -2331,17 +2307,16 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 		var targetCovers []string
 		var isAutoCover bool
 
-		if opts != nil && (opts.CoverImage != "" || len(opts.Images) > 0) {
+		if opts != nil && opts.CoverImage != "" {
+			targetCoverMode = "单图"
+			targetCovers = []string{opts.CoverImage}
+		} else if opts != nil && len(opts.Images) > 0 && len(inlineImages) == 0 {
 			if len(opts.Images) >= 3 {
 				targetCoverMode = "三图"
 				targetCovers = opts.Images[:3]
 			} else {
 				targetCoverMode = "单图"
-				coverImg := opts.CoverImage
-				if coverImg == "" && len(opts.Images) > 0 {
-					coverImg = opts.Images[0]
-				}
-				targetCovers = []string{coverImg}
+				targetCovers = []string{opts.Images[0]}
 			}
 		} else {
 			// 如果没指定任何 opts（或者指定的 opts 中没有封面），且正文变了，我们重新自适应
