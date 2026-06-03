@@ -1211,20 +1211,128 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 		dayTarget2 := fmt.Sprintf("%d月%d日", t.Month(), t.Day())
 		hourTarget1 := fmt.Sprintf("%d", t.Hour())
 		hourTarget2 := fmt.Sprintf("%02d", t.Hour())
+		minuteTarget1 := fmt.Sprintf("%02d", t.Minute())
+		minuteTarget2 := fmt.Sprintf("%d", t.Minute())
 
-		// (1) 交互选择日期
-		daySelect, errDaySel := modalEl.Element(".day-select")
-		if errDaySel != nil {
-			daySelect, _ = modalEl.ElementX(`//div[contains(@class, 'byte-select') and (contains(., '月') or contains(., '日'))]`)
-		}
+		selectTimingValue := func(kind string, targets []string) bool {
+			markRes, _ := page.Eval(`(kind) => {
+				document.querySelectorAll('.mcp-timing-select-target').forEach(el => el.classList.remove('mcp-timing-select-target'));
+				const visible = (el) => {
+					if (!el) return false;
+					const style = window.getComputedStyle(el);
+					const rect = el.getBoundingClientRect();
+					return style.display !== 'none' && style.visibility !== 'hidden' && rect.width >= 35 && rect.height >= 20;
+				};
+				const clean = (el) => (el.textContent || '').replace(/\s+/g, '').trim();
+				const modal = document.querySelector('.mcp-timing-modal, .common-timing-picker, [class*="timing-picker"]');
+				if (!modal) return JSON.stringify({ found: false, reason: 'no modal' });
+				let controls = Array.from(modal.querySelectorAll('.byte-select, [class*="select"]'))
+					.filter(visible)
+					.filter(el => {
+						const cls = String(el.className || '');
+						if (cls.includes('option') || cls.includes('dropdown') || cls.includes('popup')) return false;
+						const text = clean(el);
+						return text.length > 0 && text.length <= 12;
+					});
+				controls = controls.filter((el, idx) => {
+					const rect = el.getBoundingClientRect();
+					return !controls.some((other, otherIdx) => {
+						if (otherIdx === idx || !other.contains(el)) return false;
+						const otherRect = other.getBoundingClientRect();
+						return otherRect.width >= rect.width && otherRect.height >= rect.height;
+					});
+				});
+				controls.sort((a, b) => {
+					const ra = a.getBoundingClientRect();
+					const rb = b.getBoundingClientRect();
+					if (Math.abs(ra.top - rb.top) > 8) return ra.top - rb.top;
+					return ra.left - rb.left;
+				});
+				const debug = controls.map(el => ({ text: clean(el), className: String(el.className || '').slice(0, 80) }));
+				const dateControl = controls.find(el => /月.*日/.test(clean(el)));
+				const numericControls = controls.filter(el => /^\d{1,2}$/.test(clean(el)));
+				let target = null;
+				if (kind === 'day') target = dateControl;
+				if (kind === 'hour') target = numericControls[0] || controls[1];
+				if (kind === 'minute') target = numericControls[1] || controls[2];
+				if (!target) return JSON.stringify({ found: false, kind, debug });
+				target.classList.add('mcp-timing-select-target');
+				return JSON.stringify({ found: true, kind, text: clean(target), debug });
+			}`, kind)
+			if markRes != nil {
+				log.Infof("定时 %s 下拉框定位结果: %s", kind, markRes.Value.Str())
+				if !strings.Contains(markRes.Value.Str(), `"found":true`) {
+					return false
+				}
+			}
 
-		if daySelect != nil {
-			log.Infof("找到日期下拉框，点击展开。")
-			_ = daySelect.Click(proto.InputMouseButtonLeft, 1)
+			targetEl, errTarget := page.Timeout(1 * time.Second).Element(".mcp-timing-select-target")
+			if errTarget != nil || targetEl == nil {
+				return false
+			}
+			_, _ = targetEl.Eval(`() => {
+				this.scrollIntoView({ block: 'center', inline: 'center' });
+				const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+				events.forEach(name => this.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window })));
+			}`)
 			time.Sleep(800 * time.Millisecond)
 
-			log.Infof("匹配目标日期: %s 或 %s ...", dayTarget1, dayTarget2)
-			clickedDay, errClickDay := page.Eval(`(d1, d2) => {
+			clickRes, _ := page.Eval(`(targets) => {
+				const visible = (el) => {
+					if (!el) return false;
+					const style = window.getComputedStyle(el);
+					const rect = el.getBoundingClientRect();
+					return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+				};
+				const clean = (el) => (el.textContent || '').replace(/\s+/g, '').trim();
+				const wanted = new Set(targets.map(t => String(t).replace(/\s+/g, '').trim()).filter(Boolean));
+				let options = Array.from(document.querySelectorAll('.byte-select-option, [class*="select-option"], [role="option"], li, div, span'))
+					.filter(visible)
+					.filter(el => {
+						const text = clean(el);
+						if (!text || text.length > 12) return false;
+						return wanted.has(text);
+					});
+				options = options.filter(el => !Array.from(el.children || []).some(child => wanted.has(clean(child))));
+				const debug = options.map(el => ({ text: clean(el), className: String(el.className || '').slice(0, 80) })).slice(0, 10);
+				const opt = options[0];
+				if (!opt) return JSON.stringify({ clicked: false, targets, debug });
+				opt.scrollIntoView({ block: 'center', inline: 'center' });
+				const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+				events.forEach(name => opt.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window })));
+				return JSON.stringify({ clicked: true, text: clean(opt), targets, debug });
+			}`, targets)
+			if clickRes != nil {
+				log.Infof("定时 %s 选项点击结果: %s", kind, clickRes.Value.Str())
+				if strings.Contains(clickRes.Value.Str(), `"clicked":true`) {
+					time.Sleep(600 * time.Millisecond)
+					return true
+				}
+			}
+			return false
+		}
+
+		robustSelectOK := selectTimingValue("day", []string{dayTarget1, dayTarget2}) &&
+			selectTimingValue("hour", []string{hourTarget1, hourTarget2, hourTarget1 + "时", hourTarget2 + "时"}) &&
+			selectTimingValue("minute", []string{minuteTarget1, minuteTarget2, minuteTarget1 + "分", minuteTarget2 + "分"})
+		if robustSelectOK {
+			log.Info("定时发布时间新下拉选择流程完成，跳过旧选择兜底")
+		}
+
+		if !robustSelectOK {
+			// (1) 交互选择日期
+			daySelect, errDaySel := modalEl.Element(".day-select")
+			if errDaySel != nil {
+				daySelect, _ = modalEl.ElementX(`//div[contains(@class, 'byte-select') and (contains(., '月') or contains(., '日'))]`)
+			}
+
+			if daySelect != nil {
+				log.Infof("找到日期下拉框，点击展开。")
+				_ = daySelect.Click(proto.InputMouseButtonLeft, 1)
+				time.Sleep(800 * time.Millisecond)
+
+				log.Infof("匹配目标日期: %s 或 %s ...", dayTarget1, dayTarget2)
+				clickedDay, errClickDay := page.Eval(`(d1, d2) => {
 				let opts = Array.from(document.querySelectorAll('.byte-select-option, [class*="select-option"], li, div, span')).filter(el => {
 					let text = el.textContent ? el.textContent.trim() : '';
 					return (text.includes(d1) || text.includes(d2)) && el.offsetWidth > 0;
@@ -1236,30 +1344,30 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 				return false;
 			}`, dayTarget1, dayTarget2)
 
-			if errClickDay == nil && clickedDay != nil && clickedDay.Value.Bool() {
-				log.Info("日期选择成功")
-			} else {
-				log.Warnf("未选中日期选项: %s/%s", dayTarget1, dayTarget2)
+				if errClickDay == nil && clickedDay != nil && clickedDay.Value.Bool() {
+					log.Info("日期选择成功")
+				} else {
+					log.Warnf("未选中日期选项: %s/%s", dayTarget1, dayTarget2)
+				}
+				time.Sleep(500 * time.Millisecond)
 			}
-			time.Sleep(500 * time.Millisecond)
-		}
 
-		// (2) 交互选择小时
-		hourSelect, errHourSel := modalEl.Element(".hour-select")
-		if errHourSel != nil {
-			selects, _ := modalEl.Elements(`.byte-select`)
-			if len(selects) >= 2 {
-				hourSelect = selects[1]
+			// (2) 交互选择小时
+			hourSelect, errHourSel := modalEl.Element(".hour-select")
+			if errHourSel != nil {
+				selects, _ := modalEl.Elements(`.byte-select`)
+				if len(selects) >= 2 {
+					hourSelect = selects[1]
+				}
 			}
-		}
 
-		if hourSelect != nil {
-			log.Infof("找到小时下拉框，点击展开。")
-			_ = hourSelect.Click(proto.InputMouseButtonLeft, 1)
-			time.Sleep(800 * time.Millisecond)
+			if hourSelect != nil {
+				log.Infof("找到小时下拉框，点击展开。")
+				_ = hourSelect.Click(proto.InputMouseButtonLeft, 1)
+				time.Sleep(800 * time.Millisecond)
 
-			log.Infof("匹配目标小时: %s 或 %s ...", hourTarget1, hourTarget2)
-			clickedHour, errClickHour := page.Eval(`(h1, h2) => {
+				log.Infof("匹配目标小时: %s 或 %s ...", hourTarget1, hourTarget2)
+				clickedHour, errClickHour := page.Eval(`(h1, h2) => {
 				let opts = Array.from(document.querySelectorAll('.byte-select-option, [class*="select-option"], li, div, span')).filter(el => {
 					let text = el.textContent ? el.textContent.trim() : '';
 					return (text === h1 || text === h2 || text === h1 + '时' || text === h2 + '时' || text === h1 + '点' || text === h2 + '点') && el.offsetWidth > 0;
@@ -1279,33 +1387,33 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 				return false;
 			}`, hourTarget1, hourTarget2)
 
-			if errClickHour == nil && clickedHour != nil && clickedHour.Value.Bool() {
-				log.Info("小时选择成功")
-			} else {
-				log.Warnf("未选中小时选项: %s/%s", hourTarget1, hourTarget2)
+				if errClickHour == nil && clickedHour != nil && clickedHour.Value.Bool() {
+					log.Info("小时选择成功")
+				} else {
+					log.Warnf("未选中小时选项: %s/%s", hourTarget1, hourTarget2)
+				}
+				time.Sleep(500 * time.Millisecond)
 			}
-			time.Sleep(500 * time.Millisecond)
-		}
 
-		// (3) 交互选择分钟
-		minuteSelect, errMinSel := modalEl.Element(".minute-select")
-		if errMinSel != nil {
-			selects, _ := modalEl.Elements(`.byte-select`)
-			if len(selects) >= 3 {
-				minuteSelect = selects[2]
-				errMinSel = nil
+			// (3) 交互选择分钟
+			minuteSelect, errMinSel := modalEl.Element(".minute-select")
+			if errMinSel != nil {
+				selects, _ := modalEl.Elements(`.byte-select`)
+				if len(selects) >= 3 {
+					minuteSelect = selects[2]
+					errMinSel = nil
+				}
 			}
-		}
-		if errMinSel == nil && minuteSelect != nil {
-			log.Infof("找到分钟下拉框，点击展开。")
-			_ = minuteSelect.Click(proto.InputMouseButtonLeft, 1)
-			time.Sleep(800 * time.Millisecond)
+			if errMinSel == nil && minuteSelect != nil {
+				log.Infof("找到分钟下拉框，点击展开。")
+				_ = minuteSelect.Click(proto.InputMouseButtonLeft, 1)
+				time.Sleep(800 * time.Millisecond)
 
-			minuteTarget1 := fmt.Sprintf("%02d", t.Minute())
-			minuteTarget2 := fmt.Sprintf("%d", t.Minute())
-			log.Infof("匹配目标分钟: %s 或 %s ...", minuteTarget1, minuteTarget2)
+				minuteTarget1 := fmt.Sprintf("%02d", t.Minute())
+				minuteTarget2 := fmt.Sprintf("%d", t.Minute())
+				log.Infof("匹配目标分钟: %s 或 %s ...", minuteTarget1, minuteTarget2)
 
-			clickedMin, errClickMin := page.Eval(`(m1, m2) => {
+				clickedMin, errClickMin := page.Eval(`(m1, m2) => {
 				let opts = Array.from(document.querySelectorAll('.byte-select-option, [class*="select-option"], li, div, span')).filter(el => {
 					let text = el.textContent ? el.textContent.trim() : '';
 					return (text === m1 || text === m2 || text === m1 + '分' || text === m2 + '分') && el.offsetWidth > 0;
@@ -1325,12 +1433,13 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 				return false;
 			}`, minuteTarget1, minuteTarget2)
 
-			if errClickMin == nil && clickedMin != nil && clickedMin.Value.Bool() {
-				log.Info("分钟选择成功")
-			} else {
-				log.Warnf("未选中分钟选项: %s/%s", minuteTarget1, minuteTarget2)
+				if errClickMin == nil && clickedMin != nil && clickedMin.Value.Bool() {
+					log.Info("分钟选择成功")
+				} else {
+					log.Warnf("未选中分钟选项: %s/%s", minuteTarget1, minuteTarget2)
+				}
+				time.Sleep(500 * time.Millisecond)
 			}
-			time.Sleep(500 * time.Millisecond)
 		}
 
 		// (3) 点击确定
