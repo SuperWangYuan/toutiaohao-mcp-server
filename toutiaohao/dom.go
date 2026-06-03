@@ -209,6 +209,78 @@ func clickVisibleModalPrimaryButton(page *rod.Page, wantedTexts []string, descri
 	return strings.Contains(result, `"clicked":true`), result, nil
 }
 
+func clickVisiblePageButtonByText(page *rod.Page, wantedTexts []string, blockedTexts []string, description string) (bool, string, error) {
+	res, err := page.Eval(`(wantedTexts, blockedTexts, description) => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' &&
+				style.visibility !== 'hidden' &&
+				style.opacity !== '0' &&
+				rect.width > 0 &&
+				rect.height > 0;
+		};
+		const disabled = (el) => {
+			const cls = String(el.className || '');
+			return el.disabled ||
+				el.getAttribute('disabled') !== null ||
+				el.getAttribute('aria-disabled') === 'true' ||
+				cls.includes('disabled') ||
+				cls.includes('is-disabled') ||
+				cls.includes('byte-btn-disabled') ||
+				cls.includes('semi-button-disabled');
+		};
+		const textOf = (el) => (el.textContent || '').replace(/\s+/g, '').trim();
+		const blocked = (text) => blockedTexts.some(w => text === w || text.includes(w));
+		const matched = (text) => wantedTexts.some(w => {
+			if (text === w) return true;
+			return w.length > 1 && text.includes(w);
+		});
+		let controls = Array.from(document.querySelectorAll('button, [role="button"], a, .byte-btn, .semi-button, [class*="btn"], [class*="button"]'))
+			.filter(el => visible(el) && !disabled(el))
+			.filter(el => {
+				const text = textOf(el);
+				if (!text) return false;
+				if (blocked(text)) return false;
+				return true;
+			});
+
+		const debug = controls.map(el => ({
+			tag: el.tagName,
+			className: String(el.className || '').slice(0, 80),
+			text: textOf(el).slice(0, 40)
+		})).filter(item => item.text).slice(0, 20);
+
+		let btn = controls.find(el => wantedTexts.some(w => textOf(el) === w));
+		if (!btn) {
+			btn = controls.find(el => matched(textOf(el)));
+		}
+		if (!btn) {
+			btn = controls.find(el => {
+				const cls = String(el.className || '');
+				const text = textOf(el);
+				return matched(text) && (cls.includes('primary') || cls.includes('confirm'));
+			});
+		}
+		if (!btn) {
+			return JSON.stringify({ clicked: false, description, debug });
+		}
+
+		const text = textOf(btn);
+		btn.click();
+		return JSON.stringify({ clicked: true, text, description, debug });
+	}`, wantedTexts, blockedTexts, description)
+	if err != nil {
+		return false, "", err
+	}
+	if res == nil {
+		return false, "", nil
+	}
+	result := res.Value.Str()
+	return strings.Contains(result, `"clicked":true`), result, nil
+}
+
 // sanitizeImageToTemp 将给定的图片文件（PNG/JPEG/GIF）进行解码并使用 Go 官方的纯净编码器重新写为标准的 JPEG/PNG 临时文件。
 // 这可以彻底消除图片中非标准的文件元数据块、色彩空间（如 CMYK）错配，从而防止今日头条后台报错“无效图片数据”。
 func sanitizeImageToTemp(srcPath string) (string, func(), error) {
@@ -978,21 +1050,83 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 	}
 
 	// 2. 检查并操作定时发布弹窗（byte-select 新版结构）
-	_, _ = page.Eval(`() => {
+	timingModalScanJS := `() => {
 		document.querySelectorAll('.mcp-timing-modal').forEach(el => el.classList.remove('mcp-timing-modal'));
-		const visible = (el) => {
+		const usable = (el) => {
 			if (!el) return false;
-			const style = window.getComputedStyle(el);
-			const rect = el.getBoundingClientRect();
-			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			let cur = el;
+			while (cur && cur !== document.documentElement) {
+				const style = window.getComputedStyle(cur);
+				if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+				cur = cur.parentElement;
+			}
+			return true;
 		};
-		const modal = Array.from(document.querySelectorAll('[class*="timing-picker"], .common-timing-picker, .byte-modal, [role="dialog"]')).find(el => {
-			const text = (el.textContent || '').trim();
-			return visible(el) && (text.includes('定时发布') || text.includes('预览并定时发布'));
+		const selectors = [
+			'.byte-modal-wrapper[style*="display: block"] .common-timing-picker',
+			'.common-timing-picker',
+			'[class*="timing-picker"]',
+			'.byte-modal',
+			'[role="dialog"]',
+			'.semi-modal'
+		];
+		const seen = new Set();
+		const candidates = [];
+		for (const sel of selectors) {
+			for (const el of document.querySelectorAll(sel)) {
+				if (seen.has(el)) continue;
+				seen.add(el);
+				const text = (el.textContent || '').replace(/\s+/g, '').trim();
+				if (!text) continue;
+				candidates.push({
+					el,
+					selector: sel,
+					text,
+					usable: usable(el),
+					className: String(el.className || '').slice(0, 120)
+				});
+			}
+		}
+		const modalCandidate = candidates.find(item => {
+			const text = item.text;
+			return item.usable && (text.includes('定时发布') || text.includes('预览并定时发布'));
 		});
-		if (modal) modal.classList.add('mcp-timing-modal');
-	}`)
+		if (modalCandidate) {
+			modalCandidate.el.classList.add('mcp-timing-modal');
+			return JSON.stringify({
+				found: true,
+				selector: modalCandidate.selector,
+				className: modalCandidate.className,
+				text: modalCandidate.text.slice(0, 120)
+			});
+		}
+		return JSON.stringify({
+			found: false,
+			candidates: candidates.map(item => ({
+				selector: item.selector,
+				className: item.className,
+				usable: item.usable,
+				text: item.text.slice(0, 80)
+			})).slice(0, 12)
+		});
+	}`
+	modalScan, _ := page.Eval(timingModalScanJS)
+	if modalScan != nil {
+		log.Infof("定时发布 Modal 扫描结果: %s", modalScan.Value.Str())
+	}
 	modalEl, errModal := page.Timeout(2 * time.Second).Element(`.mcp-timing-modal`)
+	if errModal != nil || modalEl == nil {
+		clickedTiming, timingInfo, errTimingClick := clickVisiblePageButtonByText(page, []string{"定时发布"}, []string{"预览并定时发布", "预览并发布", "立即发布"}, "open timing modal fallback")
+		if errTimingClick == nil && clickedTiming {
+			log.Infof("未直接识别到定时 Modal，已点击页面定时发布触发器重试: %s", timingInfo)
+			time.Sleep(1500 * time.Millisecond)
+			modalScan, _ = page.Eval(timingModalScanJS)
+			if modalScan != nil {
+				log.Infof("定时发布 Modal 重试扫描结果: %s", modalScan.Value.Str())
+			}
+			modalEl, errModal = page.Timeout(2 * time.Second).Element(`.mcp-timing-modal`)
+		}
+	}
 	if errModal == nil && modalEl != nil {
 		log.Info("检测到新版定时发布 Modal 弹窗存在，开始进行 Select 下拉框交互选择...")
 

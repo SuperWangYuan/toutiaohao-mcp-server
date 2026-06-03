@@ -1937,6 +1937,10 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 				log.Infof("通过通用 Modal 主按钮处理修改发布确认: %s", info)
 				break
 			}
+			if clicked, info, errClick := clickVisiblePageButtonByText(a.page, []string{"确认发布", "确认发表", "确定发布", "发布"}, []string{"预览并发布", "预览并定时发布", "返回编辑", "取消"}, "update publish confirm page"); errClick == nil && clicked {
+				log.Infof("通过页面确认按钮处理修改发布确认: %s", info)
+				break
+			}
 		}
 		return waitForPublishResult(a.page, 90*time.Second)
 	}
@@ -1961,6 +1965,15 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 		}
 		if err == nil && clicked {
 			log.Infof("Secondary publish confirmation succeeded: %s", modalInfo)
+			clickedConfirm = true
+			break
+		}
+		clickedPage, pageInfo, errPage := clickVisiblePageButtonByText(a.page, []string{"确认发布", "确认发表", "确定发布", "发布"}, []string{"预览并发布", "预览并定时发布", "返回编辑", "取消"}, "publish confirm page")
+		if errPage == nil && pageInfo != "" {
+			lastJSResult = pageInfo
+		}
+		if errPage == nil && clickedPage {
+			log.Infof("Secondary publish page confirmation succeeded: %s", pageInfo)
 			clickedConfirm = true
 			break
 		}
