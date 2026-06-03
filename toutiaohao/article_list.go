@@ -349,12 +349,30 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 				const rect = el.getBoundingClientRect();
 				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 			};
-			let btns = document.querySelectorAll('span, button, a, div, [role="button"]');
-			for (let btn of btns) {
-				let t = (btn.textContent || '').trim();
-				if (t === '删除' && visible(btn)) {
-					btn.click();
-					return 'clicked delete after more';
+			const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
+			const clickLikeUser = (el) => {
+				['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
+					el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+				});
+			};
+			const roots = Array.from(document.querySelectorAll('.byte-popover, .semi-popover, [class*="popover"], [class*="dropdown"], [class*="menu"], [role="menu"], [role="listbox"]')).filter(visible);
+			for (const root of roots) {
+				const items = Array.from(root.querySelectorAll('li, button, span, a, div, [role="menuitem"], [role="button"]')).filter(visible);
+				for (const item of items) {
+					const text = normalize(item.textContent);
+					if (text.includes('删除') && text.length <= 12) {
+						const target = item.closest('li, button, a, [role="menuitem"], [role="button"]') || item;
+						clickLikeUser(target);
+						return 'clicked delete after more';
+					}
+				}
+			}
+			const btns = Array.from(document.querySelectorAll('li, button, span, a, div, [role="menuitem"], [role="button"]')).filter(visible);
+			for (const btn of btns) {
+				const text = normalize(btn.textContent);
+				if (text.includes('删除') && text.length <= 12) {
+					clickLikeUser(btn);
+					return 'clicked delete after more fallback';
 				}
 			}
 			return 'no delete after more';
@@ -367,11 +385,31 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 
 	// 确认弹窗
 	confirmRes, _ := page.Eval(`() => {
-		let btns = document.querySelectorAll('button, span');
-		for (let btn of btns) {
-			let t = (btn.textContent || '').trim();
-			if (t === '确认' || t === '确定' || t.includes('确认删除')) {
-				btn.click();
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
+		const clickLikeUser = (el) => {
+			['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
+				el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+			});
+		};
+		const roots = Array.from(document.querySelectorAll('.byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"]')).filter(visible);
+		const candidates = [];
+		for (const root of roots) {
+			candidates.push(...Array.from(root.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible));
+		}
+		if (candidates.length === 0) {
+			candidates.push(...Array.from(document.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible));
+		}
+		for (const btn of candidates) {
+			const text = normalize(btn.textContent);
+			if ((text === '删除' || text === '确认' || text === '确定' || text.includes('确认删除') || text.includes('确定删除')) && !text.includes('取消')) {
+				const target = btn.closest('button, a, [role="button"]') || btn;
+				clickLikeUser(target);
 				return 'confirmed';
 			}
 		}
@@ -381,8 +419,16 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 	if menuResult != "" {
 		log.Infof("删除菜单点击结果: %s", menuResult)
 	}
+	if strings.Contains(resultStr, "clicked more") && !strings.Contains(menuResult, "clicked delete") {
+		safeScreenshot(page, "./screenshot_delete_draft_menu_error.png")
+		return fmt.Errorf("草稿更多菜单中未找到删除按钮: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_menu_error.png", articleID, articleTitle, menuResult)
+	}
 	if confirmRes != nil {
 		log.Infof("删除确认点击结果: %s", confirmRes.Value.Str())
+	}
+	if confirmRes == nil || strings.Contains(confirmRes.Value.Str(), "no confirm") {
+		safeScreenshot(page, "./screenshot_delete_draft_confirm_error.png")
+		return fmt.Errorf("草稿删除确认弹窗未确认: id=%s title=%s，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle)
 	}
 
 	_ = page.Reload()
