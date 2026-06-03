@@ -704,6 +704,9 @@ var publishErrorTexts = []string{
 	"标题不能为空",
 	"正文不能为空",
 	"内容不能为空",
+	"请勿选择重复的封面",
+	"重复的封面",
+	"为保证读者体验",
 }
 
 // waitForPublishResult 等待并检测发布结果

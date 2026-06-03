@@ -93,7 +93,7 @@ func (s *ToutiaoService) CheckArticleExists(ctx context.Context, title string) (
 // PublishArticle 发布文章
 func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content string, opts *toutiaohao.ArticleOptions) (*toutiaohao.PublishResult, error) {
 	log.Infof("[Step 1/7] 开始发布文章校验，标题: %s", title)
-	content = ensureInlineImages(content, opts)
+	title = truncateTitleForPublish(title)
 	if err := toutiaohao.ValidateArticle(title, content, opts); err != nil {
 		log.Errorf("[Step 1/7] 参数校验失败: %v", err)
 		return nil, err
@@ -195,32 +195,6 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 // GetArticleList 获取文章列表
 func (s *ToutiaoService) GetArticleList(ctx context.Context, params *toutiaohao.ArticleListParams) (*toutiaohao.ArticleListResponse, error) {
 	return toutiaohao.GetArticleList(ctx, params, s.cookieStore)
-}
-
-func ensureInlineImages(content string, opts *toutiaohao.ArticleOptions) string {
-	if opts == nil || len(opts.Images) == 0 {
-		return content
-	}
-	if strings.Contains(content, "![") && strings.Contains(content, "](") {
-		return content
-	}
-
-	var b strings.Builder
-	b.WriteString(strings.TrimRight(content, "\n"))
-	appendCount := 0
-	for _, imagePath := range opts.Images {
-		imagePath = strings.TrimSpace(imagePath)
-		if imagePath == "" {
-			continue
-		}
-		appendCount++
-		b.WriteString("\n\n")
-		b.WriteString(fmt.Sprintf("![配图%d](%s)", appendCount, imagePath))
-	}
-	if appendCount > 0 {
-		log.Infof("[Step 4/7] 检测到 images 参数但正文缺少 Markdown 图片，已自动追加 %d 张正文插图占位", appendCount)
-	}
-	return b.String()
 }
 
 // DeleteArticle 删除文章

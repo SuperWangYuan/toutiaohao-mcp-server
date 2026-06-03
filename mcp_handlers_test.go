@@ -2,6 +2,8 @@ package main
 
 import (
 	"testing"
+
+	"github.com/example/toutiaohao-mcp-server/configs"
 )
 
 func TestLoginHandlerArgsValidation_EmptyUsername(t *testing.T) {
@@ -50,5 +52,13 @@ func TestLoginToolSchema(t *testing.T) {
 	// 验证工具已注册 - InitMCPServer 在 NewAppServer 中调用
 	if server.mcpServer == nil {
 		t.Fatal("mcpServer is nil")
+	}
+}
+
+func TestTruncateTitleForPublish(t *testing.T) {
+	longTitle := "123456789012345678901234567890extra"
+	got := truncateTitleForPublish(longTitle)
+	if len([]rune(got)) != configs.MaxTitleLength {
+		t.Fatalf("expected title length %d, got %d: %s", configs.MaxTitleLength, len([]rune(got)), got)
 	}
 }

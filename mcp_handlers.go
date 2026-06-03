@@ -4,8 +4,20 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/example/toutiaohao-mcp-server/configs"
 	"github.com/example/toutiaohao-mcp-server/toutiaohao"
+	log "github.com/sirupsen/logrus"
 )
+
+func truncateTitleForPublish(title string) string {
+	runes := []rune(title)
+	if len(runes) <= configs.MaxTitleLength {
+		return title
+	}
+	truncated := string(runes[:configs.MaxTitleLength])
+	log.Warnf("标题超过 %d 字，已在入口层自动截断: %s -> %s", configs.MaxTitleLength, title, truncated)
+	return truncated
+}
 
 // handleLoginArgsValidation 校验登录参数，返回 nil 表示通过
 func handleLoginArgsValidation(args map[string]interface{}) *MCPToolResult {
@@ -102,6 +114,7 @@ func (s *AppServer) handleSaveMicroPostDraft(ctx context.Context, args map[strin
 func (s *AppServer) handlePublishArticle(ctx context.Context, args map[string]interface{}) *MCPToolResult {
 	title, _ := args["title"].(string)
 	content, _ := args["content"].(string)
+	title = truncateTitleForPublish(title)
 
 	opts := &toutiaohao.ArticleOptions{}
 	if imgs, ok := args["images"].([]string); ok {
@@ -147,6 +160,9 @@ func (s *AppServer) handleUpdateArticle(ctx context.Context, args map[string]int
 	articleID, _ := args["article_id"].(string)
 	title, _ := args["title"].(string)
 	content, _ := args["content"].(string)
+	if title != "" {
+		title = truncateTitleForPublish(title)
+	}
 
 	opts := &toutiaohao.ArticleOptions{}
 	if imgs, ok := args["images"].([]string); ok {

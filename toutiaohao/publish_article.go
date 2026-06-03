@@ -238,7 +238,15 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 		}
 		if err := a.uploadCovers(targetCovers, isAutoCover); err != nil {
 			log.Warnf("Failed to upload cover images for mode %s: %v", targetCoverMode, err)
+			if degradeErr := a.setCoverMode("无封面"); degradeErr != nil {
+				log.Warnf("封面上传失败后降级为无封面也失败: %v", degradeErr)
+			} else {
+				log.Warn("封面上传失败，已降级为无封面以避免发布按钮被封面校验拦截")
+			}
 		}
+	}
+	if err := a.clearBlockingCoverWarning(); err != nil {
+		log.Warnf("处理封面校验警告失败: %v", err)
 	}
 
 	// 设置原创标记
@@ -1023,13 +1031,15 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 	}()
 
 	for i, path := range coverPaths {
-		// 如果是自适应封面，且该位置的封面槽已自动填入了图片，则跳过上传
-		if isAutoCover {
-			hasImg, errCheck := a.checkCoverSlotHasImage(i)
-			if errCheck == nil && hasImg {
-				log.Infof("检测到封面槽 %d 已自动填入图片，自适应模式下跳过上传", i+1)
-				continue
+		// 头条会从正文图片自动同步封面槽。若槽位已有图，继续点“编辑/替换”很容易进入错误的弹层或触发重复封面校验。
+		hasImg, errCheck := a.checkCoverSlotHasImage(i)
+		if errCheck == nil && hasImg {
+			modeNote := "显式封面"
+			if isAutoCover {
+				modeNote = "自适应封面"
 			}
+			log.Infof("检测到封面槽 %d 已有图片（%s），跳过重复上传", i+1, modeNote)
+			continue
 		}
 
 		localPath, cleanup, err := downloadImageToTemp(path)
@@ -1308,6 +1318,25 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 
 		time.Sleep(1500 * time.Millisecond)
 	}
+	return nil
+}
+
+func (a *ArticlePublishAction) clearBlockingCoverWarning() error {
+	res, err := a.page.Eval(`() => {
+		const text = document.body ? document.body.innerText || '' : '';
+		return text.includes('请勿选择重复的封面') ||
+			text.includes('重复的封面') ||
+			text.includes('为保证读者体验');
+	}`)
+	if err != nil || res == nil || !res.Value.Bool() {
+		return err
+	}
+
+	log.Warn("检测到封面重复/读者体验校验警告，自动切换为无封面以解除发布阻塞")
+	if err := a.setCoverMode("无封面"); err != nil {
+		return fmt.Errorf("切换无封面失败: %w", err)
+	}
+	time.Sleep(1 * time.Second)
 	return nil
 }
 
@@ -2033,6 +2062,24 @@ func (a *ArticlePublishAction) clickScheduledPublishConfirm(publishTime interfac
 				}
 				return nil
 			}
+		}
+
+		onPreviewPage := false
+		previewRes, previewErr := a.page.Eval(`() => {
+			const text = document.body ? (document.body.innerText || '').replace(/\s+/g, '') : '';
+			return text.includes('返回编辑') &&
+				(text.includes('确认发布') || text.includes('发布文章') || text.includes('定时发布') || text.includes('预览并定时发布'));
+		}`)
+		if previewErr == nil && previewRes != nil {
+			onPreviewPage = previewRes.Value.Bool()
+		}
+		if !onPreviewPage {
+			if i == 6 {
+				log.Warnf("点击预览并发布后仍未进入预览确认页，跳过定时设置并等待页面发布结果。最后状态: %s", lastResult)
+				return waitForPublishResult(a.page, 45*time.Second)
+			}
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
 		clicked, infoClick, errClick := clickVisiblePageButtonByText(
