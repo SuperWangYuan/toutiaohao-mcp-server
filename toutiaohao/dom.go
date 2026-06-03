@@ -1289,6 +1289,13 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 
 		// (3) 交互选择分钟
 		minuteSelect, errMinSel := modalEl.Element(".minute-select")
+		if errMinSel != nil {
+			selects, _ := modalEl.Elements(`.byte-select`)
+			if len(selects) >= 3 {
+				minuteSelect = selects[2]
+				errMinSel = nil
+			}
+		}
 		if errMinSel == nil && minuteSelect != nil {
 			log.Infof("找到分钟下拉框，点击展开。")
 			_ = minuteSelect.Click(proto.InputMouseButtonLeft, 1)
@@ -1327,6 +1334,29 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 		}
 
 		// (3) 点击确定
+		expectedTime := t.Format("2006-01-02 15:04")
+		verifyRes, _ := page.Eval(`(expected) => {
+			const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
+			const expectedCompact = normalize(expected);
+			const modal = document.querySelector('.mcp-timing-modal, .common-timing-picker, [class*="timing-picker"]');
+			const text = normalize(modal ? modal.textContent : document.body.innerText);
+			const publishTime = normalize((modal && modal.querySelector('.publish-time')) ? modal.querySelector('.publish-time').textContent : '');
+			return JSON.stringify({
+				matched: text.includes(expectedCompact) || publishTime.includes(expectedCompact),
+				expected: expectedCompact,
+				publishTime,
+				text: text.slice(0, 160)
+			});
+		}`, expectedTime)
+		if verifyRes != nil {
+			verifyStr := verifyRes.Value.Str()
+			log.Infof("定时发布时间设置校验: %s", verifyStr)
+			if !strings.Contains(verifyStr, `"matched":true`) {
+				safeScreenshot(page, "./screenshot_publish_time_verify_error.png")
+				return fmt.Errorf("定时发布时间未设置为目标值 %s，页面状态: %s", expectedTime, verifyStr)
+			}
+		}
+
 		log.Info("确认定时选择...")
 		confirmed, confirmInfo, errConfirm := clickVisibleModalPrimaryButton(page, []string{"预览并定时发布", "定时发布", "确定", "确认", "提交"}, "timing publish modal")
 		if errConfirm != nil {

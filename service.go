@@ -171,6 +171,11 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 	if errList == nil && respList != nil && len(respList.Articles) > 0 {
 		for _, art := range respList.Articles {
 			if art.Title == title {
+				if articleStatusIsDraft(art.Status) {
+					errDraft := fmt.Errorf("文章提交后仍为草稿状态，ArticleID=%s status=%v", art.ArticleID, art.Status)
+					log.Errorf("发布后核对失败：%v", errDraft)
+					return nil, errDraft
+				}
 				log.Infof("发布后核对验证成功：列表中已找到标题为「%s」的文章，ArticleID 为 %s", title, art.ArticleID)
 				return &toutiaohao.PublishResult{
 					Success:        true,
@@ -190,6 +195,22 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 		CoverStatus:    coverStatus,
 		OriginalStatus: originalStatus,
 	}, nil
+}
+
+func articleStatusIsDraft(status interface{}) bool {
+	switch v := status.(type) {
+	case float64:
+		return int(v) == 1
+	case int:
+		return v == 1
+	case int64:
+		return v == 1
+	case string:
+		normalized := strings.TrimSpace(strings.ToLower(v))
+		return normalized == "1" || normalized == "draft" || normalized == "草稿"
+	default:
+		return false
+	}
 }
 
 // GetArticleList 获取文章列表

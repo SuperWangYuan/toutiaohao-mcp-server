@@ -2075,7 +2075,8 @@ func (a *ArticlePublishAction) clickScheduledPublishConfirm(publishTime interfac
 		if modalEl, errModal := findExistingTimingModal(a.page, "scheduled-confirm-loop"); errModal == nil && modalEl != nil {
 			if err := setPublishTime(a.page, publishTime); err != nil {
 				lastResult = err.Error()
-				log.Warnf("预览页定时弹窗设置失败: %v", err)
+				log.Errorf("预览页定时弹窗设置失败，中断本次提交以避免默认时间误发: %v", err)
+				return fmt.Errorf("设置定时发布时间失败: %w", err)
 			} else {
 				if err := waitForPublishResult(a.page, 25*time.Second); err != nil {
 					log.Warnf("定时发布提交后未检测到跳转或成功提示，继续交由发布后列表校验确认: %v", err)
@@ -2130,7 +2131,8 @@ func (a *ArticlePublishAction) clickScheduledPublishConfirm(publishTime interfac
 			time.Sleep(1500 * time.Millisecond)
 			if err := setPublishTime(a.page, publishTime); err != nil {
 				lastResult = err.Error()
-				log.Warnf("点击定时发布按钮后设置时间失败: %v", err)
+				log.Errorf("点击定时发布按钮后设置时间失败，中断本次提交以避免默认时间误发: %v", err)
+				return fmt.Errorf("设置定时发布时间失败: %w", err)
 			} else {
 				if err := waitForPublishResult(a.page, 25*time.Second); err != nil {
 					log.Warnf("定时发布提交后未检测到跳转或成功提示，继续交由发布后列表校验确认: %v", err)
