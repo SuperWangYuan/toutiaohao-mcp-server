@@ -249,49 +249,60 @@ func (s *ToutiaoService) DeleteArticle(ctx context.Context, articleID string) er
 	if bin := browser.DetectChromePath(); bin != "" {
 		l = l.Bin(bin)
 	}
-	url := l.MustLaunch()
-	rodBrowser := rod.New().ControlURL(url).MustConnect()
+	controlURL := l.MustLaunch()
+	rodBrowser := rod.New().ControlURL(controlURL).MustConnect()
 	defer rodBrowser.Close()
 
-	// 加载并注入 Cookie
 	cookieData, err := s.cookieStore.LoadCookies()
-	if err == nil && len(cookieData) > 0 {
-		var cookies []struct {
-			Name   string `json:"name"`
-			Value  string `json:"value"`
-			Domain string `json:"domain"`
-			Path   string `json:"path"`
+	if err != nil || len(cookieData) == 0 {
+		return fmt.Errorf("no cookies available, please login first")
+	}
+	var cookies []struct {
+		Name     string `json:"name"`
+		Value    string `json:"value"`
+		Domain   string `json:"domain"`
+		Path     string `json:"path"`
+		Secure   bool   `json:"secure"`
+		HTTPOnly bool   `json:"httpOnly"`
+	}
+	if err := json.Unmarshal(cookieData, &cookies); err != nil {
+		return fmt.Errorf("failed to parse cookies for browser deletion: %w", err)
+	}
+	var rodCookies []*proto.NetworkCookie
+	for _, c := range cookies {
+		if c.Name == "" {
+			continue
 		}
-		if err := json.Unmarshal(cookieData, &cookies); err == nil {
-			var rodCookies []*proto.NetworkCookie
-			for _, c := range cookies {
-				if c.Domain == "" {
-					c.Domain = ".toutiao.com"
-				}
-				if c.Path == "" {
-					c.Path = "/"
-				}
-				rodCookies = append(rodCookies, &proto.NetworkCookie{
-					Name:     c.Name,
-					Value:    c.Value,
-					Domain:   c.Domain,
-					Path:     c.Path,
-					HTTPOnly: false,
-					Secure:   false,
-					Session:  true,
-				})
-			}
-			if len(rodCookies) > 0 {
-				rodBrowser.MustSetCookies(rodCookies...)
-				log.Infof("已注入 %d 个 Cookie", len(rodCookies))
-			}
+		if c.Domain == "" {
+			c.Domain = ".toutiao.com"
 		}
+		if c.Path == "" {
+			c.Path = "/"
+		}
+		rodCookies = append(rodCookies, &proto.NetworkCookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Secure:   c.Secure,
+			HTTPOnly: c.HTTPOnly,
+		})
+	}
+	if len(rodCookies) == 0 {
+		return fmt.Errorf("no valid cookies available, please login first")
 	}
 
-	page := rodBrowser.MustPage()
+	page := rodBrowser.MustPage("https://mp.toutiao.com/profile_v4/graphic/articles?status=draft")
 	defer page.Close()
+	page.Timeout(15 * time.Second).WaitLoad()
+	time.Sleep(2 * time.Second)
+	rodBrowser.MustSetCookies(rodCookies...)
+	log.Infof("已注入 %d 个 Cookie", len(rodCookies))
+	page.Reload()
+	page.Timeout(15 * time.Second).WaitLoad()
+	time.Sleep(3 * time.Second)
 
-	if err := toutiaohao.DeleteDraftByBrowserWithTitle(ctx, page, articleID, articleTitle); err != nil {
+	if err := toutiaohao.DeleteDraftByBrowserOnPage(ctx, page, articleID, articleTitle); err != nil {
 		return err
 	}
 

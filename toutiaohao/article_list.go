@@ -309,6 +309,24 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 	return DeleteDraftByBrowserWithTitle(ctx, page, articleID, "")
 }
 
+// DeleteDraftByBrowserOnPage 在当前已加载的草稿列表页面上删除草稿，不重新触发 SPA 导航。
+func DeleteDraftByBrowserOnPage(ctx context.Context, page *rod.Page, articleID string, articleTitle string) error {
+	log.Infof("正在当前页面删除草稿: %s 标题: %s", articleID, articleTitle)
+
+	url, _ := page.Eval(`() => window.location.href`)
+	currentURL := ""
+	if url != nil {
+		currentURL = url.Value.Str()
+	}
+	log.Infof("当前页面URL: %s", currentURL)
+	if strings.Contains(currentURL, "login") {
+		return fmt.Errorf("跳转到登录页，Cookie可能过期")
+	}
+
+	_, err := deleteDraftFromCurrentPage(page, articleID, articleTitle)
+	return err
+}
+
 // DeleteDraftByBrowserWithTitle 用浏览器删除草稿，支持通过文章标题定位列表卡片。
 func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleID string, articleTitle string) error {
 	log.Infof("正在用浏览器删除草稿: %s 标题: %s", articleID, articleTitle)
@@ -320,9 +338,12 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 	}
 
 	var resultStr string
+	var lastErr error
+	deleted := false
 	for _, draftURL := range draftURLs {
 		if err := page.Navigate(draftURL); err != nil {
 			log.Warnf("导航到草稿列表页失败 %s: %v", draftURL, err)
+			lastErr = err
 			continue
 		}
 		_ = page.Timeout(10 * time.Second).WaitLoad()
@@ -358,64 +379,83 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 			}
 			log.Infof("草稿箱导航后 URL: %s", navURL)
 		}
-		_, _ = page.Eval(`() => {
-			window.scrollTo(0, window.scrollY || 0);
-			document.scrollingElement && (document.scrollingElement.scrollLeft = 0);
-			document.querySelectorAll('*').forEach(el => {
-				if (el.scrollLeft) el.scrollLeft = 0;
-			});
-		}`)
-
-		log.Info("尝试定位目标草稿并勾选复选框...")
 		var err error
-		resultStr, err = clickDraftCheckboxWithRetry(page, articleID, articleTitle)
+		resultStr, err = deleteDraftFromCurrentPage(page, articleID, articleTitle)
 		if err != nil {
-			log.Warnf("草稿复选框点击失败: %v", err)
+			log.Warnf("当前草稿列表页删除失败: %v", err)
+			lastErr = err
 			continue
 		}
-		log.Infof("草稿复选框定位结果: %s", resultStr)
-		if resultStr != "" && !strings.Contains(resultStr, "no matching") && !strings.Contains(resultStr, "no checkbox") {
+		if resultStr != "" {
+			deleted = true
 			break
 		}
 	}
-	if resultStr == "" || strings.Contains(resultStr, "no matching") {
+	if !deleted {
+		if lastErr != nil {
+			return lastErr
+		}
+	}
+	if resultStr == "" || strings.Contains(resultStr, "no matching") || strings.Contains(resultStr, "no checkbox") {
 		safeScreenshot(page, "./screenshot_delete_draft_not_found.png")
 		return fmt.Errorf("未在草稿列表中找到待删除文章: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_not_found.png", articleID, articleTitle, resultStr)
 	}
+	return nil
+}
+
+func deleteDraftFromCurrentPage(page *rod.Page, articleID string, articleTitle string) (string, error) {
+	_, _ = page.Eval(`() => {
+		window.scrollTo(0, window.scrollY || 0);
+		document.scrollingElement && (document.scrollingElement.scrollLeft = 0);
+		document.querySelectorAll('*').forEach(el => {
+			if (el.scrollLeft) el.scrollLeft = 0;
+		});
+	}`)
+
+	log.Info("尝试定位目标草稿并勾选复选框...")
+	resultStr, err := clickDraftCheckboxWithRetry(page, articleID, articleTitle)
+	if err != nil {
+		return resultStr, fmt.Errorf("草稿复选框点击失败: %w", err)
+	}
+	log.Infof("草稿复选框定位结果: %s", resultStr)
+	if resultStr == "" || strings.Contains(resultStr, "no matching") {
+		safeScreenshot(page, "./screenshot_delete_draft_not_found.png")
+		return resultStr, fmt.Errorf("未在草稿列表中找到待删除文章: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_not_found.png", articleID, articleTitle, resultStr)
+	}
 	if strings.Contains(resultStr, "no checkbox") {
 		safeScreenshot(page, "./screenshot_delete_draft_checkbox_error.png")
-		return fmt.Errorf("已找到草稿但未找到可勾选复选框: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_checkbox_error.png", articleID, articleTitle, resultStr)
+		return resultStr, fmt.Errorf("已找到草稿但未找到可勾选复选框: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_checkbox_error.png", articleID, articleTitle, resultStr)
 	}
 
 	time.Sleep(1500 * time.Millisecond)
 	batchResult, err := clickDraftBatchDeleteOnCurrentPage(page)
 	if err != nil {
 		safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
-		return fmt.Errorf("草稿批量删除按钮点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, err)
+		return resultStr, fmt.Errorf("草稿批量删除按钮点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, err)
 	}
 	log.Infof("草稿批量删除点击结果: %s", batchResult)
 	if batchResult == "" || strings.Contains(batchResult, "no batch delete") {
 		safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
-		return fmt.Errorf("勾选草稿后未找到批量删除按钮: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, batchResult)
+		return resultStr, fmt.Errorf("勾选草稿后未找到批量删除按钮: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, batchResult)
 	}
 
 	time.Sleep(2 * time.Second)
 	confirmResult, err := clickDraftDeleteConfirm(page)
 	if err != nil {
 		safeScreenshot(page, "./screenshot_delete_draft_confirm_error.png")
-		return fmt.Errorf("草稿删除确认弹窗点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle, err)
+		return resultStr, fmt.Errorf("草稿删除确认弹窗点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle, err)
 	}
 	log.Infof("草稿删除确认点击结果: %s", confirmResult)
 	if confirmResult == "" || strings.Contains(confirmResult, "no confirm") {
 		safeScreenshot(page, "./screenshot_delete_draft_confirm_error.png")
-		return fmt.Errorf("草稿删除确认弹窗未确认: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle, confirmResult)
+		return resultStr, fmt.Errorf("草稿删除确认弹窗未确认: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle, confirmResult)
 	}
 
 	_ = page.Reload()
 	_ = page.Timeout(10 * time.Second).WaitLoad()
 	time.Sleep(3 * time.Second)
 	log.Infof("草稿删除操作已提交，等待 API 列表复核: %s", articleID)
-	return nil
+	return resultStr, nil
 }
 
 func clickDraftNavigation(page *rod.Page) (string, error) {
