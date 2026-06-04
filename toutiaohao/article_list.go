@@ -461,6 +461,20 @@ func deleteDraftFromCurrentPage(page *rod.Page, articleID string, articleTitle s
 		return resultStr, fmt.Errorf("草稿删除确认弹窗未确认: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle, confirmResult)
 	}
 
+	// 等待删除确认弹窗在 DOM 中完全消失
+	log.Info("等待删除确认弹窗在 DOM 中完全消失...")
+	for i := 0; i < 30; i++ {
+		res, err := page.Eval(`() => {
+			const el = document.querySelector('.mcp-draft-confirm-delete');
+			return !el || el.getBoundingClientRect().width === 0;
+		}`)
+		if err == nil && res != nil && res.Value.Bool() {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	time.Sleep(1500 * time.Millisecond)
+
 	_ = page.Reload()
 	_ = page.Timeout(10 * time.Second).WaitLoad()
 	time.Sleep(3 * time.Second)
@@ -924,6 +938,9 @@ func physicalClickMarkedElement(page *rod.Page, selector string) error {
 			['pointerover', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
 				this.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
 			});
+			if (typeof this.click === 'function') {
+				this.click();
+			}
 		}`)
 		return jsErr
 	}
