@@ -681,16 +681,38 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 			const key = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$') || k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
 			if (!key) return false;
 			const val = el[key];
+			if (!val) return false;
+
+			// 1. 优先检查 React Fiber 的 key 属性
+			if (String(val.key || '') === targetID) return true;
+			if (val.pendingProps && String(val.pendingProps.key || '') === targetID) return true;
+			if (val.memoizedProps && String(val.memoizedProps.key || '') === targetID) return true;
+
+			// 2. 浅层安全检索（限制深度在 3 层内，且过滤掉全量列表特征属性）
 			const visited = new Set();
 			const checkObj = (obj, depth = 0) => {
-				if (!obj || depth > 8) return false;
+				if (!obj || depth > 3) return false;
 				if (visited.has(obj)) return false;
+				visited.add(obj);
+
 				if (typeof obj === 'string' || typeof obj === 'number') {
 					return String(obj) === targetID;
 				}
+				if (Array.isArray(obj)) {
+					if (obj.length > 2) return false; // 排除长数组，防止匹配到全量列表
+					for (let i = 0; i < obj.length; i++) {
+						if (checkObj(obj[i], depth + 1)) return true;
+					}
+					return false;
+				}
 				if (typeof obj === 'object') {
-					visited.add(obj);
 					for (const k in obj) {
+						const kl = k.toLowerCase();
+						if (kl.includes('list') || kl.includes('article') || kl.includes('data') || kl.includes('row') || kl.includes('records') || kl.includes('children')) {
+							if (obj[k] && (Array.isArray(obj[k]) || (typeof obj[k] === 'object' && Object.keys(obj[k]).length > 10))) {
+								continue;
+							}
+						}
 						try {
 							if (Object.prototype.hasOwnProperty.call(obj, k)) {
 								if (checkObj(obj[k], depth + 1)) return true;
@@ -708,8 +730,7 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 			return (input && input.checked) || el.getAttribute('aria-checked') === 'true' || /\bchecked\b/.test(String(el.className || '').toLowerCase());
 		};
 		const title = normalize(articleTitle);
-		const titlePrefix = title.length > 10 ? title.slice(0, 10) : title;
-		const titleLoose = title.length > 6 ? title.slice(0, 6) : title;
+		const titlePrefix = title.length > 12 ? title.slice(0, 12) : title;
 		const matches = (el) => {
 			const text = normalize(el.textContent || '');
 			if (articleID) {
@@ -717,9 +738,11 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 				if (el.outerHTML && el.outerHTML.includes(articleID)) return true;
 				if (findReactID(el, articleID)) return true;
 			}
-			return (title && text.includes(title)) ||
-				(titlePrefix && text.includes(titlePrefix)) ||
-				(titleLoose && text.includes(titleLoose));
+			if (title) {
+				if (text.includes(title)) return true;
+				if (title.length > 12 && text.includes(titlePrefix)) return true;
+			}
+			return false;
 		};
 		const interactiveCheckbox = (el) => {
 			if (!el) return null;
@@ -778,7 +801,7 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 			let foundSiblingCheckbox = false;
 			for (const sibling of siblings) {
 				if (!visible(sibling)) continue;
-				if (normalize(sibling.textContent || '').includes(titleLoose) || sibling === card) {
+				if (normalize(sibling.textContent || '').includes(titlePrefix) || sibling === card) {
 					const cb = interactiveCheckbox(sibling);
 					if (cb) {
 						if (checked(cb)) return 'checkbox already checked';
