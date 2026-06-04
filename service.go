@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,9 @@ import (
 	"github.com/example/toutiaohao-mcp-server/configs"
 	"github.com/example/toutiaohao-mcp-server/cookies"
 	"github.com/example/toutiaohao-mcp-server/toutiaohao"
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -238,10 +242,53 @@ func (s *ToutiaoService) DeleteArticle(ctx context.Context, articleID string) er
 		articleTitle = s.findArticleTitleForDelete(ctx, articleID)
 	}
 
-	b := browser.NewBrowser(false)
-	defer b.Close()
+	// 直接用 rod 创建页面并注入 Cookie（避免 headless_browser 的 Cookie 格式不匹配问题）
+	l := launcher.New().
+		Headless(false).
+		Set("no-sandbox")
+	if bin := browser.DetectChromePath(); bin != "" {
+		l = l.Bin(bin)
+	}
+	url := l.MustLaunch()
+	rodBrowser := rod.New().ControlURL(url).MustConnect()
+	defer rodBrowser.Close()
 
-	page := b.NewPage()
+	// 加载并注入 Cookie
+	cookieData, err := s.cookieStore.LoadCookies()
+	if err == nil && len(cookieData) > 0 {
+		var cookies []struct {
+			Name   string `json:"name"`
+			Value  string `json:"value"`
+			Domain string `json:"domain"`
+			Path   string `json:"path"`
+		}
+		if err := json.Unmarshal(cookieData, &cookies); err == nil {
+			var rodCookies []*proto.NetworkCookie
+			for _, c := range cookies {
+				if c.Domain == "" {
+					c.Domain = ".toutiao.com"
+				}
+				if c.Path == "" {
+					c.Path = "/"
+				}
+				rodCookies = append(rodCookies, &proto.NetworkCookie{
+					Name:     c.Name,
+					Value:    c.Value,
+					Domain:   c.Domain,
+					Path:     c.Path,
+					HTTPOnly: false,
+					Secure:   false,
+					Session:  true,
+				})
+			}
+			if len(rodCookies) > 0 {
+				rodBrowser.MustSetCookies(rodCookies...)
+				log.Infof("已注入 %d 个 Cookie", len(rodCookies))
+			}
+		}
+	}
+
+	page := rodBrowser.MustPage()
 	defer page.Close()
 
 	if err := toutiaohao.DeleteDraftByBrowserWithTitle(ctx, page, articleID, articleTitle); err != nil {

@@ -192,43 +192,68 @@ func DeleteArticle(ctx context.Context, articleID string, cookieStore cookies.Co
 		return err
 	}
 
-	url := configs.DeleteArticleAPI
-	body := fmt.Sprintf(`{"article_id":"%s"}`, articleID)
-
 	data, err := cookieStore.LoadCookies()
 	if err != nil || data == nil {
 		return fmt.Errorf("no cookies available, please login first")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	injectCookies(req, data)
-
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("delete request failed: %w", err)
+	url := configs.DeleteArticleAPI
+	payloads := []string{
+		fmt.Sprintf(`{"article_id":"%s"}`, articleID),
+		fmt.Sprintf(`{"group_id":"%s"}`, articleID),
+		fmt.Sprintf(`{"item_id":"%s"}`, articleID),
+		fmt.Sprintf(`{"pgc_id":"%s"}`, articleID),
 	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("delete failed with status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	// 头条API可能返回HTTP 200但code非0（如user not login）
-	var apiResp struct {
-		Code int `json:"code"`
-	}
-	if err := json.Unmarshal(respBody, &apiResp); err == nil && apiResp.Code != 0 {
-		return fmt.Errorf("delete API returned error code %d: %s", apiResp.Code, string(respBody))
+	if articleID != "" && strings.Trim(articleID, "0123456789") == "" {
+		payloads = append(payloads,
+			fmt.Sprintf(`{"article_id":%s}`, articleID),
+			fmt.Sprintf(`{"group_id":%s}`, articleID),
+			fmt.Sprintf(`{"item_id":%s}`, articleID),
+			fmt.Sprintf(`{"pgc_id":%s}`, articleID),
+		)
 	}
 
-	return nil
+	var lastErr error
+	for _, body := range payloads {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		injectCookies(req, data)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("delete request failed with payload %s: %w", body, err)
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("delete failed with payload %s status %d: %s", body, resp.StatusCode, string(respBody))
+			continue
+		}
+
+		// 头条旧删除 API 已可能废弃，常见返回 code=20007124 Id invalid；继续换参数尝试。
+		var apiResp struct {
+			Code int `json:"code"`
+		}
+		if err := json.Unmarshal(respBody, &apiResp); err == nil && apiResp.Code != 0 {
+			lastErr = fmt.Errorf("delete API returned error code %d with payload %s: %s", apiResp.Code, body, string(respBody))
+			log.Warnf("删除 API 参数尝试失败: %v", lastErr)
+			continue
+		}
+
+		log.Infof("删除 API 参数尝试成功: %s", body)
+		return nil
+	}
+
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("delete API failed: no payload attempted")
 }
 
 // doAuthenticatedGet 带 Cookie 的 GET 请求
@@ -288,21 +313,10 @@ func DeleteDraftByBrowser(ctx context.Context, page *rod.Page, articleID string)
 func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleID string, articleTitle string) error {
 	log.Infof("正在用浏览器删除草稿: %s 标题: %s", articleID, articleTitle)
 
-	// 导航到头条号主页，确保 cookie 生效
-	if err := page.Navigate("https://mp.toutiao.com"); err != nil {
-		return fmt.Errorf("导航到头条主页失败: %w", err)
-	}
-	_ = page.Timeout(10 * time.Second).WaitLoad()
-	time.Sleep(3 * time.Second)
-
 	draftURLs := []string{
 		"https://mp.toutiao.com/profile_v4/graphic/articles?status=draft",
 		"https://mp.toutiao.com/profile_v4/graphic/articles?status=1",
 		"https://mp.toutiao.com/profile_v4/graphic/articles",
-		"https://mp.toutiao.com/profile_v4/graphic/list?status=draft",
-		"https://mp.toutiao.com/profile_v4/graphic/list?status=1",
-		"https://mp.toutiao.com/profile_v4/graphic/manage?status=draft",
-		"https://mp.toutiao.com/profile_v4/graphic/manage?status=1",
 	}
 
 	var resultStr string
@@ -317,6 +331,10 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 		url, _ := page.Eval(`() => window.location.href`)
 		title, _ := page.Eval(`() => document.title`)
 		log.Infof("当前页面URL: %v, 标题: %v", url, title)
+		if url != nil && strings.Contains(url.Value.Str(), "login") {
+			return fmt.Errorf("跳转到登录页，Cookie可能过期")
+		}
+
 		if navInfo, errNav := clickDraftNavigation(page); errNav == nil && navInfo != "" {
 			log.Infof("草稿箱导航点击结果: %s", navInfo)
 			time.Sleep(4 * time.Second)
@@ -328,137 +346,56 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 				if (el.scrollLeft) el.scrollLeft = 0;
 			});
 		}`)
-		log.Info("尝试定位并点击删除按钮...")
 
+		log.Info("尝试定位目标草稿并勾选复选框...")
 		var err error
-		resultStr, err = clickDraftDeleteOnCurrentPage(page, articleID, articleTitle)
+		resultStr, err = clickDraftCheckboxOnCurrentPage(page, articleID, articleTitle)
 		if err != nil {
-			log.Warnf("查找文章卡片失败: %v", err)
+			log.Warnf("草稿复选框点击失败: %v", err)
 			continue
 		}
-		log.Infof("查找结果: %s", resultStr)
-		if resultStr != "" && !strings.Contains(resultStr, "no matching") {
+		log.Infof("草稿复选框定位结果: %s", resultStr)
+		if resultStr != "" && !strings.Contains(resultStr, "no matching") && !strings.Contains(resultStr, "no checkbox") {
 			break
 		}
 	}
 	if resultStr == "" || strings.Contains(resultStr, "no matching") {
 		safeScreenshot(page, "./screenshot_delete_draft_not_found.png")
-		return fmt.Errorf("未在草稿列表中找到待删除文章: id=%s title=%s，已保存截图 screenshot_delete_draft_not_found.png", articleID, articleTitle)
+		return fmt.Errorf("未在草稿列表中找到待删除文章: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_not_found.png", articleID, articleTitle, resultStr)
 	}
-	time.Sleep(2 * time.Second)
+	if strings.Contains(resultStr, "no checkbox") {
+		safeScreenshot(page, "./screenshot_delete_draft_checkbox_error.png")
+		return fmt.Errorf("已找到草稿但未找到可勾选复选框: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_checkbox_error.png", articleID, articleTitle, resultStr)
+	}
 
-	// 如果点了更多，等待菜单弹出后再点删除。直接点到删除时不要再全页面扫，防止误点下一篇。
-	menuResult := ""
-	if strings.Contains(resultStr, "clicked more") {
-		menuRes, _ := page.Eval(`() => {
-			const visible = (el) => {
-				if (!el) return false;
-				const style = window.getComputedStyle(el);
-				const rect = el.getBoundingClientRect();
-				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-			};
-			const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
-			const clickLikeUser = (el) => {
-				['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
-					el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
-				});
-			};
-			const roots = Array.from(document.querySelectorAll('.byte-popover, .semi-popover, .byte-dropdown, .semi-dropdown, [class*="popover"], [class*="dropdown"], [class*="menu"], [class*="option"], [role="menu"], [role="listbox"]')).filter(visible);
-			for (const root of roots) {
-				const items = Array.from(root.querySelectorAll('li, button, span, a, div, p, [role="menuitem"], [role="option"], [role="button"]')).filter(visible);
-				for (const item of items) {
-					const text = normalize(item.textContent || item.getAttribute('aria-label') || item.getAttribute('title'));
-					const cls = String(item.className || '').toLowerCase();
-					if ((text.includes('删除') || cls.includes('delete')) && text.length <= 16) {
-						const target = item.closest('li, button, a, [role="menuitem"], [role="button"]') || item;
-						clickLikeUser(target);
-						return 'clicked delete after more';
-					}
-				}
-			}
-			const btns = Array.from(document.querySelectorAll('li, button, span, a, div, p, [role="menuitem"], [role="option"], [role="button"]')).filter(visible);
-			for (const btn of btns) {
-				const text = normalize(btn.textContent || btn.getAttribute('aria-label') || btn.getAttribute('title'));
-				const cls = String(btn.className || '').toLowerCase();
-				if ((text.includes('删除') || cls.includes('delete')) && text.length <= 16) {
-					clickLikeUser(btn);
-					return 'clicked delete after more fallback';
-				}
-			}
-			const rootTexts = roots.map(root => normalize(root.textContent).slice(0, 80)).filter(Boolean).slice(0, 8);
-			const visibleTexts = Array.from(document.querySelectorAll('li, button, span, a, div, p, [role="menuitem"], [role="option"], [role="button"]'))
-				.filter(visible).map(el => normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title')))
-				.filter(text => text && text.length <= 20).slice(0, 40);
-			return 'no delete after more; roots=' + JSON.stringify(rootTexts) + '; visible=' + JSON.stringify(visibleTexts);
-		}`)
-		if menuRes != nil {
-			menuResult = menuRes.Value.Str()
-		}
+	time.Sleep(1500 * time.Millisecond)
+	batchResult, err := clickDraftBatchDeleteOnCurrentPage(page)
+	if err != nil {
+		safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
+		return fmt.Errorf("草稿批量删除按钮点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, err)
 	}
-	time.Sleep(2 * time.Second)
+	log.Infof("草稿批量删除点击结果: %s", batchResult)
+	if batchResult == "" || strings.Contains(batchResult, "no batch delete") {
+		safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
+		return fmt.Errorf("勾选草稿后未找到批量删除按钮: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, batchResult)
+	}
 
-	// 确认弹窗
-	confirmRes, _ := page.Eval(`() => {
-		const visible = (el) => {
-			if (!el) return false;
-			const style = window.getComputedStyle(el);
-			const rect = el.getBoundingClientRect();
-			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-		};
-		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
-		const clickLikeUser = (el) => {
-			['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
-				el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
-			});
-		};
-		const roots = Array.from(document.querySelectorAll('.byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"]')).filter(visible);
-		const candidates = [];
-		for (const root of roots) {
-			candidates.push(...Array.from(root.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible));
-		}
-		if (candidates.length === 0) {
-			candidates.push(...Array.from(document.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible));
-		}
-		for (const btn of candidates) {
-			const text = normalize(btn.textContent);
-			if ((text === '删除' || text === '确认' || text === '确定' || text.includes('确认删除') || text.includes('确定删除')) && !text.includes('取消')) {
-				const target = btn.closest('button, a, [role="button"]') || btn;
-				clickLikeUser(target);
-				return 'confirmed';
-			}
-		}
-		return 'no confirm';
-	}`)
 	time.Sleep(2 * time.Second)
-	if menuResult != "" {
-		log.Infof("删除菜单点击结果: %s", menuResult)
-	}
-	if strings.Contains(resultStr, "clicked more") && !strings.Contains(menuResult, "clicked delete") {
-		safeScreenshot(page, "./screenshot_delete_draft_menu_error.png")
-		return fmt.Errorf("草稿更多菜单中未找到删除按钮: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_menu_error.png", articleID, articleTitle, menuResult)
-	}
-	if confirmRes != nil {
-		log.Infof("删除确认点击结果: %s", confirmRes.Value.Str())
-	}
-	if confirmRes == nil || strings.Contains(confirmRes.Value.Str(), "no confirm") {
+	confirmResult, err := clickDraftDeleteConfirm(page)
+	if err != nil {
 		safeScreenshot(page, "./screenshot_delete_draft_confirm_error.png")
-		return fmt.Errorf("草稿删除确认弹窗未确认: id=%s title=%s，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle)
+		return fmt.Errorf("草稿删除确认弹窗点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle, err)
+	}
+	log.Infof("草稿删除确认点击结果: %s", confirmResult)
+	if confirmResult == "" || strings.Contains(confirmResult, "no confirm") {
+		safeScreenshot(page, "./screenshot_delete_draft_confirm_error.png")
+		return fmt.Errorf("草稿删除确认弹窗未确认: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_confirm_error.png", articleID, articleTitle, confirmResult)
 	}
 
 	_ = page.Reload()
 	_ = page.Timeout(10 * time.Second).WaitLoad()
 	time.Sleep(3 * time.Second)
-	existsRes, _ := page.Eval(`(articleID, articleTitle) => {
-		const html = document.body ? document.body.innerHTML || '' : '';
-		const text = document.body ? document.body.innerText || '' : '';
-		return (articleID && (html.includes(articleID) || text.includes(articleID))) ||
-			(articleTitle && text.includes(articleTitle));
-	}`, articleID, articleTitle)
-	if existsRes != nil && existsRes.Value.Bool() {
-		return fmt.Errorf("草稿删除后复核仍存在: id=%s title=%s", articleID, articleTitle)
-	}
-
-	log.Infof("草稿删除操作完成并通过列表复核")
+	log.Infof("草稿删除操作已提交，等待 API 列表复核: %s", articleID)
 	return nil
 }
 
@@ -491,10 +428,10 @@ func clickDraftNavigation(page *rod.Page) (string, error) {
 	return result.Value.Str(), nil
 }
 
-func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle string) (string, error) {
+func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle string) (string, error) {
 	result, err := page.Eval(`(articleID, articleTitle) => {
-		document.querySelectorAll('.mcp-draft-action-delete, .mcp-draft-action-more').forEach(el => {
-			el.classList.remove('mcp-draft-action-delete', 'mcp-draft-action-more');
+		document.querySelectorAll('.mcp-draft-checkbox').forEach(el => {
+			el.classList.remove('mcp-draft-checkbox');
 		});
 		const visible = (el) => {
 			if (!el) return false;
@@ -503,6 +440,10 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 		};
 		const normalize = (s) => String(s || '').replace(/\s+/g, '').replace(/…|\.{3}/g, '').trim();
+		const checked = (el) => {
+			const input = el.matches && el.matches('input[type="checkbox"]') ? el : el.querySelector && el.querySelector('input[type="checkbox"]');
+			return (input && input.checked) || el.getAttribute('aria-checked') === 'true' || /\bchecked\b/.test(String(el.className || '').toLowerCase());
+		};
 		const title = normalize(articleTitle);
 		const titlePrefix = title.length > 10 ? title.slice(0, 10) : title;
 		const titleLoose = title.length > 6 ? title.slice(0, 6) : title;
@@ -514,12 +455,20 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 				(titlePrefix && text.includes(titlePrefix)) ||
 				(titleLoose && text.includes(titleLoose));
 		};
+		const interactiveCheckbox = (el) => {
+			if (!el) return null;
+			const direct = el.matches && (el.matches('input[type="checkbox"]') || el.getAttribute('role') === 'checkbox' || String(el.className || '').toLowerCase().includes('checkbox')) ? el : null;
+			const found = direct || el.querySelector('input[type="checkbox"], [role="checkbox"], [class*="checkbox"]');
+			if (!found) return null;
+			const target = found.closest('label, button, [role="checkbox"], [class*="checkbox"]') || found;
+			return visible(target) ? target : null;
+		};
 		const leafSelectors = 'a, span, div, p, h1, h2, h3, td, [href], [class*="title"]';
 		const leaves = Array.from(document.querySelectorAll(leafSelectors)).filter(el => visible(el) && matches(el));
 		const cards = [];
 		for (const leaf of leaves) {
 			let cur = leaf;
-			for (let depth = 0; cur && depth < 10; depth++, cur = cur.parentElement) {
+			for (let depth = 0; cur && depth < 12; depth++, cur = cur.parentElement) {
 				const cls = String(cur.className || '').toLowerCase();
 				const text = normalize(cur.textContent || '');
 				if (cur.tagName === 'TR' || cur.tagName === 'LI' || cls.includes('item') || cls.includes('card') ||
@@ -537,27 +486,29 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 			['pointerover', 'mouseover', 'mouseenter'].forEach(name => {
 				card.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
 			});
-			const btns = Array.from(card.querySelectorAll('button, span, a, div, [role="button"]')).filter(visible);
-			const deleteBtn = btns.find(btn => normalize(btn.textContent) === '删除' || normalize(btn.getAttribute('aria-label')).includes('删除') || String(btn.className || '').includes('delete'));
-			if (deleteBtn) {
-				deleteBtn.classList.add('mcp-draft-action-delete');
-				return 'marked delete';
+			const inCard = interactiveCheckbox(card);
+			if (inCard) {
+				if (checked(inCard)) return 'checkbox already checked';
+				inCard.classList.add('mcp-draft-checkbox');
+				return 'marked checkbox';
 			}
-			const moreBtn = btns.find(btn => {
-				const text = normalize(btn.textContent);
-				const cls = String(btn.className || '').toLowerCase();
-				const aria = normalize(btn.getAttribute('aria-label'));
-				const titleText = normalize(btn.getAttribute('title'));
-				const rect = btn.getBoundingClientRect();
-				const compact = rect.width > 0 && rect.width <= 96 && rect.height > 0 && rect.height <= 48;
-				return text === '更多' || text === '···' || text === '...' || text === '⋯' ||
-					text.includes('更多') || aria.includes('更多') || titleText.includes('更多') ||
-					(cls.includes('more') && compact);
-			});
-			if (moreBtn) {
-				moreBtn.classList.add('mcp-draft-action-more');
-				return 'marked more';
+			const parent = card.parentElement;
+			const siblings = parent ? Array.from(parent.children) : [];
+			for (const sibling of siblings) {
+				if (!visible(sibling)) continue;
+				if (normalize(sibling.textContent || '').includes(titleLoose) || sibling === card) {
+					const cb = interactiveCheckbox(sibling);
+					if (cb) {
+						if (checked(cb)) return 'checkbox already checked';
+						cb.classList.add('mcp-draft-checkbox');
+						return 'marked checkbox sibling';
+					}
+				}
 			}
+		}
+		if (cards.length > 0) {
+			const diagnostics = cards.map(card => normalize(card.textContent || '').slice(0, 80)).slice(0, 3);
+			return 'no checkbox in matching card; cards=' + JSON.stringify(diagnostics);
 		}
 		return 'no matching card found';
 	}`, articleID, articleTitle)
@@ -569,19 +520,100 @@ func clickDraftDeleteOnCurrentPage(page *rod.Page, articleID, articleTitle strin
 	}
 	resultStr := result.Value.Str()
 	switch resultStr {
-	case "marked delete":
-		if err := physicalClickMarkedElement(page, ".mcp-draft-action-delete"); err != nil {
+	case "marked checkbox", "marked checkbox sibling":
+		if err := physicalClickMarkedElement(page, ".mcp-draft-checkbox"); err != nil {
 			return resultStr, err
 		}
-		return "clicked delete", nil
-	case "marked more":
-		if err := physicalClickMarkedElement(page, ".mcp-draft-action-more"); err != nil {
-			return resultStr, err
-		}
-		return "clicked more", nil
+		return "clicked checkbox", nil
 	default:
 		return resultStr, nil
 	}
+}
+
+func clickDraftBatchDeleteOnCurrentPage(page *rod.Page) (string, error) {
+	result, err := page.Eval(`() => {
+		document.querySelectorAll('.mcp-draft-batch-delete').forEach(el => el.classList.remove('mcp-draft-batch-delete'));
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
+		const roots = Array.from(document.querySelectorAll('[class*="batch"], [class*="toolbar"], [class*="operation"], [class*="action"], .byte-table, .semi-table, body')).filter(visible);
+		const candidates = [];
+		for (const root of roots) {
+			candidates.push(...Array.from(root.querySelectorAll('button, a, span, div, [role="button"]')).filter(visible));
+		}
+		const unique = [...new Set(candidates)];
+		for (const el of unique) {
+			const text = normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+			const cls = String(el.className || '').toLowerCase();
+			if ((text === '删除' || text === '批量删除' || text === '删除草稿' || cls.includes('delete')) && !text.includes('取消')) {
+				const target = el.closest('button, a, [role="button"], [class*="button"]') || el;
+				target.scrollIntoView({ block: 'center', inline: 'center' });
+				target.classList.add('mcp-draft-batch-delete');
+				return 'marked batch delete: ' + text;
+			}
+		}
+		const texts = unique.map(el => normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'))).filter(text => text && text.length <= 24).slice(0, 50);
+		return 'no batch delete; texts=' + JSON.stringify(texts);
+	}`)
+	if err != nil {
+		return "", err
+	}
+	if result == nil {
+		return "", nil
+	}
+	resultStr := result.Value.Str()
+	if strings.Contains(resultStr, "marked batch delete") {
+		if err := physicalClickMarkedElement(page, ".mcp-draft-batch-delete"); err != nil {
+			return resultStr, err
+		}
+		return "clicked batch delete", nil
+	}
+	return resultStr, nil
+}
+
+func clickDraftDeleteConfirm(page *rod.Page) (string, error) {
+	result, err := page.Eval(`() => {
+		document.querySelectorAll('.mcp-draft-confirm-delete').forEach(el => el.classList.remove('mcp-draft-confirm-delete'));
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
+		const roots = Array.from(document.querySelectorAll('.byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"], body')).filter(visible);
+		for (const root of roots) {
+			const candidates = Array.from(root.querySelectorAll('button, a, span, div, [role="button"]')).filter(visible);
+			for (const el of candidates) {
+				const text = normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+				if ((text === '删除' || text === '确认' || text === '确定' || text === '确认删除' || text === '确定删除') && !text.includes('取消')) {
+					const target = el.closest('button, a, [role="button"], [class*="button"]') || el;
+					target.scrollIntoView({ block: 'center', inline: 'center' });
+					target.classList.add('mcp-draft-confirm-delete');
+					return 'marked confirm: ' + text;
+				}
+			}
+		}
+		return 'no confirm';
+	}`)
+	if err != nil {
+		return "", err
+	}
+	if result == nil {
+		return "", nil
+	}
+	resultStr := result.Value.Str()
+	if strings.Contains(resultStr, "marked confirm") {
+		if err := physicalClickMarkedElement(page, ".mcp-draft-confirm-delete"); err != nil {
+			return resultStr, err
+		}
+		return "clicked confirm", nil
+	}
+	return resultStr, nil
 }
 
 func physicalClickMarkedElement(page *rod.Page, selector string) error {

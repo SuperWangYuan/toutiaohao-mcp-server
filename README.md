@@ -197,8 +197,9 @@ go test -v -run TestUpdateArticleManual
 
 - 删除接口会先调用头条 HTTP 删除 API，但不信任仅返回 success 的结果；必须重新查询列表确认文章消失。
 - 草稿删除失败时会回退到浏览器自动化：进入 `graphic/articles`，物理点击左侧“草稿箱”，定位标题/ID 匹配的草稿卡片。
-- 卡片操作必须只点击真实可见的“更多/删除”小按钮本体，不要点击 `.pgc-content` 等外层容器。点击前需滚入视口中心，并使用 rod 鼠标坐标物理点击。
-- 若仍失败，会保存 `screenshot_delete_draft_not_found.png`、`screenshot_delete_draft_menu_error.png` 或 `screenshot_delete_draft_confirm_error.png` 以便分析。
+- 草稿删除不依赖“更多”菜单或编辑页删除按钮；应勾选目标草稿行的真实复选框，再点击批量操作栏中的“删除”，最后处理确认弹窗。
+- 复选框、批量删除按钮和确认按钮都必须只点击真实可见的小按钮本体，不要点击 `.pgc-content` 等外层容器。点击前需滚入视口中心，并使用 rod 鼠标坐标物理点击。
+- 若仍失败，会保存 `screenshot_delete_draft_not_found.png`、`screenshot_delete_draft_checkbox_error.png`、`screenshot_delete_draft_batch_error.png` 或 `screenshot_delete_draft_confirm_error.png` 以便分析。
 
 ---
 

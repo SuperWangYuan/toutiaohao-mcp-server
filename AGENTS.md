@@ -103,7 +103,8 @@ AI 助手在此项目中编写代码或执行自动化修改时，必须严格�
 
 7. **DOM 动态交互与刷新同步**：
    - 对于依赖悬停（Hover）触发显示操作菜单（如“更多”及隐藏的“删除”按钮）的卡片布局，必须首先物理 `Hover()` 对应的卡片区域并稍作等待，再通过 XPath（在 Go-rod 中必须使用 `ElementX()` 而非 `Element()`）精确定位子元素。
-   - **草稿删除操作按钮打标规则**：定位草稿卡片里的“更多/删除”操作时，严禁对外层容器（如 `.pgc-content`、整张卡片、`[role=button]` 父容器）打标后点击。必须只给真实可见的小按钮本体打标，随后调用 `scrollIntoView({ block: 'center', inline: 'center' })` 并用 go-rod `Interactable()` 坐标物理点击；只有物理点击失败时才允许回退 JS 事件链。否则会出现 `element has no visible shape or outside the viewport`，菜单不会展开。
+   - **草稿删除批量勾选规则**：头条草稿箱列表和草稿编辑页可能都不提供单篇“删除”入口。删除草稿时必须优先进入 `/profile_v4/graphic/articles?status=draft`，物理点击左侧“草稿箱”，根据标题/ID 定位目标草稿行，勾选该行真实可见的复选框，再点击页面批量操作栏中的“删除”并处理确认弹窗。
+   - **草稿删除元素打标规则**：定位草稿行复选框、批量“删除”按钮或确认按钮时，严禁对外层容器（如 `.pgc-content`、整张卡片、`[role=button]` 父容器）打标后点击。必须只给真实可见的小按钮本体打标，随后调用 `scrollIntoView({ block: 'center', inline: 'center' })` 并用 go-rod `Interactable()` 坐标物理点击；只有物理点击失败时才允许回退 JS 事件链。否则会出现 `element has no visible shape or outside the viewport`，操作不会触发。
    - 在触发涉及 DOM 删除等可能引起局部异步更新的操作后，必须通过 `page.Reload()` 重启导航加载，以此物理抹除已被后台删除的节点，防止旧 DOM 滞留导致的二次误判。
    - **消除顶部悬浮导航栏遮挡防线**：页面上下滚动时，顶部导航栏（如 `.shead_wrap` 等）极易遮挡正文图片上传按钮或封面槽，引发 go-rod 获取物理坐标失败（`Interactable` 报错）。在涉及物理定位与点击前，必须调用 `dismissObstacles()` 将 `.shead_wrap` 与 `[class*="shead_wrap"]` 等顶栏强行隐藏（设为 `display: none`）以保证稳定。
 

@@ -2,6 +2,7 @@ package browser
 
 import (
 	"os"
+
 	"github.com/example/toutiaohao-mcp-server/cookies"
 	log "github.com/sirupsen/logrus"
 	headless_browser "github.com/xpzouying/headless_browser"
@@ -19,6 +20,11 @@ func WithBinPath(binPath string) Option {
 	return func(c *browserConfig) {
 		c.binPath = binPath
 	}
+}
+
+// DetectChromePath 自动检测 Chrome 浏览器路径（导出供外部使用）
+func DetectChromePath() string {
+	return detectChromePath()
 }
 
 // detectChromePath 自动检测 Chrome 浏览器路径
