@@ -39,5 +39,8 @@ func setupRoutes(router *gin.Engine, appServer *AppServer) {
 		api.POST("/account/overview", appServer.apiGetAccountOverview)   // 兼容 /account/overview POST
 		api.GET("/analytics/article", appServer.apiGetArticleStats)
 		api.GET("/analytics/report", appServer.apiGenerateReport)
+		api.GET("/analytics/trends", appServer.apiGetAccountTrends)
+		api.GET("/articles/detail", appServer.apiGetArticleDetail)
+		api.GET("/micro-posts", appServer.apiGetMicroPostList)
 	}
 }

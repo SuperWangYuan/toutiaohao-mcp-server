@@ -22,9 +22,10 @@ var validStatuses = map[string]bool{
 
 // ArticleListParams 文章列表查询参数
 type ArticleListParams struct {
-	Page     int    `json:"page"`
-	PageSize int    `json:"page_size"`
-	Status   string `json:"status"`
+	Page        int    `json:"page"`
+	PageSize    int    `json:"page_size"`
+	Status      string `json:"status"`
+	ContentType string `json:"content_type"`
 }
 
 // ArticleListResponse 文章列表响应
@@ -40,10 +41,14 @@ type ArticleItem struct {
 	Title           string      `json:"title"`
 	Status          interface{} `json:"status"`
 	CreateTime      interface{} `json:"create_time"`
+	PublishTime     interface{} `json:"publish_time"`
 	ReadCount       int         `json:"go_detail_count_v2"`
+	ReadCountAlias  int         `json:"read_count"`
+	ViewCountAlias  int         `json:"view_count"`
 	CommentCount    int         `json:"comment_count"`
 	DiggCount       int         `json:"digg_count"`
 	ImpressionCount int         `json:"impression_count"`
+	CTR             float64     `json:"ctr"`
 	ArticleURL      string      `json:"article_url"`
 }
 
@@ -120,6 +125,9 @@ func NewArticleListParams(args map[string]interface{}) *ArticleListParams {
 	if s, ok := args["status"].(string); ok && s != "" {
 		params.Status = s
 	}
+	if ct, ok := args["content_type"].(string); ok && ct != "" {
+		params.ContentType = ct
+	}
 
 	return params
 }
@@ -148,6 +156,9 @@ func GetArticleList(ctx context.Context, params *ArticleListParams, cookieStore 
 
 	url := fmt.Sprintf("%s?page=%d&page_size=%d&status=%s",
 		configs.ArticleListAPI, params.Page, params.PageSize, params.Status)
+	if params.ContentType != "" {
+		url = fmt.Sprintf("%s&content_type=%s", url, params.ContentType)
+	}
 
 	body, err := doAuthenticatedGet(ctx, url, cookieStore)
 	if err != nil {
@@ -170,6 +181,21 @@ func GetArticleList(ctx context.Context, params *ArticleListParams, cookieStore 
 		if resp.Data.Articles[i].ID != "" {
 			resp.Data.Articles[i].ArticleID = resp.Data.Articles[i].ID
 		}
+
+		// 填充字段别名与点击率计算
+		resp.Data.Articles[i].ReadCountAlias = resp.Data.Articles[i].ReadCount
+		resp.Data.Articles[i].ViewCountAlias = resp.Data.Articles[i].ReadCount
+		if resp.Data.Articles[i].ImpressionCount > 0 {
+			resp.Data.Articles[i].CTR = float64(resp.Data.Articles[i].ReadCount) / float64(resp.Data.Articles[i].ImpressionCount)
+		} else {
+			resp.Data.Articles[i].CTR = 0.0
+		}
+
+		// 兜底 PublishTime，若为空则以 CreateTime 填充
+		if resp.Data.Articles[i].PublishTime == nil || fmt.Sprintf("%v", resp.Data.Articles[i].PublishTime) == "" {
+			resp.Data.Articles[i].PublishTime = resp.Data.Articles[i].CreateTime
+		}
+
 		if articleStatusMatchesFilter(resp.Data.Articles[i].Status, params.Status) {
 			filtered = append(filtered, resp.Data.Articles[i])
 		}
@@ -985,4 +1011,33 @@ func physicalClickMarkedElement(page *rod.Page, selector string) error {
 	_ = page.Mouse.Down(proto.InputMouseButtonLeft, 1)
 	_ = page.Mouse.Up(proto.InputMouseButtonLeft, 1)
 	return nil
+}
+
+// GetArticleDetail 获取文章详情
+// GetArticleDetail 获取文章详情
+func GetArticleDetail(ctx context.Context, articleID string, cookieStore cookies.Cookier) (map[string]interface{}, error) {
+	if strings.TrimSpace(articleID) == "" {
+		return nil, fmt.Errorf("article_id is required")
+	}
+
+	// 拼装真实编辑页接口 url
+	url := fmt.Sprintf("%s?pgc_id=%s&wxstyle=0&format=json", configs.ArticleDetailAPI, articleID)
+	body, err := doAuthenticatedGet(ctx, url, cookieStore)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse detail response: %w", err)
+	}
+
+	// 鲁棒性兼容：若外部未直接包含 content，且嵌套了 data，则提取 data 段返回
+	if _, hasContent := resp["content"]; !hasContent {
+		if dataVal, hasData := resp["data"].(map[string]interface{}); hasData {
+			return dataVal, nil
+		}
+	}
+
+	return resp, nil
 }

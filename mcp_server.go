@@ -89,6 +89,23 @@ type GenerateReportArgs struct {
 // GetAccountOverviewArgs 账户概览参数（无参数）
 type GetAccountOverviewArgs struct{}
 
+// GetArticleDetailArgs 获取文章详情参数
+type GetArticleDetailArgs struct {
+	ArticleID string `json:"article_id" jsonschema_description:"文章或草稿的 ID (即 pgc_id)"`
+}
+
+// GetMicroPostsArgs 获取微头条列表参数
+type GetMicroPostsArgs struct {
+	Page     int    `json:"page,omitempty" jsonschema_description:"页码（默认1）"`
+	PageSize int    `json:"page_size,omitempty" jsonschema_description:"每页数量（默认20）"`
+	Status   string `json:"status,omitempty" jsonschema_description:"状态筛选：all/published/draft/review（默认all）"`
+}
+
+// GetAccountTrendsArgs 获取账户趋势参数
+type GetAccountTrendsArgs struct {
+	Days int `json:"days,omitempty" jsonschema_description:"天数（默认7，如 7 或 30）"`
+}
+
 // PublishMicroPostArgs 微头条发布参数
 type PublishMicroPostArgs struct {
 	Content     string      `json:"content" jsonschema_description:"微头条正文内容（最多2000字）"`
@@ -283,6 +300,23 @@ func registerManageTools(server *mcp.Server, appServer *AppServer) {
 			result := appServer.handleDeleteArticle(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
 		}))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_micro_posts",
+		Description: "获取微头条内容列表，支持按状态筛选（all/published/draft/review）",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: true,
+		},
+	}, withPanicRecovery("get_micro_posts",
+		func(ctx context.Context, req *mcp.CallToolRequest, args GetMicroPostsArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"page":      float64(args.Page),
+				"page_size": float64(args.PageSize),
+				"status":    args.Status,
+			}
+			result := appServer.handleGetMicroPosts(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}))
 }
 
 // registerAnalyticsTools 注册数据分析工具
@@ -326,6 +360,36 @@ func registerAnalyticsTools(server *mcp.Server, appServer *AppServer) {
 				"report_type": args.ReportType,
 			}
 			result := appServer.handleGenerateReport(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_article_detail",
+		Description: "获取指定文章的完整详细数据（如审核状态、分类标签、原始文本等）",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: true,
+		},
+	}, withPanicRecovery("get_article_detail",
+		func(ctx context.Context, req *mcp.CallToolRequest, args GetArticleDetailArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"article_id": args.ArticleID,
+			}
+			result := appServer.handleGetArticleDetail(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_account_trends",
+		Description: "获取账户最近 N 天的数据趋势对比（近7天或近30天阅读、粉丝等趋势）",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: true,
+		},
+	}, withPanicRecovery("get_account_trends",
+		func(ctx context.Context, req *mcp.CallToolRequest, args GetAccountTrendsArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"days": args.Days,
+			}
+			result := appServer.handleGetAccountTrends(ctx, argsMap)
 			return convertToMCPResult(result), nil, nil
 		}))
 }

@@ -378,6 +378,16 @@ func (s *ToutiaoService) GenerateReport(ctx context.Context, reportType string) 
 	return toutiaohao.GenerateReport(ctx, reportType, page, s.cookieStore)
 }
 
+// GetArticleDetail 获取文章详情数据
+func (s *ToutiaoService) GetArticleDetail(ctx context.Context, articleID string) (map[string]interface{}, error) {
+	return toutiaohao.GetArticleDetail(ctx, articleID, s.cookieStore)
+}
+
+// GetAccountTrends 获取账户近 N 天的数据趋势
+func (s *ToutiaoService) GetAccountTrends(ctx context.Context, days int) (*toutiaohao.TrendResponse, error) {
+	return toutiaohao.GetAccountTrends(ctx, days, s.cookieStore)
+}
+
 // UpdateArticle 修改/更新文章
 func (s *ToutiaoService) UpdateArticle(ctx context.Context, articleID string, title, content string, opts *toutiaohao.ArticleOptions) (*toutiaohao.PublishResult, error) {
 	if err := toutiaohao.ValidateUpdateArticle(articleID, title, content, opts); err != nil {

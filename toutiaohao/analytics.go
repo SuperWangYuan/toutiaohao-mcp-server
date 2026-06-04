@@ -255,7 +255,7 @@ func GetAccountOverview(ctx context.Context, page *rod.Page, cookieStore cookies
 					const idx = text.indexOf(kw);
 					if (idx >= 0) {
 						const after = text.substring(idx + kw.length);
-						const m = after.match(/^\s*([\d,]+(?:\.\d+)?)/);
+						const m = after.match(/^\s*[:：(（【]?\s*([\d,]+(?:\.\d+)?)/);
 						if (m) {
 							const num = parseFloat(m[1].replace(/,/g, ''));
 							if (num > bestMatch) bestMatch = num;
@@ -463,4 +463,93 @@ func injectBrowserCookies(page *rod.Page, cookieStore cookies.Cookier) error {
 
 	log.Infof("已注入 %d 个 Cookie", len(entries))
 	return nil
+}
+
+// TrendItem 单日趋势数据
+type TrendItem struct {
+	Date            string  `json:"date"`
+	ImpressionCount int     `json:"impression_count"`
+	ReadCount       int     `json:"read_count"`
+	LikeCount       int     `json:"like_count"`
+	CommentCount    int     `json:"comment_count"`
+	FansChangeCount int     `json:"fans_change_count"`
+}
+
+// TrendResponse 趋势数据响应
+type TrendResponse struct {
+	Days   int         `json:"days"`
+	Trends []TrendItem `json:"trends"`
+}
+
+// GetAccountTrends 获取账户趋势数据
+func GetAccountTrends(ctx context.Context, days int, cookieStore cookies.Cookier) (*TrendResponse, error) {
+	if days <= 0 {
+		days = 7 // 默认 7 天
+	}
+
+	// 动态算出 from 和 to 的日期
+	now := time.Now()
+	// 头条通常统计到昨日的数据，因此 to 是昨天，from 是 (昨天 - days + 1)
+	toTime := now.AddDate(0, 0, -1)
+	fromTime := toTime.AddDate(0, 0, -days+1)
+
+	fromStr := fromTime.Format("2006-01-02")
+	toStr := toTime.Format("2006-01-02")
+
+	log.Infof("获取近 %d 天趋势数据，日期范围: %s ~ %s", days, fromStr, toStr)
+
+	// 利用我们在 works-overall 数据分析中抓到的 content/stat_trends API
+	// 拼接路由参数 type=0（代表所有类型），app_id=1231（PC创作者端应用标识）
+	url := fmt.Sprintf("https://mp.toutiao.com/mp/agw/statistic/v2/content/stat_trends?from=%s&to=%s&type=0&app_id=1231", fromStr, toStr)
+
+	body, err := doAuthenticatedGet(ctx, url, cookieStore)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch trends from API: %w", err)
+	}
+
+	// 定义头条原生的响应格式结构体进行反序列化
+	var rawResp struct {
+		Code            int    `json:"code"`
+		Message         string `json:"message"`
+		DailyStatDatas  []struct {
+			Date       string `json:"date"`
+			AuthorStat struct {
+				ConsumeData struct {
+					ImpressionCount int `json:"impression_count"`
+					GoDetailCount   int `json:"go_detail_count"`
+				} `json:"consume_data"`
+				FansChangeCount int `json:"fans_change_count"`
+				InteractionData struct {
+					CommentCount int `json:"comment_count"`
+					DiggCount    int `json:"digg_count"`
+				} `json:"interaction_data"`
+			} `json:"author_stat"`
+		} `json:"daily_stat_datas"`
+	}
+
+	if err := json.Unmarshal(body, &rawResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal raw trend response: %w", err)
+	}
+
+	if rawResp.Code != 0 {
+		return nil, fmt.Errorf("trend API returned error: code=%d, message=%s", rawResp.Code, rawResp.Message)
+	}
+
+	// 转化为规范统一的别名数据格式
+	trends := make([]TrendItem, 0, len(rawResp.DailyStatDatas))
+	for _, item := range rawResp.DailyStatDatas {
+		trends = append(trends, TrendItem{
+			Date:            item.Date,
+			ImpressionCount: item.AuthorStat.ConsumeData.ImpressionCount,
+			ReadCount:       item.AuthorStat.ConsumeData.GoDetailCount,
+			LikeCount:       item.AuthorStat.InteractionData.DiggCount,
+			CommentCount:    item.AuthorStat.InteractionData.CommentCount,
+			FansChangeCount: item.AuthorStat.FansChangeCount,
+		})
+	}
+
+	return &TrendResponse{
+		Days:   days,
+		Trends: trends,
+	}, nil
 }

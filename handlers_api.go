@@ -276,3 +276,50 @@ func (s *AppServer) apiGenerateReport(c *gin.Context) {
 	}
 	respondSuccess(c, result)
 }
+
+// apiGetArticleDetail 获取单篇文章详情 API
+func (s *AppServer) apiGetArticleDetail(c *gin.Context) {
+	articleID := c.Query("article_id")
+	result, err := s.toutiaoService.GetArticleDetail(c.Request.Context(), articleID)
+	if err != nil {
+		respondError(c, mapErrorToStatusCode(err), err.Error())
+		return
+	}
+	respondSuccess(c, result)
+}
+
+// apiGetMicroPostList 获取微头条列表 API
+func (s *AppServer) apiGetMicroPostList(c *gin.Context) {
+	params := toutiaohao.NewArticleListParams(map[string]interface{}{
+		"status": c.DefaultQuery("status", "all"),
+	})
+	params.ContentType = "ugc" // 微头条
+
+	result, err := s.toutiaoService.GetArticleList(c.Request.Context(), params)
+	if err != nil {
+		respondError(c, mapErrorToStatusCode(err), err.Error())
+		return
+	}
+	respondSuccess(c, result)
+}
+
+// apiGetAccountTrends 获取账户近 N 天趋势数据 API
+func (s *AppServer) apiGetAccountTrends(c *gin.Context) {
+	var req struct {
+		Days int `json:"days" form:"days"`
+	}
+	if err := c.ShouldBind(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Days <= 0 {
+		req.Days = 7
+	}
+
+	result, err := s.toutiaoService.GetAccountTrends(c.Request.Context(), req.Days)
+	if err != nil {
+		respondError(c, mapErrorToStatusCode(err), err.Error())
+		return
+	}
+	respondSuccess(c, result)
+}

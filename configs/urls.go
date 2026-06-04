@@ -18,4 +18,7 @@ const (
 	SaveMicroDraftAPI = "https://mp.toutiao.com/mp/agw/draft/save_ugc_draft"
 	UserInfoAPI      = "https://mp.toutiao.com/mp/agw/user/info/"
 	ContentStatsAPI  = "https://mp.toutiao.com/mp/agw/article/content_stats/"
+	ArticleDetailAPI = "https://mp.toutiao.com/mp/agw/article/edit"
+	ContentTrendsAPI = "https://mp.toutiao.com/mp/agw/statistic/v2/content/stat_trends"
+	ContentOverviewAPI = "https://mp.toutiao.com/mp/agw/statistic/v2/content_stat"
 )

@@ -273,3 +273,58 @@ func (s *AppServer) handleGenerateReport(ctx context.Context, args map[string]in
 	data, _ := json.Marshal(result)
 	return NewTextResult(string(data))
 }
+
+// handleGetArticleDetail 处理获取单篇文章详情
+func (s *AppServer) handleGetArticleDetail(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	articleID, _ := args["article_id"].(string)
+	if articleID == "" {
+		return NewErrorResult("article_id is required")
+	}
+
+	result, err := s.toutiaoService.GetArticleDetail(ctx, articleID)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleGetMicroPosts 处理获取微头条列表
+func (s *AppServer) handleGetMicroPosts(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	params := toutiaohao.NewArticleListParams(args)
+	params.ContentType = "ugc" // 微头条
+
+	if err := toutiaohao.ValidateArticleListStatus(params.Status); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	result, err := s.toutiaoService.GetArticleList(ctx, params)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleGetAccountTrends 处理获取账户趋势数据
+func (s *AppServer) handleGetAccountTrends(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	var days int
+	if d, ok := args["days"].(float64); ok {
+		days = int(d)
+	} else if d, ok := args["days"].(int); ok {
+		days = d
+	}
+	if days <= 0 {
+		days = 7
+	}
+
+	result, err := s.toutiaoService.GetAccountTrends(ctx, days)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
