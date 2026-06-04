@@ -338,6 +338,7 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 	log.Infof("正在用浏览器删除草稿: %s 标题: %s", articleID, articleTitle)
 
 	draftURLs := []string{
+		"https://mp.toutiao.com/profile_v4/manage/draft",
 		"https://mp.toutiao.com/profile_v4/graphic/articles?status=draft",
 		"https://mp.toutiao.com/profile_v4/graphic/articles?status=1",
 		"https://mp.toutiao.com/profile_v4/graphic/articles",
@@ -432,16 +433,20 @@ func deleteDraftFromCurrentPage(page *rod.Page, articleID string, articleTitle s
 		return resultStr, fmt.Errorf("已找到草稿但未找到可勾选复选框: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_checkbox_error.png", articleID, articleTitle, resultStr)
 	}
 
-	time.Sleep(1500 * time.Millisecond)
-	batchResult, err := clickDraftBatchDeleteOnCurrentPage(page)
-	if err != nil {
-		safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
-		return resultStr, fmt.Errorf("草稿批量删除按钮点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, err)
-	}
-	log.Infof("草稿批量删除点击结果: %s", batchResult)
-	if batchResult == "" || strings.Contains(batchResult, "no batch delete") {
-		safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
-		return resultStr, fmt.Errorf("勾选草稿后未找到批量删除按钮: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, batchResult)
+	if resultStr == "clicked single delete" {
+		log.Info("已直接点击单篇删除按钮，无需批量删除，直接等待并确认删除弹窗...")
+	} else {
+		time.Sleep(1500 * time.Millisecond)
+		batchResult, err := clickDraftBatchDeleteOnCurrentPage(page)
+		if err != nil {
+			safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
+			return resultStr, fmt.Errorf("草稿批量删除按钮点击失败: id=%s title=%s err=%v，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, err)
+		}
+		log.Infof("草稿批量删除点击结果: %s", batchResult)
+		if batchResult == "" || strings.Contains(batchResult, "no batch delete") {
+			safeScreenshot(page, "./screenshot_delete_draft_batch_error.png")
+			return resultStr, fmt.Errorf("勾选草稿后未找到批量删除按钮: id=%s title=%s result=%s，已保存截图 screenshot_delete_draft_batch_error.png", articleID, articleTitle, batchResult)
+		}
 	}
 
 	time.Sleep(2 * time.Second)
@@ -484,6 +489,9 @@ func clickDraftNavigation(page *rod.Page) (string, error) {
 		});
 		for (const el of candidates) {
 			el.scrollIntoView({ block: 'center', inline: 'center' });
+			if (typeof el.click === 'function') {
+				el.click();
+			}
 			['pointerover', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
 				el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
 			});
@@ -514,7 +522,16 @@ func ensureDraftTabSelected(page *rod.Page) (string, error) {
 		return "", err
 	}
 	log.Infof("草稿箱导航点击结果: %s", navInfo)
-	time.Sleep(4 * time.Second)
+	time.Sleep(2 * time.Second)
+
+	// 【强保刷新】如果真的点击了草稿箱导航，则直接刷新页面以确保列表重新渲染
+	if strings.Contains(navInfo, "clicked") {
+		log.Info("点击了草稿导航，执行页面 Reload 以确保草稿列表可靠渲染...")
+		_ = page.Reload()
+		_ = page.Timeout(10 * time.Second).WaitLoad()
+		time.Sleep(3 * time.Second)
+	}
+
 	return navInfo, nil
 }
 
@@ -632,6 +649,45 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 			const rect = el.getBoundingClientRect();
 			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 		};
+		const validCard = (el) => {
+			if (!el) return false;
+			const rect = el.getBoundingClientRect();
+			if (rect.height > 350 || rect.height < 40) return false;
+			if (rect.right < 280) return false;
+			const cls = String(el.className || '').toLowerCase();
+			const id = String(el.id || '').toLowerCase();
+			if (cls.includes('sidebar') || cls.includes('menu') || cls.includes('header') || cls.includes('nav') || cls.includes('tab') ||
+				id.includes('sidebar') || id.includes('menu') || id.includes('header') || id.includes('nav')) {
+				return false;
+			}
+			return true;
+		};
+		const findReactID = (el, targetID) => {
+			if (!el) return false;
+			const key = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$') || k.startsWith('__reactProps$') || k.startsWith('__reactEventHandlers$'));
+			if (!key) return false;
+			const val = el[key];
+			const visited = new Set();
+			const checkObj = (obj, depth = 0) => {
+				if (!obj || depth > 8) return false;
+				if (visited.has(obj)) return false;
+				if (typeof obj === 'string' || typeof obj === 'number') {
+					return String(obj) === targetID;
+				}
+				if (typeof obj === 'object') {
+					visited.add(obj);
+					for (const k in obj) {
+						try {
+							if (Object.prototype.hasOwnProperty.call(obj, k)) {
+								if (checkObj(obj[k], depth + 1)) return true;
+							}
+						} catch(e) {}
+					}
+				}
+				return false;
+			};
+			return checkObj(val);
+		};
 		const normalize = (s) => String(s || '').replace(/\s+/g, '').replace(/…|\.{3}/g, '').trim();
 		const checked = (el) => {
 			const input = el.matches && el.matches('input[type="checkbox"]') ? el : el.querySelector && el.querySelector('input[type="checkbox"]');
@@ -641,10 +697,13 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 		const titlePrefix = title.length > 10 ? title.slice(0, 10) : title;
 		const titleLoose = title.length > 6 ? title.slice(0, 6) : title;
 		const matches = (el) => {
-			const html = normalize(el.innerHTML || '');
 			const text = normalize(el.textContent || '');
-			return (articleID && (html.includes(articleID) || text.includes(articleID))) ||
-				(title && text.includes(title)) ||
+			if (articleID) {
+				if (text.includes(articleID)) return true;
+				if (el.outerHTML && el.outerHTML.includes(articleID)) return true;
+				if (findReactID(el, articleID)) return true;
+			}
+			return (title && text.includes(title)) ||
 				(titlePrefix && text.includes(titlePrefix)) ||
 				(titleLoose && text.includes(titleLoose));
 		};
@@ -666,14 +725,29 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 				const text = normalize(cur.textContent || '');
 				if (cur.tagName === 'TR' || cur.tagName === 'LI' || cls.includes('item') || cls.includes('card') ||
 					cls.includes('article') || cls.includes('work') || cls.includes('list') || text.includes('编辑')) {
-					if (!cards.includes(cur)) cards.push(cur);
-					break;
+					if (validCard(cur)) {
+						if (!cards.includes(cur)) cards.push(cur);
+						break;
+					}
 				}
 			}
 		}
 		for (const card of Array.from(document.querySelectorAll('div[class*="item"], div[class*="card"], div[class*="article"], div[class*="work"], li[class*="item"], tr, article'))) {
-			if (visible(card) && matches(card) && !cards.includes(card)) cards.push(card);
+			if (visible(card) && matches(card) && validCard(card) && !cards.includes(card)) cards.push(card);
 		}
+		const singleDeleteBtn = (card) => {
+			if (!card) return null;
+			const buttons = Array.from(card.querySelectorAll('button, a, span, div, [role="button"]')).filter(el => visible(el));
+			for (const el of buttons) {
+				const text = normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '');
+				const cls = String(el.className || '').toLowerCase();
+				if ((text === '删除' || text === '删除草稿' || (cls.includes('delete') && text.length <= 4)) && !text.includes('取消') && !text.includes('批量')) {
+					const target = el.closest('button, a, [role="button"], [class*="button"]') || el;
+					return visible(target) ? target : null;
+				}
+			}
+			return null;
+		};
 		for (const card of cards) {
 			card.scrollIntoView({ block: 'center', inline: 'center' });
 			['pointerover', 'mouseover', 'mouseenter'].forEach(name => {
@@ -687,6 +761,7 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 			}
 			const parent = card.parentElement;
 			const siblings = parent ? Array.from(parent.children) : [];
+			let foundSiblingCheckbox = false;
 			for (const sibling of siblings) {
 				if (!visible(sibling)) continue;
 				if (normalize(sibling.textContent || '').includes(titleLoose) || sibling === card) {
@@ -694,8 +769,16 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 					if (cb) {
 						if (checked(cb)) return 'checkbox already checked';
 						cb.classList.add('mcp-draft-checkbox');
+						foundSiblingCheckbox = true;
 						return 'marked checkbox sibling';
 					}
+				}
+			}
+			if (!foundSiblingCheckbox) {
+				const delBtn = singleDeleteBtn(card);
+				if (delBtn) {
+					delBtn.classList.add('mcp-draft-single-delete');
+					return 'marked single delete';
 				}
 			}
 		}
@@ -718,6 +801,11 @@ func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle str
 			return resultStr, err
 		}
 		return "clicked checkbox", nil
+	case "marked single delete":
+		if err := physicalClickMarkedElement(page, ".mcp-draft-single-delete"); err != nil {
+			return resultStr, err
+		}
+		return "clicked single delete", nil
 	default:
 		return resultStr, nil
 	}

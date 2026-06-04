@@ -46,6 +46,7 @@ func TestPublishArticleManual(t *testing.T) {
 	}
 
 	var articleID string
+	var uniqueTitle string
 	// 设置环境变量以便内部 browser 加载根目录下的 cookies.json
 	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
 
@@ -69,7 +70,7 @@ func TestPublishArticleManual(t *testing.T) {
 			log.Infof("测试结束，正在自动清理（删除）临时草稿文章 %s ...", articleID)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
-			if delErr := DeleteDraftByBrowser(ctx, page, articleID); delErr != nil {
+			if delErr := DeleteDraftByBrowserWithTitle(ctx, page, articleID, uniqueTitle); delErr != nil {
 				log.Warnf("清理临时草稿文章失败: %v", delErr)
 			} else {
 				log.Info("临时测试草稿文章已通过浏览器物理删除成功。")
@@ -104,7 +105,7 @@ func TestPublishArticleManual(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// 输入标题（每次测试加上时间戳使其唯一）
-	uniqueTitle := fmt.Sprintf("测试移动云发布%d", time.Now().Unix()%100000)
+	uniqueTitle = fmt.Sprintf("测试移动云发布%d", time.Now().Unix()%100000)
 	log.Infof("正在输入测试标题: %s", uniqueTitle)
 	if err := a.inputTitle(uniqueTitle); err != nil {
 		info, _ := page.Info()
@@ -244,6 +245,7 @@ func TestPublishArticleBodyImageManual(t *testing.T) {
 	}
 
 	var articleID string
+	var uniqueTitle string
 	os.Setenv("TOUTIAOHAO_COOKIES_PATH", "../cookies.json")
 	log.SetFormatter(&log.TextFormatter{FullTimestamp: true})
 
@@ -260,7 +262,7 @@ func TestPublishArticleBodyImageManual(t *testing.T) {
 			log.Infof("测试结束，正在自动清理正文插图临时草稿 %s ...", articleID)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
-			if delErr := DeleteDraftByBrowser(ctx, page, articleID); delErr != nil {
+			if delErr := DeleteDraftByBrowserWithTitle(ctx, page, articleID, uniqueTitle); delErr != nil {
 				log.Warnf("清理正文插图临时草稿失败: %v", delErr)
 			}
 		}
@@ -286,7 +288,7 @@ func TestPublishArticleBodyImageManual(t *testing.T) {
 	}
 	time.Sleep(3 * time.Second)
 
-	uniqueTitle := fmt.Sprintf("正文插图测试%d", time.Now().Unix()%100000)
+	uniqueTitle = fmt.Sprintf("正文插图测试%d", time.Now().Unix()%100000)
 	if err := a.inputTitle(uniqueTitle); err != nil {
 		t.Fatalf("输入标题失败: %v", err)
 	}
