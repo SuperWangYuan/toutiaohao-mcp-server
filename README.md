@@ -198,7 +198,7 @@ go test -v -run TestUpdateArticleManual
 - 删除接口会先调用头条 HTTP 删除 API，但不信任仅返回 success 的结果；必须重新查询列表确认文章消失。
 - 草稿删除失败时会回退到浏览器自动化：用 `rodBrowser.MustPage("https://mp.toutiao.com/profile_v4/graphic/articles?status=draft")` 一步到位打开草稿列表，注入 Cookie 后 `Reload()`，然后在当前页面定位标题/ID 匹配的草稿卡片。
 - 不要创建空白页后再 `page.Navigate()` 到草稿箱；该两步式导航可能导致 SPA 数据请求未携带 Cookie，表现为 URL 正确但列表卡片为空。
-- 如果当前 URL 已经包含 `status=draft` 或 `status=1`，说明页面已经在草稿列表路由，不要再次点击左侧“草稿箱”；直接等待列表渲染并定位目标草稿，避免 SPA 路由重入导致卡片区空白。
+- URL 中的 `status=draft` 或 `status=1` 只作为初始导航辅助，不能用来判断草稿箱 Tab 是否已选中。删除前必须读取页面 DOM 中“草稿箱”Tab 的 `active` / `selected` / `aria-selected` 状态；如果未选中，需要先点击草稿箱 Tab 并等待卡片重新渲染。
 - 草稿删除不依赖“更多”菜单或编辑页删除按钮；应勾选目标草稿行的真实复选框，再点击批量操作栏中的“删除”，最后处理确认弹窗。
 - 复选框、批量删除按钮和确认按钮都必须只点击真实可见的小按钮本体，不要点击 `.pgc-content` 等外层容器。点击前需滚入视口中心，并使用 rod 鼠标坐标物理点击。
 - 若仍失败，会保存 `screenshot_delete_draft_not_found.png`、`screenshot_delete_draft_checkbox_error.png`、`screenshot_delete_draft_batch_error.png` 或 `screenshot_delete_draft_confirm_error.png` 以便分析。

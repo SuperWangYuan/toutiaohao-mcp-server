@@ -323,6 +323,12 @@ func DeleteDraftByBrowserOnPage(ctx context.Context, page *rod.Page, articleID s
 		return fmt.Errorf("跳转到登录页，Cookie可能过期")
 	}
 
+	if navInfo, err := ensureDraftTabSelected(page); err != nil {
+		return err
+	} else if navInfo != "" {
+		log.Infof("草稿箱 tab 确认结果: %s", navInfo)
+	}
+
 	_, err := deleteDraftFromCurrentPage(page, articleID, articleTitle)
 	return err
 }
@@ -360,17 +366,16 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 			return fmt.Errorf("跳转到登录页，Cookie可能过期")
 		}
 
-		navClicked := false
-		if shouldClickDraftNavigation(currentURL, draftURL) {
-			if navInfo, errNav := clickDraftNavigation(page); errNav == nil && navInfo != "" {
-				log.Infof("草稿箱导航点击结果: %s", navInfo)
-				time.Sleep(4 * time.Second)
-				navClicked = strings.Contains(navInfo, "clicked")
-			}
-		} else {
-			log.Infof("当前 URL 已指向草稿列表，跳过左侧草稿箱导航点击: %s", currentURL)
+		navInfo, errNav := ensureDraftTabSelected(page)
+		if errNav != nil {
+			log.Warnf("草稿箱 tab 确认失败: %v", errNav)
+			lastErr = errNav
+			continue
 		}
-		if navClicked {
+		if navInfo != "" {
+			log.Infof("草稿箱 tab 确认结果: %s", navInfo)
+		}
+		if strings.Contains(navInfo, "clicked") {
 			// 导航点击后刷新一次当前 URL，便于日志定位 SPA 路由变化。
 			urlAfterNav, _ := page.Eval(`() => window.location.href`)
 			navURL := ""
@@ -467,14 +472,22 @@ func clickDraftNavigation(page *rod.Page) (string, error) {
 			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 		};
 		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
-		const candidates = Array.from(document.querySelectorAll('a, span, div, li, button, [role="button"]')).filter(el => {
-			const text = normalize(el.textContent);
-			return visible(el) && (text === '草稿箱' || text.includes('草稿箱'));
+		const candidates = Array.from(document.querySelectorAll('a, span, div, li, button, [role="tab"], [role="button"], [aria-selected]')).filter(el => {
+			const text = normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+			const rect = el.getBoundingClientRect();
+			return visible(el) && text.includes('草稿箱') && text.length <= 24 && rect.width <= 240 && rect.height <= 80;
+		});
+		candidates.sort((a, b) => {
+			const ar = a.getBoundingClientRect();
+			const br = b.getBoundingClientRect();
+			return (ar.width * ar.height) - (br.width * br.height);
 		});
 		for (const el of candidates) {
 			el.scrollIntoView({ block: 'center', inline: 'center' });
-			el.click();
-			return 'clicked draft navigation';
+			['pointerover', 'mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
+				el.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+			});
+			return 'clicked draft navigation: ' + normalize(el.textContent || el.getAttribute('aria-label') || '');
 		}
 		return 'draft navigation not found';
 	}`)
@@ -487,9 +500,98 @@ func clickDraftNavigation(page *rod.Page) (string, error) {
 	return result.Value.Str(), nil
 }
 
-func shouldClickDraftNavigation(currentURL, requestedURL string) bool {
-	combined := strings.ToLower(currentURL + " " + requestedURL)
-	return !strings.Contains(combined, "status=draft") && !strings.Contains(combined, "status=1")
+func ensureDraftTabSelected(page *rod.Page) (string, error) {
+	needNav, tabInfo, err := shouldClickDraftNavigation(page)
+	if err != nil {
+		log.Warnf("读取草稿箱 tab 状态失败，将尝试点击草稿箱: %v", err)
+		needNav = true
+	}
+	if !needNav {
+		return "already draft tab: " + tabInfo, nil
+	}
+	navInfo, err := clickDraftNavigation(page)
+	if err != nil {
+		return "", err
+	}
+	log.Infof("草稿箱导航点击结果: %s", navInfo)
+	time.Sleep(4 * time.Second)
+	return navInfo, nil
+}
+
+func shouldClickDraftNavigation(page *rod.Page) (bool, string, error) {
+	result, err := page.Eval(`() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
+		const activeOf = (el) => {
+			let cur = el;
+			for (let depth = 0; cur && depth < 5; depth++, cur = cur.parentElement) {
+				const cls = String(cur.className || '').toLowerCase();
+				const aria = cur.getAttribute && cur.getAttribute('aria-selected');
+				const selected = cur.getAttribute && cur.getAttribute('data-selected');
+				const active = cur.getAttribute && cur.getAttribute('data-active');
+				if (aria === 'true' || selected === 'true' || active === 'true') return true;
+				if (cls.includes('active') || cls.includes('selected') || cls.includes('current') || cls.includes('checked')) return true;
+			}
+			return false;
+		};
+		const selectors = [
+			'[role="tab"]',
+			'[aria-selected]',
+			'[class*="tab" i]',
+			'[class*="tabs" i] *',
+			'a',
+			'button',
+			'li',
+			'span',
+			'div'
+		].join(',');
+		const candidates = Array.from(document.querySelectorAll(selectors)).filter(el => {
+			if (!visible(el)) return false;
+			const text = normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
+			const rect = el.getBoundingClientRect();
+			return text.includes('草稿箱') && text.length <= 24 && rect.width <= 260 && rect.height <= 90;
+		});
+		candidates.sort((a, b) => {
+			const ar = a.getBoundingClientRect();
+			const br = b.getBoundingClientRect();
+			return (ar.width * ar.height) - (br.width * br.height);
+		});
+		const tab = candidates[0];
+		if (!tab) return JSON.stringify({ found: false });
+		return JSON.stringify({
+			found: true,
+			active: activeOf(tab),
+			text: normalize(tab.textContent || tab.getAttribute('aria-label') || tab.getAttribute('title')),
+			className: String(tab.className || ''),
+			parentClassName: String(tab.parentElement && tab.parentElement.className || '')
+		});
+	}`)
+	if err != nil {
+		return true, "", err
+	}
+	if result == nil {
+		return true, "", nil
+	}
+	var info struct {
+		Found           bool   `json:"found"`
+		Active          bool   `json:"active"`
+		Text            string `json:"text"`
+		ClassName       string `json:"className"`
+		ParentClassName string `json:"parentClassName"`
+	}
+	if err := json.Unmarshal([]byte(result.Value.Str()), &info); err != nil {
+		return true, result.Value.Str(), err
+	}
+	tabInfo := fmt.Sprintf("found=%v active=%v text=%s class=%s parent=%s", info.Found, info.Active, info.Text, info.ClassName, info.ParentClassName)
+	if !info.Found {
+		return true, tabInfo, nil
+	}
+	return !info.Active, tabInfo, nil
 }
 
 func clickDraftCheckboxWithRetry(page *rod.Page, articleID, articleTitle string) (string, error) {
