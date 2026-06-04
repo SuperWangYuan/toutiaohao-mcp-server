@@ -331,13 +331,32 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 		url, _ := page.Eval(`() => window.location.href`)
 		title, _ := page.Eval(`() => document.title`)
 		log.Infof("当前页面URL: %v, 标题: %v", url, title)
-		if url != nil && strings.Contains(url.Value.Str(), "login") {
+		currentURL := ""
+		if url != nil {
+			currentURL = url.Value.Str()
+		}
+		if strings.Contains(currentURL, "login") {
 			return fmt.Errorf("跳转到登录页，Cookie可能过期")
 		}
 
-		if navInfo, errNav := clickDraftNavigation(page); errNav == nil && navInfo != "" {
-			log.Infof("草稿箱导航点击结果: %s", navInfo)
-			time.Sleep(4 * time.Second)
+		navClicked := false
+		if shouldClickDraftNavigation(currentURL, draftURL) {
+			if navInfo, errNav := clickDraftNavigation(page); errNav == nil && navInfo != "" {
+				log.Infof("草稿箱导航点击结果: %s", navInfo)
+				time.Sleep(4 * time.Second)
+				navClicked = strings.Contains(navInfo, "clicked")
+			}
+		} else {
+			log.Infof("当前 URL 已指向草稿列表，跳过左侧草稿箱导航点击: %s", currentURL)
+		}
+		if navClicked {
+			// 导航点击后刷新一次当前 URL，便于日志定位 SPA 路由变化。
+			urlAfterNav, _ := page.Eval(`() => window.location.href`)
+			navURL := ""
+			if urlAfterNav != nil {
+				navURL = urlAfterNav.Value.Str()
+			}
+			log.Infof("草稿箱导航后 URL: %s", navURL)
 		}
 		_, _ = page.Eval(`() => {
 			window.scrollTo(0, window.scrollY || 0);
@@ -349,7 +368,7 @@ func DeleteDraftByBrowserWithTitle(ctx context.Context, page *rod.Page, articleI
 
 		log.Info("尝试定位目标草稿并勾选复选框...")
 		var err error
-		resultStr, err = clickDraftCheckboxOnCurrentPage(page, articleID, articleTitle)
+		resultStr, err = clickDraftCheckboxWithRetry(page, articleID, articleTitle)
 		if err != nil {
 			log.Warnf("草稿复选框点击失败: %v", err)
 			continue
@@ -426,6 +445,38 @@ func clickDraftNavigation(page *rod.Page) (string, error) {
 		return "", nil
 	}
 	return result.Value.Str(), nil
+}
+
+func shouldClickDraftNavigation(currentURL, requestedURL string) bool {
+	combined := strings.ToLower(currentURL + " " + requestedURL)
+	return !strings.Contains(combined, "status=draft") && !strings.Contains(combined, "status=1")
+}
+
+func clickDraftCheckboxWithRetry(page *rod.Page, articleID, articleTitle string) (string, error) {
+	var lastResult string
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		result, err := clickDraftCheckboxOnCurrentPage(page, articleID, articleTitle)
+		if err != nil {
+			lastErr = err
+			log.Warnf("第 %d 次定位草稿复选框失败: %v", attempt, err)
+			time.Sleep(1500 * time.Millisecond)
+			continue
+		}
+		lastResult = result
+		if result != "" && !strings.Contains(result, "no matching") && !strings.Contains(result, "no checkbox") {
+			if attempt > 1 {
+				log.Infof("第 %d 次等待后成功定位草稿复选框: %s", attempt, result)
+			}
+			return result, nil
+		}
+		log.Infof("第 %d 次定位草稿复选框未命中: %s", attempt, result)
+		time.Sleep(1500 * time.Millisecond)
+	}
+	if lastErr != nil && lastResult == "" {
+		return "", lastErr
+	}
+	return lastResult, nil
 }
 
 func clickDraftCheckboxOnCurrentPage(page *rod.Page, articleID, articleTitle string) (string, error) {
