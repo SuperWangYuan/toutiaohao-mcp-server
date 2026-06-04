@@ -881,11 +881,23 @@ func clickDraftDeleteConfirm(page *rod.Page) (string, error) {
 		};
 		const normalize = (s) => String(s || '').replace(/\s+/g, '').trim();
 		const roots = Array.from(document.querySelectorAll('.byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"], body')).filter(visible);
-		for (const root of roots) {
+		const modalRoots = roots.filter(el => el.tagName !== 'BODY');
+		const searchIn = modalRoots.length > 0 ? modalRoots : [document.body];
+		for (const root of searchIn) {
 			const candidates = Array.from(root.querySelectorAll('button, a, span, div, [role="button"]')).filter(visible);
 			for (const el of candidates) {
 				const text = normalize(el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'));
-				if ((text === '删除' || text === '确认' || text === '确定' || text === '确认删除' || text === '确定删除') && !text.includes('取消')) {
+				if ((text === '确认' || text === '确定' || text === '确认删除' || text === '确定删除' || text === '删除') && !text.includes('取消')) {
+					// 排除列表上的单篇删除按钮
+					if (el.classList.contains('mcp-draft-single-delete') || el.closest('.mcp-draft-single-delete')) {
+						continue;
+					}
+					// 如果是在 body 中找，且匹配文字是 "删除"，我们需要确保它不是列表中的其他删除按钮
+					if (root.tagName === 'BODY' && text === '删除') {
+						if (!el.closest('.byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"]')) {
+							continue;
+						}
+					}
 					const target = el.closest('button, a, [role="button"], [class*="button"]') || el;
 					target.scrollIntoView({ block: 'center', inline: 'center' });
 					target.classList.add('mcp-draft-confirm-delete');
@@ -903,6 +915,7 @@ func clickDraftDeleteConfirm(page *rod.Page) (string, error) {
 	}
 	resultStr := result.Value.Str()
 	if strings.Contains(resultStr, "marked confirm") {
+		log.Infof("找到确认删除按钮特征: %s", resultStr)
 		if err := physicalClickMarkedElement(page, ".mcp-draft-confirm-delete"); err != nil {
 			return resultStr, err
 		}
