@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -68,9 +69,90 @@ type Report struct {
 	AccountOverview *AccountOverview `json:"account_overview,omitempty"`
 }
 
-// GetAccountOverview 获取账户概览（通过浏览器自动化抓取创作者后台首页数据）
+// getAccountOverviewViaAPI 纯 HTTP 方式获取数据概览
+func getAccountOverviewViaAPI(ctx context.Context, cookieStore cookies.Cookier) (*AccountOverview, error) {
+	// 1. 获取 UID
+	userID, errUID := getUID(ctx, cookieStore)
+	if errUID != nil || userID == "" {
+		return nil, fmt.Errorf("failed to get user_id: %w", errUID)
+	}
+
+	// 2. 获取 merge_v2 统计数据
+	stats, errStats := getHomeMergeStatistic(ctx, cookieStore)
+	if errStats != nil {
+		return nil, fmt.Errorf("failed to get merge_v2 statistics: %w", errStats)
+	}
+
+	var followers int
+	var totalReads int
+	var revenue string
+
+	if dataMap, ok := stats["data"].(map[string]interface{}); ok {
+		if val := dataMap["total_subscribe_count"]; val != nil {
+			fmt.Sscanf(fmt.Sprintf("%v", val), "%d", &followers)
+		}
+		if val := dataMap["total_read_play_count"]; val != nil {
+			fmt.Sscanf(fmt.Sprintf("%v", val), "%d", &totalReads)
+		}
+		if val := dataMap["total_income"]; val != nil {
+			revenue = fmt.Sprintf("%v", val)
+		}
+	}
+
+	// 3. 从 Feed API 累加最近 100 篇内容算点赞与分享量
+	totalLikes := 0
+	totalShares := 0
+
+	clientExtraParams := `{"category":"mp_article","real_app_id":"1231","need_forward":"true","offset_mode":"1","page_index":"1","status":"0","source":"0"}`
+	feedURL := fmt.Sprintf("https://mp.toutiao.com/api/feed/mp_provider/v1/?provider_type=mp_provider&aid=13&app_name=news_article&category=mp_article&channel=&stream_api_version=88&genre_type_switch=%%7B%%22repost%%22%%3A1%%2C%%22small_video%%22%%3A1%%2C%%22toutiao_graphic%%22%%3A1%%2C%%22weitoutiao%%22%%3A1%%2C%%22xigua_video%%22%%3A1%%7D&device_platform=pc&platform_id=0&visited_uid=%s&offset=0&count=100&keyword=&client_extra_params=%s&app_id=1231",
+		userID, url.QueryEscape(clientExtraParams))
+
+	body, errFeed := doAuthenticatedGet(ctx, feedURL, cookieStore)
+	if errFeed == nil {
+		var feedResp struct {
+			Data []map[string]interface{} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &feedResp); err == nil {
+			for _, item := range feedResp.Data {
+				if assembleCell, ok := item["assembleCell"].(map[string]interface{}); ok {
+					if itemCell, ok := assembleCell["itemCell"].(map[string]interface{}); ok {
+						if itemCounter, ok := itemCell["itemCounter"].(map[string]interface{}); ok {
+							if d, ok := itemCounter["diggCount"].(float64); ok {
+								totalLikes += int(d)
+							}
+							if rp, ok := itemCounter["repinCount"].(float64); ok {
+								totalShares += int(rp)
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		log.Warnf("GetAccountOverview API mode failed to load feed items: %v", errFeed)
+	}
+
+	return &AccountOverview{
+		Followers:   followers,
+		TotalReads:  totalReads,
+		TotalLikes:  totalLikes,
+		TotalShares: totalShares,
+		Revenue:     revenue,
+		RawData:     fmt.Sprintf("API-Fetched: Followers=%d, TotalReads=%d, Revenue=%s, TotalLikes=%d, TotalShares=%d", followers, totalReads, revenue, totalLikes, totalShares),
+	}, nil
+}
+
+// GetAccountOverview 获取账户概览（优先通过纯 HTTP API 抓取；如失败，自动回退到浏览器自动化作为降级兜底）
 func GetAccountOverview(ctx context.Context, page *rod.Page, cookieStore cookies.Cookier) (*AccountOverview, error) {
-	log.Info("开始获取账户概览数据（浏览器自动化方式）...")
+	log.Info("开始获取账户概览数据（优先 HTTP API 模式）...")
+
+	overview, errAPI := getAccountOverviewViaAPI(ctx, cookieStore)
+	if errAPI == nil && overview != nil {
+		log.Infof("HTTP API 获取账户概览成功: 粉丝=%d, 阅读=%d, 点赞=%d, 分享=%d, 收益=%s",
+			overview.Followers, overview.TotalReads, overview.TotalLikes, overview.TotalShares, overview.Revenue)
+		return overview, nil
+	}
+	log.Warnf("HTTP API 获取账户概览失败: %v，回退到浏览器自动化抓取...", errAPI)
 
 	// 注入 Cookie
 	if err := injectBrowserCookies(page, cookieStore); err != nil {
@@ -166,64 +248,12 @@ func GetAccountOverview(ctx context.Context, page *rod.Page, cookieStore cookies
 		// 去重
 		data.rawTexts = [...new Set(data.rawTexts)];
 
-		// 尝试从文本中提取数字（针对头条创作者后台的 "标题\n数字" 格式）
-		function extractNumber(texts, keywords, excludeKeywords) {
-			excludeKeywords = excludeKeywords || [];
-			let bestMatch = 0;
-
-			for (const text of texts) {
-				// 排除包含排除关键词的文本
-				let excluded = false;
-				for (const ek of excludeKeywords) {
-					if (text.includes(ek)) { excluded = true; break; }
-				}
-				if (excluded) continue;
-
-				for (const kw of keywords) {
-					if (!text.includes(kw)) continue;
-
-					// 策略 1: 匹配 "关键词\n数字" 或 "关键词 数字" 格式（紧邻）
-					const regex1 = new RegExp(kw + '[\\s\\n]*([\\d,]+(?:\\.\\d+)?)');
-					const m1 = text.match(regex1);
-					if (m1) {
-						const num = parseFloat(m1[1].replace(/,/g, ''));
-						if (num > bestMatch) bestMatch = num;
-					}
-
-					// 策略 2: 分行匹配 - 找到关键词所在行的下一行数字
-					const lines = text.split('\n');
-					for (let i = 0; i < lines.length - 1; i++) {
-						if (lines[i].includes(kw)) {
-							const nextLine = lines[i + 1].trim();
-							const m2 = nextLine.match(/^([\d,]+(?:\.\d+)?)/);
-							if (m2) {
-								const num = parseFloat(m2[1].replace(/,/g, ''));
-								if (num > bestMatch) bestMatch = num;
-							}
-						}
-					}
-				}
-			}
-			return Math.floor(bestMatch);
-		}
-
-		// 提取收益金额
-		function extractMoney(texts) {
-			for (const text of texts) {
-				if (text.includes('累计收益') || text.includes('收益')) {
-					const m = text.match(/([\d,]+(?:\.\d+)?)元/);
-					if (m) return m[1];
-				}
-			}
-			return '0';
-		}
-
 		// 转义正则特殊字符
 		function escapeRegex(s) {
 			return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 		}
 
-		// 重写 extractNumber 以使用字符串匹配而非正则匹配关键词
+		// 使用字符串匹配而非正则匹配关键词
 		function extractNumberV2(texts, keywords, excludeKeywords) {
 			excludeKeywords = excludeKeywords || [];
 			let bestMatch = 0;
@@ -264,6 +294,17 @@ func GetAccountOverview(ctx context.Context, page *rod.Page, cookieStore cookies
 				}
 			}
 			return Math.floor(bestMatch);
+		}
+
+		// 提取收益金额
+		function extractMoney(texts) {
+			for (const text of texts) {
+				if (text.includes('累计收益') || text.includes('收益')) {
+					const m = text.match(/([\d,]+(?:\.\d+)?)元/);
+					if (m) return m[1];
+				}
+			}
+			return '0';
 		}
 
 		data.followers = extractNumberV2(data.rawTexts, ['粉丝数', '粉丝']);
@@ -343,7 +384,7 @@ func GetArticleStats(ctx context.Context, articleID string, cookieStore cookies.
 				return &ArticleStats{
 					ArticleID:    item.ArticleID,
 					ReadCount:    item.ReadCount,
-					LikeCount:    item.DiggCount,
+					LikeCount:    item.LikeCount,
 					CommentCount: item.CommentCount,
 					ShareCount:   0, // 列表不返回具体的 share_count，默认赋 0
 				}, nil
@@ -415,7 +456,6 @@ func GenerateReport(ctx context.Context, reportType string, page *rod.Page, cook
 	}, nil
 }
 
-
 // injectBrowserCookies 将 cookieStore 中的 Cookie 注入到 rod 浏览器页面中
 // 如果没有可用 Cookie，会直接导航到目标页面（自动跳转到登录页供用户手动登录）
 func injectBrowserCookies(page *rod.Page, cookieStore cookies.Cookier) error {
@@ -467,12 +507,12 @@ func injectBrowserCookies(page *rod.Page, cookieStore cookies.Cookier) error {
 
 // TrendItem 单日趋势数据
 type TrendItem struct {
-	Date            string  `json:"date"`
-	ImpressionCount int     `json:"impression_count"`
-	ReadCount       int     `json:"read_count"`
-	LikeCount       int     `json:"like_count"`
-	CommentCount    int     `json:"comment_count"`
-	FansChangeCount int     `json:"fans_change_count"`
+	Date            string `json:"date"`
+	ImpressionCount int    `json:"impression_count"`
+	ReadCount       int    `json:"read_count"`
+	LikeCount       int    `json:"like_count"`
+	CommentCount    int    `json:"comment_count"`
+	FansChangeCount int    `json:"fans_change_count"`
 }
 
 // TrendResponse 趋势数据响应
@@ -509,9 +549,9 @@ func GetAccountTrends(ctx context.Context, days int, cookieStore cookies.Cookier
 
 	// 定义头条原生的响应格式结构体进行反序列化
 	var rawResp struct {
-		Code            int    `json:"code"`
-		Message         string `json:"message"`
-		DailyStatDatas  []struct {
+		Code           int    `json:"code"`
+		Message        string `json:"message"`
+		DailyStatDatas []struct {
 			Date       string `json:"date"`
 			AuthorStat struct {
 				ConsumeData struct {

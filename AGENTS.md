@@ -32,6 +32,12 @@ cd toutiaohao && go test -v -run TestPublishArticleManual
 
 # 执行正文插图上传专项集成测试
 cd toutiaohao && go test -v -run TestPublishArticleBodyImageManual
+
+# 执行微头条列表抓取集成测试
+cd toutiaohao && go test -v -run TestGetMicroPostsManual
+
+# 执行数据趋势与详情获取集成测试
+cd toutiaohao && go test -v -run "TestGetAccountTrendsManual|TestGetArticleDetailManual"
 ```
 
 ### 凭证配置
@@ -139,6 +145,25 @@ AI 助手在此项目中编写代码或执行自动化修改时，必须严格�
     - 上传触发器必须限定在当前可见的 `.upload-image-panel` / `.byte-modal` / `.semi-modal` / `[role="dialog"]` 等上传弹窗中，严禁抓取页面底层或历史遗留的全局 file input。
     - `/spice/image`、`upload_source=` 以及 `multipart/form-data` 上传请求必须绕过 `HijackRequests` 的 `LoadResponse` 代理，只能 `ContinueRequest` 原样放行；否则 multipart 文件体会被破坏并触发约 210 字节的“无效图片数据”请求。
     - 图片上传确认弹窗若未正常关闭，不允许“优雅降级继续发文”；必须保存错误截图并返回明确错误，防止正文或封面实际缺图却继续提交。
+
+15. **微头条全量历史抓取与统计合并机制（硬性数据规则）**：
+    - 微头条全量列表必须优先调用前端真实使用的 Feed 流接口 `/api/feed/mp_provider/v1/`，传入 `category=mp_wtt`、`provider_type=mp_provider`、`offset_mode=2`，并按响应中的 `offset` 游标继续翻页。
+    - `client_extra_params` 必须包含 `category=mp_wtt`、`real_app_id=1231`、`need_forward=true`、`offset_mode=2`、`status=0`、`source=0`、`start_cursor_ms=0` 和当前时间之后的 `end_cursor_ms`，以覆盖 2018 年以来的历史微头条。
+    - `/mp/agw/creator_center/list?type=1` 存在最多 30 条且 `end_cursor` 翻页失效的问题；`/mp/agw/statistic/v2/item/list?type=3` 返回数量不全，只能作为阅读量、展现量、评论数、点赞量与 CTR 的统计补充，不能作为全量列表主来源。
+    - Feed 返回结构应优先解析 `data[].assembleCell.itemCell.articleBase` 和 `itemCounter`，提取 ID、标题、创建时间、阅读数、展现量、评论数、点赞量和点击率；再与统计接口结果按 ID 内存去重合并。
+
+
+16. **文章全量历史混合抓取与去重（硬性数据规则）**：
+    - 鉴于创作者后台对作品列表做过历史归档，底层 API `/mp/agw/article/list/` 仅能展示最近 3 篇已发布文章（之前的全部被隐藏，total 也会返回 0），而包含了最新的草稿和审核中文章。
+    - 必须通过混合抓取并内存去重合并的方式拉取：先调用列表 API 获取草稿和实时文章，接着调用 Feed 流接口 `/api/feed/mp_provider/v1/`（基于 `visited_uid` 提取当前用户 user_id）分页拉取历史文章，随后在内存中按照 ID 进行**去重合并**，优先保留原列表中的草稿和审核中状态，并结合 `merge_v2` 接口返回的 `thread_count` 作为 `total`。
+
+17. **数据概览与趋势分析纯 HTTP 极速提取（硬性数据规则）**：
+    - 账号概览数据获取必须优先走纯 HTTP 方式：通过首页接口 `/mp/fe_api/home/merge_v2` 获取粉丝数、总阅读量和累计收益，并通过 Feed 接口拉取最近 100 篇内容并在内存中累加计算点赞和分享数。这相比无头浏览器 DOM 正则提取更为精准，耗时可由 10s 优化至 200ms。必须保留浏览器自动化抓取作为优雅降级兜底。
+    - 趋势数据拉取在调用 `/stat_trends` 时，必须显式且固定追加 `type=0` 参数，确保获取的是全局趋势，防止分类过滤造成粉丝变化等变动值偏小。
+
+18. **字段命名别名规范化统一（硬性数据规则）**：
+    - 严禁将今日头条 API 返回的原始、晦涩字段名（如 `go_detail_count_v2`、`digg_count`）直接返回给接口调用方。
+    - 对外导出的 `ArticleItem` 结构中必须统一翻译屏蔽原始字眼，暴露 `read_count`、`view_count`、`like_count`、`impression_count`、`ctr`（计算出的点击率别名）等符合业界命名规范的干净别名，降低集成方的开发猜测成本。
 
 ---
 

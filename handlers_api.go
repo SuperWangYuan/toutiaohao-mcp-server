@@ -183,10 +183,24 @@ func (s *AppServer) apiSaveMicroPostDraft(c *gin.Context) {
 
 // apiGetArticleList 获取文章列表 API
 func (s *AppServer) apiGetArticleList(c *gin.Context) {
-	params := toutiaohao.NewArticleListParams(map[string]interface{}{
-		"status": c.DefaultQuery("status", "all"),
-	})
+	args := make(map[string]interface{})
+	if status := c.Query("status"); status != "" {
+		args["status"] = status
+	}
+	if page := c.Query("page"); page != "" {
+		args["page"] = page
+	}
+	if pageSize := c.Query("page_size"); pageSize != "" {
+		args["page_size"] = pageSize
+	}
+	if contentType := c.Query("content_type"); contentType != "" {
+		args["content_type"] = contentType
+	}
+	if typeParam := c.Query("type"); typeParam != "" {
+		args["type"] = typeParam
+	}
 
+	params := toutiaohao.NewArticleListParams(args)
 	result, err := s.toutiaoService.GetArticleList(c.Request.Context(), params)
 	if err != nil {
 		respondError(c, mapErrorToStatusCode(err), err.Error())

@@ -89,3 +89,40 @@ func TestGetArticleDetailManual(t *testing.T) {
 		}
 	}
 }
+
+// TestGetMicroPostsManual 验证拉取微头条列表的集成测试
+func TestGetMicroPostsManual(t *testing.T) {
+	cookieStore := cookies.NewFileCookieStore(cookies.GetDefaultCookiePath())
+	cookiesData, err := cookieStore.LoadCookies()
+	if err != nil || len(cookiesData) == 0 {
+		t.Skip("跳过集成测试：本地没有检测到有效的 cookies.json 凭证文件，请先扫码登录")
+		return
+	}
+
+	ctx := context.Background()
+	params := &ArticleListParams{
+		Page:        1,
+		PageSize:    10,
+		Status:      "all",
+		ContentType: "ugc",
+	}
+
+	res, err := GetArticleList(ctx, params, cookieStore)
+	if err != nil {
+		t.Fatalf("拉取微头条列表失败: %v", err)
+	}
+
+	if res == nil {
+		t.Fatal("微头条列表响应不能为 nil")
+	}
+
+	t.Logf("成功拉取微头条列表，总数 Total: %d, 当前页条数: %d", res.Total, len(res.Articles))
+	if len(res.Articles) > 0 {
+		for i, art := range res.Articles {
+			t.Logf("[%d] ID=%s, Title=%s, 展现: %d, 阅读/播放: %d, 点赞: %d, 评论: %d, CTR: %.4f, URL: %s",
+				i, art.ArticleID, art.Title, art.ImpressionCount, art.ReadCount, art.LikeCount, art.CommentCount, art.CTR, art.ArticleURL)
+		}
+	} else {
+		t.Error("预期微头条数量大 0，但实际拉取到 0 条")
+	}
+}

@@ -1,11 +1,13 @@
 package toutiaohao
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -34,21 +36,34 @@ type ArticleListResponse struct {
 	Total    int           `json:"total"`
 }
 
-// ArticleItem 文章条目
+// ArticleItem 对外暴露的规范统一的文章条目
 type ArticleItem struct {
 	ArticleID       string      `json:"article_id"`
+	ID              string      `json:"id"` // 兼容向后字段
+	Title           string      `json:"title"`
+	Status          interface{} `json:"status"`
+	CreateTime      interface{} `json:"create_time"`
+	PublishTime     interface{} `json:"publish_time"`
+	ReadCount       int         `json:"read_count"`
+	ViewCount       int         `json:"view_count"`
+	CommentCount    int         `json:"comment_count"`
+	LikeCount       int         `json:"like_count"`
+	ImpressionCount int         `json:"impression_count"`
+	CTR             float64     `json:"ctr"`
+	ArticleURL      string      `json:"article_url"`
+}
+
+// rawArticleItem 今日头条接口直接返回的原始数据结构
+type rawArticleItem struct {
 	ID              string      `json:"id"`
 	Title           string      `json:"title"`
 	Status          interface{} `json:"status"`
 	CreateTime      interface{} `json:"create_time"`
 	PublishTime     interface{} `json:"publish_time"`
-	ReadCount       int         `json:"go_detail_count_v2"`
-	ReadCountAlias  int         `json:"read_count"`
-	ViewCountAlias  int         `json:"view_count"`
+	GoDetailCountV2 int         `json:"go_detail_count_v2"`
 	CommentCount    int         `json:"comment_count"`
 	DiggCount       int         `json:"digg_count"`
 	ImpressionCount int         `json:"impression_count"`
-	CTR             float64     `json:"ctr"`
 	ArticleURL      string      `json:"article_url"`
 }
 
@@ -112,21 +127,86 @@ func NewArticleListParams(args map[string]interface{}) *ArticleListParams {
 		return params
 	}
 
-	if p, ok := args["page"].(int); ok && p > 0 {
-		params.Page = p
-	} else if pf, ok := args["page"].(float64); ok && pf > 0 {
-		params.Page = int(pf)
+	// 1. 万能兼容解析 page
+	if pVal, ok := args["page"]; ok && pVal != nil {
+		switch v := pVal.(type) {
+		case int:
+			if v > 0 {
+				params.Page = v
+			}
+		case float64:
+			if v > 0 {
+				params.Page = int(v)
+			}
+		case string:
+			var p int
+			if fmt.Sscanf(v, "%d", &p); p > 0 {
+				params.Page = p
+			}
+		}
 	}
-	if ps, ok := args["page_size"].(int); ok && ps > 0 {
-		params.PageSize = ps
-	} else if psf, ok := args["page_size"].(float64); ok && psf > 0 {
-		params.PageSize = int(psf)
+
+	// 2. 万能兼容解析 page_size
+	if psVal, ok := args["page_size"]; ok && psVal != nil {
+		switch v := psVal.(type) {
+		case int:
+			if v > 0 {
+				params.PageSize = v
+			}
+		case float64:
+			if v > 0 {
+				params.PageSize = int(v)
+			}
+		case string:
+			var ps int
+			if fmt.Sscanf(v, "%d", &ps); ps > 0 {
+				params.PageSize = ps
+			}
+		}
 	}
+
+	// 3. 解析 status
 	if s, ok := args["status"].(string); ok && s != "" {
 		params.Status = s
 	}
-	if ct, ok := args["content_type"].(string); ok && ct != "" {
-		params.ContentType = ct
+
+	// 4. 万能类型和 content_type/type 参数转换映射
+	var typeVal interface{}
+	if val, ok := args["content_type"]; ok && val != nil {
+		typeVal = val
+	} else if val, ok := args["type"]; ok && val != nil {
+		typeVal = val
+	}
+
+	if typeVal != nil {
+		switch v := typeVal.(type) {
+		case string:
+			valLower := strings.TrimSpace(strings.ToLower(v))
+			if valLower == "1" || valLower == "ugc" || valLower == "micro" || valLower == "micro_post" {
+				params.ContentType = "ugc"
+			} else if valLower == "2" || valLower == "article" {
+				params.ContentType = "article"
+			} else {
+				params.ContentType = valLower
+			}
+		case int:
+			if v == 1 {
+				params.ContentType = "ugc"
+			} else if v == 2 {
+				params.ContentType = "article"
+			} else {
+				params.ContentType = fmt.Sprintf("%d", v)
+			}
+		case float64:
+			vInt := int(v)
+			if vInt == 1 {
+				params.ContentType = "ugc"
+			} else if vInt == 2 {
+				params.ContentType = "article"
+			} else {
+				params.ContentType = fmt.Sprintf("%d", vInt)
+			}
+		}
 	}
 
 	return params
@@ -148,18 +228,756 @@ func ValidateDeleteArticle(articleID string) error {
 	return nil
 }
 
+// getUID 获取当前登录用户的 user_id
+func getUID(ctx context.Context, cookieStore cookies.Cookier) (string, error) {
+	url := "https://mp.toutiao.com/mp/agw/creator_center/user_info?app_id=1231"
+	body, err := doAuthenticatedGet(ctx, url, cookieStore)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		UserIDStr string `json:"user_id_str"`
+		UserID    int64  `json:"user_id"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", err
+	}
+	if resp.UserIDStr != "" {
+		return resp.UserIDStr, nil
+	}
+	if resp.UserID != 0 {
+		return fmt.Sprintf("%d", resp.UserID), nil
+	}
+	return "", fmt.Errorf("failed to extract user_id from user_info response")
+}
+
+// getHomeMergeStatistic 获取首页的 merge_v2 统计数据
+func getHomeMergeStatistic(ctx context.Context, cookieStore cookies.Cookier) (map[string]interface{}, error) {
+	body, err := doAuthenticatedGet(ctx, configs.HomeMergeAPI+"?app_id=1231", cookieStore)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Statistic map[string]interface{} `json:"statistic"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Code == 0 && resp.Data.Statistic != nil {
+		return resp.Data.Statistic, nil
+	}
+	return nil, fmt.Errorf("failed to get merge_v2 statistics")
+}
+
+// mapRawToArticleItem 将头条原始接口数据映射为规范对外输出数据
+func mapRawToArticleItem(raw rawArticleItem) ArticleItem {
+	id := raw.ID
+	readCount := raw.GoDetailCountV2
+	var ctr float64
+	if raw.ImpressionCount > 0 {
+		ctr = float64(readCount) / float64(raw.ImpressionCount)
+	}
+	publishTime := raw.PublishTime
+	if publishTime == nil || fmt.Sprintf("%v", publishTime) == "" {
+		publishTime = raw.CreateTime
+	}
+	return ArticleItem{
+		ArticleID:       id,
+		ID:              id,
+		Title:           raw.Title,
+		Status:          raw.Status,
+		CreateTime:      raw.CreateTime,
+		PublishTime:     publishTime,
+		ReadCount:       readCount,
+		ViewCount:       readCount,
+		CommentCount:    raw.CommentCount,
+		LikeCount:       raw.DiggCount,
+		ImpressionCount: raw.ImpressionCount,
+		CTR:             ctr,
+		ArticleURL:      raw.ArticleURL,
+	}
+}
+
+// mapFeedItemToArticleItem 将 Feed 接口元素转换为标准 ArticleItem
+func mapFeedItemToArticleItem(item map[string]interface{}) (ArticleItem, bool) {
+	assembleCell, ok1 := item["assembleCell"].(map[string]interface{})
+	if !ok1 {
+		return ArticleItem{}, false
+	}
+	itemCell, ok2 := assembleCell["itemCell"].(map[string]interface{})
+	if !ok2 {
+		return ArticleItem{}, false
+	}
+	articleBase, ok3 := itemCell["articleBase"].(map[string]interface{})
+	if !ok3 {
+		return ArticleItem{}, false
+	}
+
+	// 提取 ID
+	var groupIDStr string
+	if groupIDVal := articleBase["groupID"]; groupIDVal != nil {
+		if f, ok := groupIDVal.(float64); ok {
+			groupIDStr = fmt.Sprintf("%.0f", f)
+		} else {
+			groupIDStr = fmt.Sprintf("%v", groupIDVal)
+		}
+	}
+	if groupIDStr == "" || groupIDStr == "0" {
+		if gidStr, ok := articleBase["gidStr"].(string); ok && gidStr != "" {
+			groupIDStr = gidStr
+		}
+	}
+	if groupIDStr == "" {
+		return ArticleItem{}, false
+	}
+
+	title, _ := articleBase["title"].(string)
+	status := interface{}(3) // 已发布
+
+	publishTime := articleBase["publishTime"]
+	createTime := articleBase["createTime"]
+	if createTime == nil {
+		createTime = publishTime
+	}
+
+	var readCount, impressionCount, commentCount, likeCount int
+	if itemCounter, ok := itemCell["itemCounter"].(map[string]interface{}); ok {
+		if r, ok := itemCounter["readCount"].(float64); ok {
+			readCount = int(r)
+		}
+		if s, ok := itemCounter["showCount"].(float64); ok {
+			impressionCount = int(s)
+		}
+		if c, ok := itemCounter["commentCount"].(float64); ok {
+			commentCount = int(c)
+		}
+		if d, ok := itemCounter["diggCount"].(float64); ok {
+			likeCount = int(d)
+		}
+	}
+
+	var ctr float64
+	if impressionCount > 0 {
+		ctr = float64(readCount) / float64(impressionCount)
+	}
+
+	articleURL, _ := articleBase["articleURL"].(string)
+	if articleURL == "" {
+		articleURL = fmt.Sprintf("https://www.toutiao.com/item/%s/", groupIDStr)
+	}
+
+	return ArticleItem{
+		ArticleID:       groupIDStr,
+		ID:              groupIDStr,
+		Title:           title,
+		Status:          status,
+		CreateTime:      createTime,
+		PublishTime:     publishTime,
+		ReadCount:       readCount,
+		ViewCount:       readCount,
+		CommentCount:    commentCount,
+		LikeCount:       likeCount,
+		ImpressionCount: impressionCount,
+		CTR:             ctr,
+		ArticleURL:      articleURL,
+	}, true
+}
+
+func getMicroPostStatsViaAPI(ctx context.Context, cookieStore cookies.Cookier) ([]ArticleItem, int, error) {
+	type statisticItemStatConsumeData struct {
+		GoDetailCount   int `json:"go_detail_count"`
+		ImpressionCount int `json:"impression_count"`
+	}
+	type statisticItemStatConsumeDetail struct {
+		ClickRate float64 `json:"click_rate"`
+	}
+	type statisticItemStatInteractionData struct {
+		CommentCount int `json:"comment_count"`
+		DiggCount    int `json:"digg_count"`
+	}
+	type statisticItemStat struct {
+		ConsumeData     statisticItemStatConsumeData     `json:"consume_data"`
+		ConsumeDetail   statisticItemStatConsumeDetail   `json:"consume_detail"`
+		InteractionData statisticItemStatInteractionData `json:"interaction_data"`
+	}
+	type statisticItemData struct {
+		ItemID     string            `json:"item_id"`
+		Title      string            `json:"title"`
+		CreateTime int64             `json:"create_time"`
+		ItemStat   statisticItemStat `json:"item_stat"`
+	}
+	type statisticItemListResponse struct {
+		Code       int                 `json:"code"`
+		Message    string              `json:"message"`
+		TotalCount int                 `json:"total_count"`
+		ItemDatas  []statisticItemData `json:"item_datas"`
+	}
+
+	url := fmt.Sprintf("%s?type=3&page_num=1&page_size=100", configs.MicroPostListAPI)
+	body, err := doAuthenticatedGet(ctx, url, cookieStore)
+	if err != nil {
+		return nil, 0, err
+	}
+	var resp statisticItemListResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("failed to parse statistic item list: %w", err)
+	}
+	if resp.Code != 0 {
+		return nil, 0, fmt.Errorf("statistic item list API returned error code %d: %s", resp.Code, resp.Message)
+	}
+
+	articles := make([]ArticleItem, 0, len(resp.ItemDatas))
+	for _, c := range resp.ItemDatas {
+		id := strings.TrimSpace(c.ItemID)
+		if id == "" {
+			continue
+		}
+		createTime := c.CreateTime
+		articles = append(articles, ArticleItem{
+			ArticleID:       id,
+			ID:              id,
+			Title:           c.Title,
+			Status:          3,
+			CreateTime:      createTime,
+			PublishTime:     createTime,
+			ReadCount:       c.ItemStat.ConsumeData.GoDetailCount,
+			ViewCount:       c.ItemStat.ConsumeData.GoDetailCount,
+			CommentCount:    c.ItemStat.InteractionData.CommentCount,
+			LikeCount:       c.ItemStat.InteractionData.DiggCount,
+			ImpressionCount: c.ItemStat.ConsumeData.ImpressionCount,
+			CTR:             c.ItemStat.ConsumeDetail.ClickRate,
+			ArticleURL:      fmt.Sprintf("https://www.toutiao.com/w/%s/", id),
+		})
+	}
+	return articles, resp.TotalCount, nil
+}
+
+func getAllMicroPostsViaFeed(ctx context.Context, cookieStore cookies.Cookier) ([]ArticleItem, int, error) {
+	userID, err := getUID(ctx, cookieStore)
+	if err != nil || userID == "" {
+		return nil, 0, fmt.Errorf("failed to get user_id for micro post feed: %w", err)
+	}
+
+	count := 30
+	cursor := "0"
+	seenCursors := make(map[string]bool)
+	seenIDs := make(map[string]bool)
+	var articles []ArticleItem
+	total := 0
+
+	for page := 1; page <= 20; page++ {
+		if seenCursors[cursor] {
+			break
+		}
+		seenCursors[cursor] = true
+		endCursorMS := time.Now().Add(24 * time.Hour).UnixMilli()
+		clientExtraParams := fmt.Sprintf(`{"category":"mp_wtt","real_app_id":"1231","need_forward":"true","offset_mode":"2","status":"0","source":"0","start_cursor_ms":"0","end_cursor_ms":"%d"}`, endCursorMS)
+		feedURL := fmt.Sprintf("%s?provider_type=mp_provider&aid=13&app_name=news_article&category=mp_wtt&channel=&stream_api_version=88&genre_type_switch=%%7B%%22repost%%22%%3A1%%2C%%22small_video%%22%%3A1%%2C%%22toutiao_graphic%%22%%3A1%%2C%%22weitoutiao%%22%%3A1%%2C%%22xigua_video%%22%%3A1%%7D&device_platform=pc&platform_id=0&visited_uid=%s&offset=%s&count=%d&keyword=&client_extra_params=%s&app_id=1231",
+			configs.MicroPostFeedAPI, url.QueryEscape(userID), url.QueryEscape(cursor), count, url.QueryEscape(clientExtraParams))
+		body, err := doAuthenticatedGet(ctx, feedURL, cookieStore)
+		if err != nil {
+			return articles, total, err
+		}
+
+		var resp struct {
+			Data        []map[string]interface{} `json:"data"`
+			Offset      interface{}              `json:"offset"`
+			HasMore     bool                     `json:"has_more"`
+			APIBaseInfo struct {
+				AppExtraParams string `json:"app_extra_params"`
+			} `json:"api_base_info"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.UseNumber()
+		if err := decoder.Decode(&resp); err != nil {
+			return articles, total, fmt.Errorf("failed to parse mp_wtt feed response: %w", err)
+		}
+
+		if resp.APIBaseInfo.AppExtraParams != "" {
+			var extra struct {
+				TotalCount int `json:"total_count"`
+			}
+			if json.Unmarshal([]byte(resp.APIBaseInfo.AppExtraParams), &extra) == nil && extra.TotalCount > total {
+				total = extra.TotalCount
+			}
+		}
+
+		for _, item := range resp.Data {
+			art, ok := mapMicroPostFeedItemToArticleItem(item)
+			if !ok || art.ArticleID == "" || seenIDs[art.ArticleID] {
+				continue
+			}
+			seenIDs[art.ArticleID] = true
+			articles = append(articles, art)
+		}
+
+		nextCursor := strings.TrimSpace(valueToString(resp.Offset))
+		if !resp.HasMore || nextCursor == "" || nextCursor == cursor {
+			break
+		}
+		cursor = nextCursor
+	}
+	if total < len(articles) {
+		total = len(articles)
+	}
+	return articles, total, nil
+}
+
+func mapMicroPostFeedItemToArticleItem(item map[string]interface{}) (ArticleItem, bool) {
+	if assembleCell, ok := item["assembleCell"].(map[string]interface{}); ok {
+		if itemCell, ok := assembleCell["itemCell"].(map[string]interface{}); ok {
+			if articleBase, ok := itemCell["articleBase"].(map[string]interface{}); ok {
+				itemCounter, _ := itemCell["itemCounter"].(map[string]interface{})
+				richContentInfo, _ := itemCell["richContentInfo"].(map[string]interface{})
+
+				id := firstNonEmptyString(
+					valueToString(articleBase["gidStr"]),
+					valueToString(articleBase["groupID"]),
+					valueToString(articleBase["groupId"]),
+					valueToString(articleBase["itemID"]),
+					valueToString(articleBase["itemId"]),
+					valueToString(articleBase["id"]),
+				)
+				if id != "" {
+					title := firstNonEmptyString(
+						valueToString(articleBase["title"]),
+						valueToString(articleBase["content"]),
+						valueToString(articleBase["abstractText"]),
+						valueToString(articleBase["abstract"]),
+						valueToString(richContentInfo["richContent"]),
+						valueToString(richContentInfo["titleRichSpan"]),
+					)
+					createTime := firstNonZeroInt64(articleBase["createTime"], articleBase["create_time"])
+					publishTime := firstNonZeroInt64(articleBase["publishTime"], articleBase["publish_time"], articleBase["createTime"], articleBase["create_time"])
+					status := firstNonZeroInt64(articleBase["itemStatus"], articleBase["item_status"], articleBase["status"])
+					if status == 0 {
+						status = 3
+					}
+
+					readCount := firstNonZeroInt(itemCounter["readCount"], itemCounter["read_count"], itemCounter["goDetailCount"], itemCounter["go_detail_count"])
+					impressionCount := firstNonZeroInt(itemCounter["showCount"], itemCounter["show_count"], itemCounter["impressionCount"], itemCounter["impression_count"])
+					commentCount := firstNonZeroInt(itemCounter["commentCount"], itemCounter["comment_count"])
+					likeCount := firstNonZeroInt(itemCounter["diggCount"], itemCounter["digg_count"], itemCounter["likeCount"], itemCounter["like_count"])
+					ctr := firstNonZeroFloat(itemCounter["clickRate"], itemCounter["click_rate"], itemCounter["ctr"])
+					if ctr == 0 && impressionCount > 0 {
+						ctr = float64(readCount) / float64(impressionCount)
+					}
+
+					return ArticleItem{
+						ArticleID:       id,
+						ID:              id,
+						Title:           title,
+						Status:          status,
+						CreateTime:      createTime,
+						PublishTime:     publishTime,
+						ReadCount:       readCount,
+						ViewCount:       readCount,
+						CommentCount:    commentCount,
+						LikeCount:       likeCount,
+						ImpressionCount: impressionCount,
+						CTR:             ctr,
+						ArticleURL:      firstNonEmptyString(valueToString(articleBase["articleURL"]), valueToString(articleBase["articleUrl"]), valueToString(articleBase["displayURL"]), fmt.Sprintf("https://www.toutiao.com/w/%s/", id)),
+					}, true
+				}
+			}
+		}
+	}
+
+	content := valueToString(item["content"])
+	if content == "" {
+		if assembleCell, ok := item["assembleCell"].(map[string]interface{}); ok {
+			if itemCell, ok := assembleCell["itemCell"].(map[string]interface{}); ok {
+				if extra, ok := itemCell["extra"].(map[string]interface{}); ok {
+					content = valueToString(extra["origin_content"])
+				}
+			}
+		}
+	}
+	if content == "" {
+		return ArticleItem{}, false
+	}
+
+	var root map[string]interface{}
+	decoder := json.NewDecoder(bytes.NewReader([]byte(content)))
+	decoder.UseNumber()
+	if err := decoder.Decode(&root); err != nil {
+		return ArticleItem{}, false
+	}
+	articleAttr, _ := root["article_attr"].(map[string]interface{})
+	if articleAttr == nil {
+		return ArticleItem{}, false
+	}
+	threadData, _ := articleAttr["thread_data"].(map[string]interface{})
+
+	id := firstNonEmptyString(
+		valueToString(articleAttr["gid"]),
+		valueToString(articleAttr["item_id"]),
+		valueToString(threadData["thread_id"]),
+		valueToString(threadData["threadId"]),
+		valueToString(threadData["id"]),
+	)
+	if id == "" {
+		return ArticleItem{}, false
+	}
+
+	title := firstNonEmptyString(
+		valueToString(threadData["title"]),
+		valueToString(articleAttr["title"]),
+		valueToString(threadData["content"]),
+		valueToString(articleAttr["abstract"]),
+	)
+	createTime := firstNonZeroInt64(articleAttr["create_time"], threadData["create_time"], threadData["createTime"])
+	status := firstNonZeroInt64(articleAttr["status"], threadData["status"])
+	if status == 0 {
+		status = 3
+	}
+
+	readCount := firstNonZeroInt(articleAttr["go_detail_count"], articleAttr["read_count"], threadData["go_detail_count"], threadData["read_count"], threadData["readCount"])
+	impressionCount := firstNonZeroInt(articleAttr["impression_count"], articleAttr["show_count"], threadData["impression_count"], threadData["show_count"], threadData["showCount"])
+	commentCount := firstNonZeroInt(articleAttr["comment_count"], threadData["comment_count"], threadData["commentCount"])
+	likeCount := firstNonZeroInt(articleAttr["digg_count"], articleAttr["like_count"], threadData["digg_count"], threadData["like_count"], threadData["diggCount"])
+	ctr := firstNonZeroFloat(articleAttr["click_rate"], threadData["click_rate"], threadData["clickRate"])
+	if ctr == 0 && impressionCount > 0 {
+		ctr = float64(readCount) / float64(impressionCount)
+	}
+
+	return ArticleItem{
+		ArticleID:       id,
+		ID:              id,
+		Title:           title,
+		Status:          status,
+		CreateTime:      createTime,
+		PublishTime:     createTime,
+		ReadCount:       readCount,
+		ViewCount:       readCount,
+		CommentCount:    commentCount,
+		LikeCount:       likeCount,
+		ImpressionCount: impressionCount,
+		CTR:             ctr,
+		ArticleURL:      fmt.Sprintf("https://www.toutiao.com/w/%s/", id),
+	}, true
+}
+
+func mergeMicroPostSources(primary []ArticleItem, stats []ArticleItem) []ArticleItem {
+	merged := make([]ArticleItem, 0, len(primary)+len(stats))
+	byID := make(map[string]int)
+	for _, item := range primary {
+		if item.ArticleID == "" {
+			continue
+		}
+		byID[item.ArticleID] = len(merged)
+		merged = append(merged, item)
+	}
+	for _, stat := range stats {
+		if stat.ArticleID == "" {
+			continue
+		}
+		if idx, ok := byID[stat.ArticleID]; ok {
+			merged[idx] = mergeArticleMetrics(merged[idx], stat)
+			continue
+		}
+		byID[stat.ArticleID] = len(merged)
+		merged = append(merged, stat)
+	}
+	return merged
+}
+
+func mergeArticleMetrics(base ArticleItem, stat ArticleItem) ArticleItem {
+	if base.Title == "" {
+		base.Title = stat.Title
+	}
+	if base.CreateTime == nil || fmt.Sprintf("%v", base.CreateTime) == "0" {
+		base.CreateTime = stat.CreateTime
+	}
+	if base.PublishTime == nil || fmt.Sprintf("%v", base.PublishTime) == "0" {
+		base.PublishTime = stat.PublishTime
+	}
+	if base.ReadCount == 0 {
+		base.ReadCount = stat.ReadCount
+		base.ViewCount = stat.ViewCount
+	}
+	if base.CommentCount == 0 {
+		base.CommentCount = stat.CommentCount
+	}
+	if base.LikeCount == 0 {
+		base.LikeCount = stat.LikeCount
+	}
+	if base.ImpressionCount == 0 {
+		base.ImpressionCount = stat.ImpressionCount
+	}
+	if base.CTR == 0 {
+		base.CTR = stat.CTR
+	}
+	return base
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" && value != "0" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstNonZeroInt(values ...interface{}) int {
+	for _, value := range values {
+		if n := int(valueToInt64(value)); n != 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func firstNonZeroInt64(values ...interface{}) int64 {
+	for _, value := range values {
+		if n := valueToInt64(value); n != 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func firstNonZeroFloat(values ...interface{}) float64 {
+	for _, value := range values {
+		if n := valueToFloat64(value); n != 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func valueToString(value interface{}) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case json.Number:
+		return v.String()
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	case int:
+		return fmt.Sprintf("%d", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func valueToInt64(value interface{}) int64 {
+	switch v := value.(type) {
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	case float64:
+		return int64(v)
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case string:
+		var n int64
+		_, _ = fmt.Sscanf(v, "%d", &n)
+		return n
+	default:
+		return 0
+	}
+}
+
+func valueToFloat64(value interface{}) float64 {
+	switch v := value.(type) {
+	case json.Number:
+		n, _ := v.Float64()
+		return n
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case string:
+		var n float64
+		_, _ = fmt.Sscanf(v, "%f", &n)
+		return n
+	default:
+		return 0
+	}
+}
+
 // GetArticleList 获取文章列表
 func GetArticleList(ctx context.Context, params *ArticleListParams, cookieStore cookies.Cookier) (*ArticleListResponse, error) {
 	if err := ValidateArticleListStatus(params.Status); err != nil {
 		return nil, err
 	}
 
-	url := fmt.Sprintf("%s?page=%d&page_size=%d&status=%s",
-		configs.ArticleListAPI, params.Page, params.PageSize, params.Status)
-	if params.ContentType != "" {
-		url = fmt.Sprintf("%s&content_type=%s", url, params.ContentType)
+	// 1. UGC 微头条专属拉取
+	if params.ContentType == "ugc" {
+		articles, total, errFeed := getAllMicroPostsViaFeed(ctx, cookieStore)
+		stats, statTotal, errStats := getMicroPostStatsViaAPI(ctx, cookieStore)
+		if len(articles) == 0 && len(stats) == 0 {
+			if errFeed != nil {
+				return nil, errFeed
+			}
+			return nil, errStats
+		}
+		if errFeed != nil {
+			log.Warnf("微头条前端 feed 全量拉取失败，将仅返回统计接口数据: %v", errFeed)
+		}
+		if errStats != nil {
+			log.Warnf("微头条统计接口指标补全失败，将仅返回 feed 指标: %v", errStats)
+		}
+
+		merged := mergeMicroPostSources(articles, stats)
+		if total < len(merged) {
+			total = len(merged)
+		}
+		if statTotal > total {
+			total = statTotal
+		}
+
+		return &ArticleListResponse{
+			Articles: merged,
+			Total:    total,
+		}, nil
 	}
 
+	// 2. 混合拉取：普通文章（all / published）全量历史拉取 Feed 流并与底层列表去重合并
+	if (params.Status == "all" || params.Status == "published") && params.ContentType != "ugc" {
+		// 先请求底层 API 接口获取最近的文章列表（包含最新的草稿、审核中、已发布文章）
+		urlStr := fmt.Sprintf("%s?page=%d&page_size=%d&status=%s",
+			configs.ArticleListAPI, params.Page, params.PageSize, params.Status)
+		bodyRaw, errRaw := doAuthenticatedGet(ctx, urlStr, cookieStore)
+		var rawList []ArticleItem
+		var rawTotal int
+		if errRaw == nil {
+			var resp struct {
+				Data struct {
+					Articles []rawArticleItem `json:"articles"`
+					Total    int              `json:"total"`
+				} `json:"data"`
+			}
+			if json.Unmarshal(bodyRaw, &resp) == nil {
+				rawTotal = resp.Data.Total
+				for _, r := range resp.Data.Articles {
+					rawList = append(rawList, mapRawToArticleItem(r))
+				}
+			}
+		}
+
+		userID, errUID := getUID(ctx, cookieStore)
+		if errUID == nil && userID != "" {
+			offset := (params.Page - 1) * params.PageSize
+			count := params.PageSize
+			clientExtraParams := fmt.Sprintf(`{"category":"mp_article","real_app_id":"1231","need_forward":"true","offset_mode":"1","page_index":"%d","status":"0","source":"0"}`, params.Page)
+
+			feedURL := fmt.Sprintf("https://mp.toutiao.com/api/feed/mp_provider/v1/?provider_type=mp_provider&aid=13&app_name=news_article&category=mp_article&channel=&stream_api_version=88&genre_type_switch=%%7B%%22repost%%22%%3A1%%2C%%22small_video%%22%%3A1%%2C%%22toutiao_graphic%%22%%3A1%%2C%%22weitoutiao%%22%%3A1%%2C%%22xigua_video%%22%%3A1%%7D&device_platform=pc&platform_id=0&visited_uid=%s&offset=%d&count=%d&keyword=&client_extra_params=%s&app_id=1231",
+				userID, offset, count, url.QueryEscape(clientExtraParams))
+
+			bodyFeed, errFeed := doAuthenticatedGet(ctx, feedURL, cookieStore)
+			if errFeed == nil {
+				var feedResp struct {
+					Data []map[string]interface{} `json:"data"`
+				}
+				if json.Unmarshal(bodyFeed, &feedResp) == nil {
+					var feedList []ArticleItem
+					for _, item := range feedResp.Data {
+						if art, ok := mapFeedItemToArticleItem(item); ok {
+							if articleStatusMatchesFilter(art.Status, params.Status) {
+								feedList = append(feedList, art)
+							}
+						}
+					}
+
+					// 去重合并：使用 map 辅助进行 ID 和标题的双重去重
+					seenIDs := make(map[string]bool)
+					seenTitles := make(map[string]bool)
+					var merged []ArticleItem
+
+					// 优先保留底层 API 接口里的元素（包括草稿、审核中等最实时状态）
+					for _, art := range rawList {
+						id := art.ArticleID
+						titleClean := strings.TrimSpace(art.Title)
+
+						if id == "" || seenIDs[id] {
+							continue
+						}
+						if titleClean != "" && seenTitles[titleClean] {
+							continue
+						}
+
+						seenIDs[id] = true
+						if titleClean != "" {
+							seenTitles[titleClean] = true
+						}
+						merged = append(merged, art)
+					}
+
+					// 加上 Feed 里面的历史已发布文章
+					for _, art := range feedList {
+						id := art.ArticleID
+						titleClean := strings.TrimSpace(art.Title)
+
+						if id == "" || seenIDs[id] {
+							continue
+						}
+						if titleClean != "" && seenTitles[titleClean] {
+							continue
+						}
+
+						seenIDs[id] = true
+						if titleClean != "" {
+							seenTitles[titleClean] = true
+						}
+						merged = append(merged, art)
+					}
+
+					// 总作品数 Total 精准解析
+					total := len(merged)
+					if stats, errStats := getHomeMergeStatistic(ctx, cookieStore); errStats == nil && stats != nil {
+						if dataMap, ok := stats["data"].(map[string]interface{}); ok {
+							if tcVal := dataMap["thread_count"]; tcVal != nil {
+								var tc int
+								if f, ok := tcVal.(float64); ok {
+									tc = int(f)
+								} else {
+									fmt.Sscanf(fmt.Sprintf("%v", tcVal), "%d", &tc)
+								}
+								if tc > 0 {
+									total = tc
+								}
+							}
+						}
+					} else {
+						if rawTotal > total {
+							total = rawTotal
+						}
+					}
+
+					return &ArticleListResponse{
+						Articles: merged,
+						Total:    total,
+					}, nil
+				}
+			}
+		}
+		// 降级兜底：如果获取 UID 或 Feed 失败，直接使用上面获取到的 rawList 正常返回
+		if len(rawList) > 0 {
+			return &ArticleListResponse{
+				Articles: rawList,
+				Total:    rawTotal,
+			}, nil
+		}
+	}
+
+	// 3. 草稿/审核中，或者发生异常降级时，退回原来的底层 API 列表接口
+	url := fmt.Sprintf("%s?page=%d&page_size=%d&status=%s",
+		configs.ArticleListAPI, params.Page, params.PageSize, params.Status)
 	body, err := doAuthenticatedGet(ctx, url, cookieStore)
 	if err != nil {
 		return nil, err
@@ -167,37 +985,19 @@ func GetArticleList(ctx context.Context, params *ArticleListParams, cookieStore 
 
 	var resp struct {
 		Data struct {
-			Articles []ArticleItem `json:"articles"`
-			Total    int           `json:"total"`
+			Articles []rawArticleItem `json:"articles"`
+			Total    int              `json:"total"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("failed to parse raw response: %w", err)
 	}
 
-	// 设置 article_id（优先用 id 字段，回退到 pgc_id），并对头条偶发忽略 status 参数的返回做客户端兜底过滤。
 	filtered := make([]ArticleItem, 0, len(resp.Data.Articles))
-	for i := range resp.Data.Articles {
-		if resp.Data.Articles[i].ID != "" {
-			resp.Data.Articles[i].ArticleID = resp.Data.Articles[i].ID
-		}
-
-		// 填充字段别名与点击率计算
-		resp.Data.Articles[i].ReadCountAlias = resp.Data.Articles[i].ReadCount
-		resp.Data.Articles[i].ViewCountAlias = resp.Data.Articles[i].ReadCount
-		if resp.Data.Articles[i].ImpressionCount > 0 {
-			resp.Data.Articles[i].CTR = float64(resp.Data.Articles[i].ReadCount) / float64(resp.Data.Articles[i].ImpressionCount)
-		} else {
-			resp.Data.Articles[i].CTR = 0.0
-		}
-
-		// 兜底 PublishTime，若为空则以 CreateTime 填充
-		if resp.Data.Articles[i].PublishTime == nil || fmt.Sprintf("%v", resp.Data.Articles[i].PublishTime) == "" {
-			resp.Data.Articles[i].PublishTime = resp.Data.Articles[i].CreateTime
-		}
-
-		if articleStatusMatchesFilter(resp.Data.Articles[i].Status, params.Status) {
-			filtered = append(filtered, resp.Data.Articles[i])
+	for _, raw := range resp.Data.Articles {
+		art := mapRawToArticleItem(raw)
+		if articleStatusMatchesFilter(art.Status, params.Status) {
+			filtered = append(filtered, art)
 		}
 	}
 
