@@ -166,9 +166,9 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 	if opts != nil {
 		if opts.CoverImage != "" {
 			coverStatus = "单图"
-		} else if len(opts.Images) >= 3 && !hasInlineImages {
+		} else if len(opts.Images) >= 3 {
 			coverStatus = "三图"
-		} else if len(opts.Images) > 0 && !hasInlineImages {
+		} else if len(opts.Images) > 0 {
 			coverStatus = "单图"
 		} else if hasInlineImages {
 			coverStatus = "自适应封面"

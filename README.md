@@ -212,7 +212,8 @@ go test -v -run "TestGetAccountTrendsManual|TestGetArticleDetailManual"
 ### 图片上传实现约定
 
 - 所有本地/下载/净化后的临时图片必须生成在项目根目录 `.tmp/` 下。
-- 正文插图和封面图上传必须使用 go-rod `HandleFileDialog()` 拦截 Chrome 原生文件选择器，再物理点击当前可见上传弹窗里的“本地上传”按钮。
+- 正文插图和封面图上传必须使用 go-rod `HandleFileDialog()` 拦截 Chrome 原生文件选择器，再物理点击当前可见上传弹窗里的“本地上传”按钮。封面槽可能直接触发文件选择器，因此封面上传会先注册文件选择器拦截，再点击封面槽；若页面弹出上传面板，再继续点击面板里的“本地上传”。
+- 图文文章封面来源优先级为：`cover_image` > 显式传入的 `images` > 正文 Markdown 内嵌图自适应。调用方传 1 张 `images` 时使用单图封面，传 3 张及以上时使用三图封面。
 - 不要直接对隐藏的 `input[type=file]` 调用 `SetFiles`。该方式可能产生本地 blob 预览，但服务端实际收到约 210 字节的损坏请求体，最终显示“无效图片数据”。
 - `/spice/image`、`upload_source=` 和 `multipart/form-data` 图片上传请求必须绕过 `HijackRequests` 的 `LoadResponse` 代理，直接 `ContinueRequest` 原样放行。
 - 如果图片确认弹窗没有关闭，应保存错误截图并返回错误，避免缺图内容继续发布。

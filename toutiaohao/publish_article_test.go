@@ -112,3 +112,48 @@ func TestShouldBypassHijackForImageUpload(t *testing.T) {
 		})
 	}
 }
+
+func TestDecideArticleCoverPrioritizesExplicitImages(t *testing.T) {
+	inlineImages := []string{"inline-1.png", "inline-2.png", "inline-3.png"}
+	decision := decideArticleCover(&ArticleOptions{
+		Images: []string{"cover.png"},
+	}, inlineImages)
+
+	if decision.Mode != "单图" {
+		t.Fatalf("mode = %q, want 单图", decision.Mode)
+	}
+	if decision.Auto {
+		t.Fatal("explicit images should not be treated as auto cover")
+	}
+	if len(decision.Covers) != 1 || decision.Covers[0] != "cover.png" {
+		t.Fatalf("covers = %#v, want explicit cover image", decision.Covers)
+	}
+}
+
+func TestDecideArticleCoverFallsBackToInlineImages(t *testing.T) {
+	decision := decideArticleCover(nil, []string{"inline-1.png", "inline-2.png", "inline-3.png"})
+
+	if decision.Mode != "三图" {
+		t.Fatalf("mode = %q, want 三图", decision.Mode)
+	}
+	if !decision.Auto {
+		t.Fatal("inline images fallback should be marked auto")
+	}
+	if len(decision.Covers) != 3 || decision.Covers[0] != "inline-1.png" {
+		t.Fatalf("covers = %#v, want first three inline images", decision.Covers)
+	}
+}
+
+func TestDecideArticleCoverPrioritizesCoverImage(t *testing.T) {
+	decision := decideArticleCover(&ArticleOptions{
+		CoverImage: "cover-image.png",
+		Images:     []string{"image-cover.png", "image-cover-2.png", "image-cover-3.png"},
+	}, []string{"inline-1.png", "inline-2.png", "inline-3.png"})
+
+	if decision.Mode != "单图" {
+		t.Fatalf("mode = %q, want 单图", decision.Mode)
+	}
+	if len(decision.Covers) != 1 || decision.Covers[0] != "cover-image.png" {
+		t.Fatalf("covers = %#v, want cover_image priority", decision.Covers)
+	}
+}

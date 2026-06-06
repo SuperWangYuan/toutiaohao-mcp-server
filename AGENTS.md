@@ -141,10 +141,11 @@ AI 助手在此项目中编写代码或执行自动化修改时，必须严格�
 
 14. **图片上传必须走 Chrome 文件选择器（硬性发文规则）**：
     - 正文插图与封面图上传严禁再直接对隐藏 `input[type=file]` 调用 `SetFiles`。头条图片上传组件会生成本地 blob 预览，但服务端可能只收到约 210 字节的空/损坏 body，并报“无效图片数据”。
-    - 必须使用 go-rod `page.HandleFileDialog()` 先拦截 Chrome 原生文件选择器，再物理点击当前可见上传面板里的“本地上传”按钮，最后由文件选择器回调传入 Go 层动态转换后的绝对路径。
+    - 必须使用 go-rod `page.HandleFileDialog()` 先拦截 Chrome 原生文件选择器，再物理点击当前可见上传面板里的“本地上传”按钮，最后由文件选择器回调传入 Go 层动态转换后的绝对路径。封面槽可能直接触发 Chrome 原生文件选择器，因此封面上传必须在点击封面槽前就预先注册 `HandleFileDialog()`，若点击槽位后出现上传面板，再继续点击面板内“本地上传”。
     - 上传触发器必须限定在当前可见的 `.upload-image-panel` / `.byte-modal` / `.semi-modal` / `[role="dialog"]` 等上传弹窗中，严禁抓取页面底层或历史遗留的全局 file input。
     - `/spice/image`、`upload_source=` 以及 `multipart/form-data` 上传请求必须绕过 `HijackRequests` 的 `LoadResponse` 代理，只能 `ContinueRequest` 原样放行；否则 multipart 文件体会被破坏并触发约 210 字节的“无效图片数据”请求。
     - 图片上传确认弹窗若未正常关闭，不允许“优雅降级继续发文”；必须保存错误截图并返回明确错误，防止正文或封面实际缺图却继续提交。
+    - **封面来源优先级**：`cover_image` 是最高优先级显式封面；其次只要图文文章调用方明确传入 `images`，就必须优先使用 `images` 作为封面候选（1 张为单图，3 张及以上为三图）。只有在 `cover_image` 和 `images` 都未传入时，才允许从正文 Markdown 内嵌图中自适应提取封面。
 
 15. **微头条全量历史抓取与统计合并机制（硬性数据规则）**：
     - 微头条全量列表必须优先调用前端真实使用的 Feed 流接口 `/api/feed/mp_provider/v1/`，传入 `category=mp_wtt`、`provider_type=mp_provider`、`offset_mode=2`，并按响应中的 `offset` 游标继续翻页。

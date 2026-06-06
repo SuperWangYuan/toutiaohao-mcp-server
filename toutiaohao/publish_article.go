@@ -88,10 +88,35 @@ func ValidateUpdateArticle(articleID, title, content string, opts *ArticleOption
 	return nil
 }
 
+func decideArticleCover(opts *ArticleOptions, inlineImages []string) coverDecision {
+	if opts != nil && opts.CoverImage != "" {
+		return coverDecision{Mode: "单图", Covers: []string{opts.CoverImage}}
+	}
+	if opts != nil && len(opts.Images) > 0 {
+		if len(opts.Images) >= 3 {
+			return coverDecision{Mode: "三图", Covers: opts.Images[:3]}
+		}
+		return coverDecision{Mode: "单图", Covers: []string{opts.Images[0]}}
+	}
+	if len(inlineImages) >= 3 {
+		return coverDecision{Mode: "三图", Covers: inlineImages[:3], Auto: true}
+	}
+	if len(inlineImages) > 0 {
+		return coverDecision{Mode: "单图", Covers: []string{inlineImages[0]}, Auto: true}
+	}
+	return coverDecision{Mode: "无封面"}
+}
+
 // ArticlePublishAction 文章发布操作
 type ArticlePublishAction struct {
 	page        *rod.Page
 	cookieStore cookies.Cookier
+}
+
+type coverDecision struct {
+	Mode   string
+	Covers []string
+	Auto   bool
 }
 
 // NewArticlePublishAction 创建文章发布操作
@@ -193,56 +218,20 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 		}
 	}
 
-	// 封面决策逻辑
-	var targetCoverMode string
-	var targetCovers []string
-	var isAutoCover bool
-
-	if opts != nil && opts.CoverImage != "" {
-		// 1. CoverImage 是明确的封面意图，优先使用。
-		targetCoverMode = "单图"
-		targetCovers = []string{opts.CoverImage}
-	} else if opts != nil && len(opts.Images) > 0 && len(inlineImages) == 0 {
-		// 2. 没有 Markdown 内嵌图时，Images 兼容旧调用作为封面备选。
-		if len(opts.Images) >= 3 {
-			targetCoverMode = "三图"
-			targetCovers = opts.Images[:3]
-		} else {
-			targetCoverMode = "单图"
-			targetCovers = []string{opts.Images[0]}
-		}
-	} else {
-		// 3. 有 Markdown 内嵌图时，Images 属于正文配图来源，封面从正文图片自适应提取，避免重复上传同一批图。
-		if len(inlineImages) >= 3 {
-			targetCoverMode = "三图"
-			targetCovers = inlineImages[:3]
-			isAutoCover = true
-		} else if len(inlineImages) > 0 {
-			targetCoverMode = "单图"
-			targetCovers = []string{inlineImages[0]}
-			isAutoCover = true
-		} else {
-			targetCoverMode = "无封面"
-		}
-	}
+	decision := decideArticleCover(opts, inlineImages)
 
 	// 设置封面模式并上传图片
-	log.Infof("封面模式决策结果: 模式=%s, 封面图数=%d, 自适应=%t", targetCoverMode, len(targetCovers), isAutoCover)
-	if err := a.setCoverMode(targetCoverMode); err != nil {
-		log.Warnf("Failed to set cover mode to %s: %v", targetCoverMode, err)
-	} else if len(targetCovers) > 0 {
+	log.Infof("封面模式决策结果: 模式=%s, 封面图数=%d, 自适应=%t", decision.Mode, len(decision.Covers), decision.Auto)
+	if err := a.setCoverMode(decision.Mode); err != nil {
+		log.Warnf("Failed to set cover mode to %s: %v", decision.Mode, err)
+	} else if len(decision.Covers) > 0 {
 		// 在自适应提取模式下，编辑器切换封面模式后需要短暂时间从正文同步图片并渲染封面槽，这里等待 3 秒以防重复上传
-		if isAutoCover {
+		if decision.Auto {
 			log.Info("自适应提取封面模式，等待 3 秒让编辑器同步正文图片...")
 			time.Sleep(3 * time.Second)
 		}
-		if err := a.uploadCovers(targetCovers, isAutoCover); err != nil {
-			log.Warnf("Failed to upload cover images for mode %s: %v", targetCoverMode, err)
-			if degradeErr := a.setCoverMode("无封面"); degradeErr != nil {
-				log.Warnf("封面上传失败后降级为无封面也失败: %v", degradeErr)
-			} else {
-				log.Warn("封面上传失败，已降级为无封面以避免发布按钮被封面校验拦截")
-			}
+		if err := a.uploadCovers(decision.Covers, decision.Auto); err != nil {
+			return fmt.Errorf("封面上传失败，已中断发布以避免无封面误发布: %w", err)
 		}
 	}
 	if err := a.clearBlockingCoverWarning(); err != nil {
@@ -947,6 +936,94 @@ func (a *ArticlePublishAction) uploadFileThroughChooser(localPath, markerClass s
 		done <- setFiles([]string{localPath})
 	}()
 
+	if err := a.clickCurrentUploadTrigger(markerClass, 5*time.Second); err != nil {
+		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+		return err
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("Chrome 文件选择器写入文件失败: %w", err)
+		}
+		log.Infof("Chrome 文件选择器已接收文件: %s", localPath)
+		return nil
+	case <-time.After(8 * time.Second):
+		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+		return fmt.Errorf("等待 Chrome 文件选择器弹出超时")
+	}
+}
+
+func (a *ArticlePublishAction) uploadCoverFileThroughChooser(localPath string, slotEl *rod.Element, imageIndex int) error {
+	setFiles, err := a.page.HandleFileDialog()
+	if err != nil {
+		return fmt.Errorf("初始化 Chrome 文件选择器拦截失败: %w", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- setFiles([]string{localPath})
+	}()
+
+	if err := a.clickElementLikeUser(slotEl, fmt.Sprintf("封面槽 %d", imageIndex)); err != nil {
+		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+		return err
+	}
+
+	if completed, err := waitFileChooserDone(done, 1500*time.Millisecond); completed {
+		if err != nil {
+			return fmt.Errorf("Chrome 文件选择器写入封面文件失败: %w", err)
+		}
+		log.Infof("Chrome 文件选择器已直接接收封面文件: %s", localPath)
+		return nil
+	}
+
+	if !a.hasVisibleUploadPanel() {
+		log.Warnf("封面图片上传：点击封面槽 %d 后未检测到上传面板，尝试 JS 事件链兜底", imageIndex)
+		_, _ = slotEl.Eval(`() => {
+			['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
+				this.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+			});
+		}`)
+		time.Sleep(1200 * time.Millisecond)
+	}
+
+	if completed, err := waitFileChooserDone(done, 300*time.Millisecond); completed {
+		if err != nil {
+			return fmt.Errorf("Chrome 文件选择器写入封面文件失败: %w", err)
+		}
+		log.Infof("Chrome 文件选择器已接收封面文件: %s", localPath)
+		return nil
+	}
+
+	if err := a.clickCurrentUploadTrigger("mcp-cover-local-upload-trigger", 5*time.Second); err != nil {
+		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+		return fmt.Errorf("封面槽 %d 未打开可用上传面板或本地上传按钮: %w", imageIndex, err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("Chrome 文件选择器写入封面文件失败: %w", err)
+		}
+		log.Infof("Chrome 文件选择器已接收封面文件: %s", localPath)
+		return nil
+	case <-time.After(8 * time.Second):
+		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+		return fmt.Errorf("等待封面 Chrome 文件选择器弹出超时")
+	}
+}
+
+func waitFileChooserDone(done <-chan error, timeout time.Duration) (bool, error) {
+	select {
+	case err := <-done:
+		return true, err
+	case <-time.After(timeout):
+		return false, nil
+	}
+}
+
+func (a *ArticlePublishAction) clickCurrentUploadTrigger(markerClass string, timeout time.Duration) error {
 	_, _ = a.page.Eval(`(markerClass) => {
 		document.querySelectorAll('.' + markerClass).forEach(el => el.classList.remove(markerClass));
 		const visible = (el) => {
@@ -955,7 +1032,7 @@ func (a *ArticlePublishAction) uploadFileThroughChooser(localPath, markerClass s
 			const rect = el.getBoundingClientRect();
 			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 		};
-		const panels = Array.from(document.querySelectorAll('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="drawer"]'))
+		const panels = Array.from(document.querySelectorAll('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"], [class*="drawer"]'))
 			.filter(visible);
 		for (const panel of panels) {
 			const controls = Array.from(panel.querySelectorAll('button, [role="button"], label, .upload-handler, input[type="file"]')).filter(visible);
@@ -972,41 +1049,48 @@ func (a *ArticlePublishAction) uploadFileThroughChooser(localPath, markerClass s
 		return false;
 	}`, markerClass)
 
-	trigger, err := a.page.Timeout(5 * time.Second).Element("." + markerClass)
+	trigger, err := a.page.Timeout(timeout).Element("." + markerClass)
 	if err != nil {
-		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
 		return fmt.Errorf("未找到当前上传面板的“本地上传”触发按钮: %w", err)
 	}
 	trigger = trigger.CancelTimeout()
+	return a.clickElementLikeUser(trigger, "上传触发器")
+}
 
-	pt, err := trigger.Interactable()
+func (a *ArticlePublishAction) clickElementLikeUser(el *rod.Element, label string) error {
+	pt, err := el.Interactable()
 	if err == nil {
-		log.Infof("通过 Chrome 文件选择器流程点击上传触发器，坐标 (%f, %f)", pt.X, pt.Y)
+		log.Infof("物理点击%s，坐标 (%f, %f)", label, pt.X, pt.Y)
 		_ = a.page.Mouse.MoveTo(*pt)
 		_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
 		_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-	} else {
-		log.Warnf("上传触发器不可物理点击，回退到 JS 事件链: %v", err)
-		_, _ = trigger.Eval(`() => {
-			const input = this.matches('input[type="file"]') ? this : this.querySelector('input[type="file"]');
-			const target = input || this;
-			['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
-				target.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
-			});
-		}`)
-	}
-
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("Chrome 文件选择器写入文件失败: %w", err)
-		}
-		log.Infof("Chrome 文件选择器已接收文件: %s", localPath)
 		return nil
-	case <-time.After(8 * time.Second):
-		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
-		return fmt.Errorf("等待 Chrome 文件选择器弹出超时")
 	}
+	log.Warnf("%s不可物理点击，回退到 JS 事件链: %v", label, err)
+	_, evalErr := el.Eval(`() => {
+		const input = this.matches('input[type="file"]') ? this : this.querySelector('input[type="file"]');
+		const target = input || this;
+		['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(name => {
+			target.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window }));
+		});
+	}`)
+	if evalErr != nil {
+		return fmt.Errorf("%s JS 事件链点击失败: %w", label, evalErr)
+	}
+	return nil
+}
+
+func (a *ArticlePublishAction) hasVisibleUploadPanel() bool {
+	res, err := a.page.Eval(`() => {
+		const visible = (el) => {
+			if (!el) return false;
+			const style = window.getComputedStyle(el);
+			const rect = el.getBoundingClientRect();
+			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+		};
+		return Array.from(document.querySelectorAll('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"], [class*="drawer"]')).some(visible);
+	}`)
+	return err == nil && res != nil && res.Value.Bool()
 }
 
 func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover bool) error {
@@ -1094,64 +1178,17 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			return fmt.Errorf("could not locate marked cover upload slot for image %d: %w", i+1, err)
 		}
 
-		// 模拟物理鼠标点击；封面槽内部的隐藏 input 不再直接注入，必须先让页面打开真实上传面板。
-		pt, err := clickEl.Interactable()
-		if err == nil {
-			log.Infof("Clicking cover slot %d at point (%f, %f)", i+1, pt.X, pt.Y)
-			_ = a.page.Mouse.MoveTo(*pt)
-			_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
-			_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
-		} else {
-			log.Warnf("Failed to get interactable point for cover slot %d, fallback to JS full events click: %v", i+1, err)
-			_, _ = clickEl.Eval(`() => {
-				const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
-				events.forEach(name => {
-					const ev = new MouseEvent(name, { bubbles: true, cancelable: true, view: window });
-					this.dispatchEvent(ev);
-				});
+		if err := a.uploadCoverFileThroughChooser(localPath, clickEl, i+1); err != nil {
+			_, _ = a.page.Eval(`() => {
+				document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 			}`)
-		}
-
-		// 延迟一小段时间，检查上传弹窗是否已经成功弹出
-		hasDialog := false
-		for d := 0; d < 6; d++ { // 等待最多 3 秒
-			resDialog, errDialog := a.page.Eval(`() => {
-				const visible = (el) => {
-					if (!el) return false;
-					const style = window.getComputedStyle(el);
-					const rect = el.getBoundingClientRect();
-					return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-				};
-				return Array.from(document.querySelectorAll('input[type="file"]')).some(inp => {
-					let parent = inp.closest('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"], [class*="drawer"]');
-					return parent !== null && visible(parent);
-				});
-			}`)
-			if errDialog == nil && resDialog != nil && resDialog.Value.Bool() {
-				hasDialog = true
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		if !hasDialog {
-			log.Warnf("【封面上传】物理点击封面槽 %d 疑似未成功弹出上传窗口，执行 JS Click 强制兜底...", i+1)
-			_, _ = clickEl.Eval("() => this.click()")
-			time.Sleep(1500 * time.Millisecond)
-		} else {
-			time.Sleep(1000 * time.Millisecond)
-		}
-
-		// 清理临时标记
-		_, _ = a.page.Eval(`() => {
-			document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
-		}`)
-
-		if err := a.uploadFileThroughChooser(localPath, "mcp-cover-local-upload-trigger"); err != nil {
 			safeScreenshot(a.page, "screenshot_upload_error.png")
 			log.Warnf("Upload error screenshot saved to screenshot_upload_error.png")
 			return fmt.Errorf("cover image %d Chrome 文件选择上传失败: %w", i+1, err)
 		}
+		_, _ = a.page.Eval(`() => {
+			document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
+		}`)
 		time.Sleep(2 * time.Second)
 
 		// 等待并点击图片确认按钮（如 data-e2e="imageUploadConfirm-btn" 或文本为“确定”的按钮）
@@ -2306,65 +2343,39 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 			}
 		}
 
-		// 只有在显式重新指定了封面参数，或者自适应模式需要的情况下，我们才更新封面
-		var targetCoverMode string
-		var targetCovers []string
-		var isAutoCover bool
-
-		if opts != nil && opts.CoverImage != "" {
-			targetCoverMode = "单图"
-			targetCovers = []string{opts.CoverImage}
-		} else if opts != nil && len(opts.Images) > 0 && len(inlineImages) == 0 {
-			if len(opts.Images) >= 3 {
-				targetCoverMode = "三图"
-				targetCovers = opts.Images[:3]
-			} else {
-				targetCoverMode = "单图"
-				targetCovers = []string{opts.Images[0]}
-			}
+		if opts == nil || (opts.CoverImage == "" && len(opts.Images) == 0) {
+			log.Info("修改文章时未显式指定封面，将保持原有封面不变")
 		} else {
-			// 如果没指定任何 opts（或者指定的 opts 中没有封面），且正文变了，我们重新自适应
-			if len(inlineImages) >= 3 {
-				targetCoverMode = "三图"
-				targetCovers = inlineImages[:3]
-				isAutoCover = true
-			} else if len(inlineImages) > 0 {
-				targetCoverMode = "单图"
-				targetCovers = []string{inlineImages[0]}
-				isAutoCover = true
-			} else {
-				targetCoverMode = "无封面"
-			}
-		}
+			decision := decideArticleCover(opts, inlineImages)
+			if decision.Mode != "" {
+				log.Infof("重新决策更新封面: 模式=%s, 图片数=%d, 自适应=%t", decision.Mode, len(decision.Covers), decision.Auto)
 
-		if targetCoverMode != "" {
-			log.Infof("重新决策更新封面: 模式=%s, 图片数=%d, 自适应=%t", targetCoverMode, len(targetCovers), isAutoCover)
-
-			// 在修改文章时，若页面上对应的封面插槽已经有上传完成的图片了，则跳过重传以提升速度并防止超时
-			needUpload := false
-			if targetCoverMode == "无封面" {
-				needUpload = false
-			} else {
-				for i := 0; i < len(targetCovers); i++ {
-					hasImg, errCheck := a.checkCoverSlotHasImage(i)
-					if errCheck != nil || !hasImg {
-						needUpload = true
-						break
+				// 在修改文章时，若页面上对应的封面插槽已经有上传完成的图片了，则跳过重传以提升速度并防止超时
+				needUpload := false
+				if decision.Mode == "无封面" {
+					needUpload = false
+				} else {
+					for i := 0; i < len(decision.Covers); i++ {
+						hasImg, errCheck := a.checkCoverSlotHasImage(i)
+						if errCheck != nil || !hasImg {
+							needUpload = true
+							break
+						}
 					}
 				}
-			}
 
-			if err := a.setCoverMode(targetCoverMode); err != nil {
-				log.Warnf("Failed to set cover mode to %s: %v", targetCoverMode, err)
-			} else if len(targetCovers) > 0 && needUpload {
-				if isAutoCover {
-					time.Sleep(3 * time.Second)
+				if err := a.setCoverMode(decision.Mode); err != nil {
+					log.Warnf("Failed to set cover mode to %s: %v", decision.Mode, err)
+				} else if len(decision.Covers) > 0 && needUpload {
+					if decision.Auto {
+						time.Sleep(3 * time.Second)
+					}
+					if err := a.uploadCovers(decision.Covers, decision.Auto); err != nil {
+						log.Warnf("Failed to upload cover images: %v", err)
+					}
+				} else if !needUpload && decision.Mode != "无封面" {
+					log.Infof("检测到修改页面封面插槽已有上传完成的封面图，跳过封面重传流程")
 				}
-				if err := a.uploadCovers(targetCovers, isAutoCover); err != nil {
-					log.Warnf("Failed to upload cover images: %v", err)
-				}
-			} else if !needUpload && targetCoverMode != "无封面" {
-				log.Infof("检测到修改页面封面插槽已有上传完成的封面图，跳过封面重传流程")
 			}
 		}
 	}

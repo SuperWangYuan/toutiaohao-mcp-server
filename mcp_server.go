@@ -41,7 +41,7 @@ type DeleteCookiesArgs struct{}
 type PublishArticleArgs struct {
 	Title       string      `json:"title" jsonschema_description:"文章标题（最多100字）"`
 	Content     string      `json:"content" jsonschema_description:"文章正文内容。支持：1. 纯文本内容。2. 包含插图的内容：使用 Markdown 格式 of 图片标签 '![图片描述](本地绝对路径)' 插入本地图片。系统会自动提取图片，按顺序逐个上传并在对应的段落位置插入。例如：'第一段内容。\\n\\n![插图](/path/to/img.png)\\n\\n第二段内容。'"`
-	Images      []string    `json:"images,omitempty" jsonschema_description:"封面图片备选或文章关联图片路径列表"`
+	Images      []string    `json:"images,omitempty" jsonschema_description:"封面图片路径列表；图文文章中若明确传入 images，将优先作为封面图使用（1 张为单图，3 张及以上为三图）。正文插图请写在 content 的 Markdown 图片标签中"`
 	Tags        []string    `json:"tags,omitempty" jsonschema_description:"标签列表（如活动话题：移动云智能新空间）"`
 	Category    string      `json:"category,omitempty" jsonschema_description:"文章分类（如科技）"`
 	CoverImage  string      `json:"cover_image,omitempty" jsonschema_description:"封面图片路径"`
@@ -56,7 +56,7 @@ type UpdateArticleArgs struct {
 	ArticleID   string      `json:"article_id" jsonschema_description:"要修改的文章或草稿的 ID (即 URL 中的 pgc_id)"`
 	Title       string      `json:"title,omitempty" jsonschema_description:"修改后的文章标题（最多100字，不修改则留空）"`
 	Content     string      `json:"content,omitempty" jsonschema_description:"修改后的文章正文内容。支持：1. 纯文本内容。2. 包含插图的内容：使用 Markdown 格式 of 图片标签 '![图片描述](本地绝对路径)' 插入本地图片。不修改则留空。"`
-	Images      []string    `json:"images,omitempty" jsonschema_description:"封面图片备选或文章关联图片路径列表"`
+	Images      []string    `json:"images,omitempty" jsonschema_description:"封面图片路径列表；修改图文文章时若明确传入 images，将优先作为新封面图使用（1 张为单图，3 张及以上为三图）。正文插图请写在 content 的 Markdown 图片标签中"`
 	CoverImage  string      `json:"cover_image,omitempty" jsonschema_description:"封面图片路径"`
 	Original    bool        `json:"original,omitempty" jsonschema_description:"是否声明原创"`
 	Fiction     bool        `json:"fiction,omitempty" jsonschema_description:"是否声明作品取材网络、虚构演绎以防范版权/姓名权争议"`
@@ -221,7 +221,7 @@ func registerMicroTools(server *mcp.Server, appServer *AppServer) {
 func registerArticleTools(server *mcp.Server, appServer *AppServer) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "publish_article",
-		Description: "发布今日头条图文文章。\n支持两种发布模式：\n1. 发布纯文本文章：直接在 content 中填写纯文本内容。\n2. 发布带插图文章（插入图片）：在 content 中图片应该插入的位置，以 Markdown 语法 `![图片描述](图片本地绝对路径)` 指定。系统将自动解析标签、将图片文件上传并以图文交替混排方式精准插入到对应位置。\n注：图片路径必须为本地绝对路径。支持封面模式设置（单图/三图/无封面）、标签/话题设置、分类设置以及声明原创。",
+		Description: "发布今日头条图文文章。\n支持两种发布模式：\n1. 发布纯文本文章：直接在 content 中填写纯文本内容。\n2. 发布带插图文章（插入图片）：在 content 中图片应该插入的位置，以 Markdown 语法 `![图片描述](图片本地绝对路径)` 指定。系统将自动解析标签、将图片文件上传并以图文交替混排方式精准插入到对应位置。\n封面规则：cover_image 优先；其次 images 明确传入时优先作为封面图使用（1 张单图，3 张及以上三图）；只有未传 cover_image/images 时才从正文插图自适应封面。\n注：图片路径必须为本地绝对路径。支持封面模式设置（单图/三图/无封面）、标签/话题设置、分类设置以及声明原创。",
 		Annotations: &mcp.ToolAnnotations{
 			DestructiveHint: boolPtr(true),
 		},
