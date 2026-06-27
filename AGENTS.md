@@ -166,6 +166,13 @@ AI 助手在此项目中编写代码或执行自动化修改时，必须严格�
     - 严禁将今日头条 API 返回的原始、晦涩字段名（如 `go_detail_count_v2`、`digg_count`）直接返回给接口调用方。
     - 对外导出的 `ArticleItem` 结构中必须统一翻译屏蔽原始字眼，暴露 `read_count`、`view_count`、`like_count`、`impression_count`、`ctr`（计算出的点击率别名）等符合业界命名规范的干净别名，降低集成方的开发猜测成本。
 
+19. **评论读取与回复结果验证（硬性互动规则）**：
+    - 评论列表必须优先调用头条评论管理页真实使用的 `/comment/author_receive_comment/` 接口，按 `offset` / `next_offset` 分页，并从 `id_str`、`text`、`user.name`、`article_info.group_id_str`、`create_time`、`reply_count` 映射对外字段。DOM 评分抓取只能作为接口失败时的兜底，严禁再次作为主来源。
+    - `get_comments` 返回的每条评论必须包含真实非空 `comment_id` 和明确的 `reply_count`。不得省略 `reply_count` 后让调用方将缺失字段误判为 `0`；按 `article_id` 或 `keyword` 过滤时需要继续分页，直到满足 `page_size` 或接口明确没有下一页。
+    - `reply_comment` 在只收到 `comment_id` 时，必须先通过真实评论接口解析对应正文和文章 ID，再在浏览器页面中定位 `.comment-item` 卡片。评论页应固定为足够的桌面视口，并自动滚动评论容器或触发“加载更多”，确保非首屏评论也能进入 DOM。
+    - 回复内容必须通过 go-rod 物理键入，键入后需要读取输入框值并确认“发布”按钮已经启用。提交时只允许点击当前可见回复编辑器内真实的按钮本体，并确认浏览器确实收到 `click` 事件，禁止点击宽泛父容器或仅派发无校验的 JS 事件。
+    - 点击“发布”不等于回复成功。提交前必须记录目标评论的 `reply_count`，提交后绕过缓存轮询真实评论接口；只有检测到 `reply_count` 增长，或在无法取得 ID 时确认回复正文真实出现在目标评论下，才能返回 `success: true`。返回体应结构化暴露 `reply_count_before` / `reply_count_after`；验证失败必须截图并返回错误，严禁假成功。
+
 ---
 
 ## 5. 本地开发与测试流程

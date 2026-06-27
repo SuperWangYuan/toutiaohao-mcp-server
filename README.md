@@ -19,6 +19,7 @@
 - **文章在线二次修改与安全测试沙盒**：支持对已发布或草稿状态的文章进行无残留二次修改。新支持 `SaveAsDraft` 选项（仅保存草稿不发布），支持纯草稿箱安全测试，测试数据不污染真实主页，且测试完毕后能通过浏览器物理清除。智能跳过非必要封面重传以防超时；引入 React onChange 底层强力驱动与 3s 延迟平息期以彻底防止 React 异步重绘回滚；在最终发布前执行“一致性二次固化校验与强行覆盖”，保证提交数据 100% 固化；物理兼容“发布”确认弹窗。
 - **文章全量历史混合抓取与去重**：解除头条原接口对已发布文章仅展示最近 3 篇的封锁。对于 `all` / `published` 状态的文章采用双通道混合拉取：先调用列表 API 拿草稿，再通过 Feed 接口拉取历史文章，并在内存中根据 ID 与非空标题进行**双重去重合并**，防止重复项冗余堆叠。
 - **字段命名别名规范化统一**：彻底翻译并屏蔽了头条原始接口中晦涩难懂的字段名（如 `go_detail_count_v2`、`digg_count`），对外统一暴露标准的 `read_count`、`view_count`、`like_count`、`impression_count`、`ctr` 等规范字段别名。
+- **真实评论读取与可验证回复**：评论列表优先读取头条评论管理页实际使用的接口，稳定返回真实 `comment_id`、文章 ID、用户名、正文、时间和 `reply_count`；回复操作通过浏览器物理完成，并在提交后以真实接口中的回复数增长作为成功条件，避免“按钮点过但实际未发布”的假成功。
 - **登录态自愈机制**：支持本地 `cookies.json` 的自动装载与生命周期管理。若会话过期，程序会在有头模式下自动弹窗等待扫码登录，登录成功后自动更新并捕获凭证回写。
 - **Markdown 智能排版引擎**：
   - 自动将正文解析分割为文本块与图片块，由浏览器控制完成图文交替混排。
@@ -109,8 +110,8 @@ go build -o toutiaohao-server .
 | **GET** | `/api/v1/articles` | 获取文章列表（支持 `published/draft/review` 状态筛选） |
 | **POST** | `/api/v1/articles/update` | 修改/更新已有图文文章 |
 | **POST** | `/api/v1/articles/delete` | 物理删除文章或删除草稿 |
-| **GET** | `/api/v1/comments` | 获取评论列表，可按 `article_id` 或 `keyword` 缩小范围 |
-| **POST** | `/api/v1/comments/reply` | 回复用户评论，需提供 `reply_content` 以及 `comment_id` 或 `comment_text` |
+| **GET** | `/api/v1/comments` | 获取真实评论列表，可按 `article_id` 或 `keyword` 缩小范围，返回 `comment_id` 与 `reply_count` |
+| **POST** | `/api/v1/comments/reply` | 回复用户评论并验证实际提交，需提供 `reply_content` 以及 `comment_id` 或 `comment_text` |
 | **GET** | `/api/v1/analytics/overview` | 账户整体运营数据（粉丝、阅读量、展现量指标） |
 | **GET** | `/api/v1/analytics/article` | 单篇文章阅读与交互明细统计 |
 | **GET** | `/api/v1/analytics/report` | 自动生成运营日报/周报/月报 |
@@ -234,9 +235,22 @@ go test -v -run "TestGetAccountTrendsManual|TestGetArticleDetailManual"
 ### 评论回复实现约定
 
 - MCP 工具 `get_comments` 用于读取评论列表，可传 `article_id`、`keyword`、`page_size`；`reply_comment` 用于回复评论。
-- `reply_comment` 必须提供 `reply_content`，并且 `comment_id` 与 `comment_text` 至少提供一个。若两者都传，会共同约束目标评论，降低误回复风险。
-- 评论管理优先通过头条后台浏览器自动化完成，不依赖未公开且可能频繁变化的评论回复 HTTP 接口。
-- 回复失败时会保存 `screenshot_comment_page_error.png`、`screenshot_comment_reply_not_found.png`、`screenshot_comment_reply_fill_error.png` 或 `screenshot_comment_reply_submit_error.png` 辅助分析。
+- `get_comments` 优先调用评论管理页真实使用的 `/comment/author_receive_comment/` 接口，并按游标继续翻页；DOM 抓取只作为接口失败时的兜底。每条结果均返回真实 `comment_id`、`article_id`、`user_name`、`content`、`create_time` 和 `reply_count`。
+- `reply_comment` 必须提供 `reply_content`，并且 `comment_id` 与 `comment_text` 至少提供一个。推荐优先传 `comment_id`；服务会先从真实接口补齐评论正文，再通过浏览器定位目标卡片。
+- 回复内容采用 go-rod 物理键入，并校验输入值和“发布”按钮状态。点击提交后会轮询真实接口，只有目标评论的 `reply_count` 增长后才返回 `success: true`，同时返回 `reply_count_before` 与 `reply_count_after`。
+- 回复失败时会保存 `screenshot_comment_page_error.png`、`screenshot_comment_reply_not_found.png`、`screenshot_comment_reply_fill_error.png`、`screenshot_comment_reply_submit_error.png` 或 `screenshot_comment_reply_verify_error.png` 辅助分析。
+
+评论列表响应中的核心字段示例：
+
+```json
+{
+  "comment_id": "7655725926924206911",
+  "article_id": "7655556701420061184",
+  "user_name": "示例用户",
+  "content": "评论正文",
+  "reply_count": 1
+}
+```
 
 ---
 
