@@ -231,11 +231,11 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 			time.Sleep(3 * time.Second)
 		}
 		if err := a.uploadCovers(decision.Covers, decision.Auto); err != nil {
-			return fmt.Errorf("封面上传失败，已中断发布以避免无封面误发布: %w", err)
+			return fmt.Errorf("封面上传失败，已中断发布以避免无封面或错误封面误发布: %w", err)
 		}
 	}
 	if err := a.clearBlockingCoverWarning(); err != nil {
-		log.Warnf("处理封面校验警告失败: %v", err)
+		return fmt.Errorf("封面校验失败，已中断发布以避免降级为无封面: %w", err)
 	}
 
 	// 设置原创标记
@@ -255,8 +255,17 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 		log.Info("检测到 SaveAsDraft 为 true，等待自动保存草稿并退出...")
 		time.Sleep(8 * time.Second)
 	} else {
-		if err := a.clickPublish(opts); err != nil {
-			return fmt.Errorf("failed to publish: %w", err)
+		if opts != nil && hasPublishTime(opts.PublishTime) {
+			if err := setPublishTime(a.page, opts.PublishTime); err != nil {
+				return fmt.Errorf("failed to set scheduled publish time: %w", err)
+			}
+			if err := waitForPublishResult(a.page, 90*time.Second); err != nil {
+				return fmt.Errorf("failed to confirm scheduled publish result: %w", err)
+			}
+		} else {
+			if err := a.clickPublish(opts); err != nil {
+				return fmt.Errorf("failed to publish: %w", err)
+			}
 		}
 	}
 
@@ -926,32 +935,56 @@ func (a *ArticlePublishAction) dismissObstacles() {
 }
 
 func (a *ArticlePublishAction) uploadFileThroughChooser(localPath, markerClass string) error {
-	setFiles, err := a.page.HandleFileDialog()
-	if err != nil {
-		return fmt.Errorf("初始化 Chrome 文件选择器拦截失败: %w", err)
-	}
+	const chooserTimeout = 15 * time.Second
 
-	done := make(chan error, 1)
-	go func() {
-		done <- setFiles([]string{localPath})
-	}()
-
-	if err := a.clickCurrentUploadTrigger(markerClass, 5*time.Second); err != nil {
-		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
-		return err
-	}
-
-	select {
-	case err := <-done:
+	attemptUpload := func(attempt int, clickTrigger func() error) error {
+		setFiles, err := a.page.HandleFileDialog()
 		if err != nil {
-			return fmt.Errorf("Chrome 文件选择器写入文件失败: %w", err)
+			return fmt.Errorf("第 %d 次初始化 Chrome 文件选择器拦截失败: %w", attempt, err)
 		}
-		log.Infof("Chrome 文件选择器已接收文件: %s", localPath)
-		return nil
-	case <-time.After(8 * time.Second):
-		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
-		return fmt.Errorf("等待 Chrome 文件选择器弹出超时")
+
+		done := make(chan error, 1)
+		go func() {
+			done <- setFiles([]string{localPath})
+		}()
+
+		if err := clickTrigger(); err != nil {
+			_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+			return fmt.Errorf("第 %d 次点击上传触发器失败: %w", attempt, err)
+		}
+
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("第 %d 次 Chrome 文件选择器写入文件失败: %w", attempt, err)
+			}
+			log.Infof("Chrome 文件选择器已接收文件（第 %d 次尝试）: %s", attempt, localPath)
+			return nil
+		case <-time.After(chooserTimeout):
+			_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+			return fmt.Errorf("第 %d 次等待 Chrome 文件选择器弹出超时（%s）", attempt, chooserTimeout)
+		}
 	}
+
+	if err := attemptUpload(1, func() error {
+		return a.clickCurrentUploadTrigger(markerClass, 5*time.Second)
+	}); err == nil {
+		return nil
+	} else {
+		log.Warnf("正文图片按钮触发上传失败，准备改点真实 file input 重试: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	if err := attemptUpload(2, func() error {
+		return a.clickCurrentUploadFileInput(markerClass+"-input", 5*time.Second)
+	}); err != nil {
+		log.Warnf("正文图片 Chrome 文件选择器重试失败，尝试直接设置当前上传面板 file input: %v", err)
+		if directErr := a.setCurrentUploadFileInput(localPath, markerClass+"-direct-input", 5*time.Second); directErr != nil {
+			return fmt.Errorf("正文图片上传重试失败: %w；直接 SetFiles 兜底也失败: %v", err, directErr)
+		}
+		log.Infof("正文图片已通过当前上传面板 file input 直接 SetFiles: %s", localPath)
+	}
+	return nil
 }
 
 func (a *ArticlePublishAction) uploadCoverFileThroughChooser(localPath string, slotEl *rod.Element, imageIndex int) error {
@@ -970,7 +1003,7 @@ func (a *ArticlePublishAction) uploadCoverFileThroughChooser(localPath string, s
 		return err
 	}
 
-	if completed, err := waitFileChooserDone(done, 1500*time.Millisecond); completed {
+	if completed, err := waitFileChooserDone(done, 2500*time.Millisecond); completed {
 		if err != nil {
 			return fmt.Errorf("Chrome 文件选择器写入封面文件失败: %w", err)
 		}
@@ -996,9 +1029,28 @@ func (a *ArticlePublishAction) uploadCoverFileThroughChooser(localPath string, s
 		return nil
 	}
 
-	if err := a.clickCurrentUploadTrigger("mcp-cover-local-upload-trigger", 5*time.Second); err != nil {
+	if !a.hasVisibleUploadPanel() {
+		log.Warnf("封面图片上传：点击封面槽 %d 后仍未检测到上传面板，尝试点击封面区域内上传/替换按钮", imageIndex)
+		if err := a.clickCoverUploadControl("mcp-cover-area-upload-control", 5*time.Second); err != nil {
+			log.Warnf("封面区域上传按钮兜底未命中: %v", err)
+		}
+		if completed, err := waitFileChooserDone(done, 2500*time.Millisecond); completed {
+			if err != nil {
+				return fmt.Errorf("Chrome 文件选择器写入封面文件失败: %w", err)
+			}
+			log.Infof("Chrome 文件选择器已通过封面区域按钮接收封面文件: %s", localPath)
+			return nil
+		}
+	}
+
+	if err := a.clickCurrentUploadTrigger("mcp-cover-local-upload-trigger", 10*time.Second); err != nil {
 		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
-		return fmt.Errorf("封面槽 %d 未打开可用上传面板或本地上传按钮: %w", imageIndex, err)
+		log.Warnf("封面槽 %d Chrome 文件选择触发失败，尝试直接设置当前上传面板 file input: %v", imageIndex, err)
+		if directErr := a.setCurrentUploadFileInput(localPath, fmt.Sprintf("mcp-cover-direct-input-%d", imageIndex), 5*time.Second); directErr != nil {
+			return fmt.Errorf("封面槽 %d 未打开可用上传面板或本地上传按钮: %w；直接 SetFiles 兜底也失败: %v", imageIndex, err, directErr)
+		}
+		log.Infof("封面图片已通过当前上传面板 file input 直接 SetFiles: %s", localPath)
+		return nil
 	}
 
 	select {
@@ -1008,10 +1060,79 @@ func (a *ArticlePublishAction) uploadCoverFileThroughChooser(localPath string, s
 		}
 		log.Infof("Chrome 文件选择器已接收封面文件: %s", localPath)
 		return nil
-	case <-time.After(8 * time.Second):
+	case <-time.After(15 * time.Second):
 		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
-		return fmt.Errorf("等待封面 Chrome 文件选择器弹出超时")
+		log.Warnf("等待封面 Chrome 文件选择器弹出超时，尝试直接设置当前上传面板 file input")
+		if directErr := a.setCurrentUploadFileInput(localPath, fmt.Sprintf("mcp-cover-direct-input-%d", imageIndex), 5*time.Second); directErr != nil {
+			return fmt.Errorf("等待封面 Chrome 文件选择器弹出超时；直接 SetFiles 兜底也失败: %w", directErr)
+		}
+		log.Infof("封面图片已通过当前上传面板 file input 直接 SetFiles: %s", localPath)
+		return nil
 	}
+}
+
+func (a *ArticlePublishAction) clickCoverUploadControl(markerClass string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastScan string
+	for time.Now().Before(deadline) {
+		scanRes, _ := a.page.Eval(`(markerClass) => {
+			document.querySelectorAll('.' + markerClass).forEach(el => el.classList.remove(markerClass));
+			const visible = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			};
+			const clean = (el) => (el.textContent || el.getAttribute('title') || el.getAttribute('aria-label') || '').replace(/\s+/g, '').trim();
+			const group = document.querySelector('.article-cover-radio-group');
+			const roots = [];
+			if (group) {
+				let p = group;
+				for (let i = 0; i < 5 && p; i++, p = p.parentElement) roots.push(p);
+			}
+			roots.push(...Array.from(document.querySelectorAll('[class*="cover" i], [class*="article-cover" i]')).filter(visible));
+			const unique = Array.from(new Set(roots)).filter(visible);
+			const debug = [];
+			for (const root of unique) {
+				const controls = Array.from(root.querySelectorAll('button, [role="button"], a, label, span, div, input[type="file"]')).filter(el => {
+					if (el.matches('input[type="file"]')) return true;
+					return visible(el);
+				});
+				debug.push({
+					root: String(root.className || root.tagName).slice(0, 80),
+					text: clean(root).slice(0, 80),
+					controls: controls.map(el => ({tag: el.tagName, className: String(el.className || '').slice(0, 60), text: clean(el).slice(0, 30)})).slice(0, 12)
+				});
+				let target = controls.find(el => {
+					if (!el.matches('button, [role="button"], a, label, span, div')) return false;
+					const text = clean(el);
+					if (!text || text === '预览' || text.includes('预览')) return false;
+					return text === '本地上传' || text === '上传' || text === '上传封面' || text === '添加封面' ||
+						text === '编辑' || text === '修改' || text === '替换' || text.includes('本地上传') ||
+						text.includes('上传封面') || text.includes('添加封面') || text.includes('替换');
+				});
+				if (!target) {
+					const input = controls.find(el => el.matches('input[type="file"]'));
+					if (input) target = input.closest('button, label, [role="button"], [class*="upload" i], [class*="cover" i]') || input;
+				}
+				if (target && visible(target)) {
+					target.scrollIntoView({ block: 'center', inline: 'center' });
+					target.classList.add(markerClass);
+					return JSON.stringify({found:true, target:{tag:target.tagName, className:String(target.className || '').slice(0, 80), text:clean(target).slice(0, 50)}, debug});
+				}
+			}
+			return JSON.stringify({found:false, debug});
+		}`, markerClass)
+		if scanRes != nil {
+			lastScan = scanRes.Value.Str()
+		}
+		if err := physicalClickMarkedElement(a.page, "."+markerClass); err == nil {
+			log.Infof("封面区域上传按钮点击成功，扫描结果: %s", lastScan)
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("未找到封面区域上传/替换按钮，最后扫描结果: %s", lastScan)
 }
 
 func waitFileChooserDone(done <-chan error, timeout time.Duration) (bool, error) {
@@ -1024,43 +1145,270 @@ func waitFileChooserDone(done <-chan error, timeout time.Duration) (bool, error)
 }
 
 func (a *ArticlePublishAction) clickCurrentUploadTrigger(markerClass string, timeout time.Duration) error {
-	_, _ = a.page.Eval(`(markerClass) => {
-		document.querySelectorAll('.' + markerClass).forEach(el => el.classList.remove(markerClass));
-		const visible = (el) => {
-			if (!el) return false;
-			const style = window.getComputedStyle(el);
-			const rect = el.getBoundingClientRect();
-			return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-		};
-		const panels = Array.from(document.querySelectorAll('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"], [class*="drawer"]'))
-			.filter(visible);
-		for (const panel of panels) {
-			const controls = Array.from(panel.querySelectorAll('button, [role="button"], label, .upload-handler, input[type="file"]')).filter(visible);
-			let trigger = controls.find(el => (el.textContent || '').trim().includes('本地上传'));
-			if (!trigger) {
-				const input = panel.querySelector('input[type="file"]');
-				if (input) trigger = input.closest('button, label, [role="button"], .upload-handler') || input;
+	deadline := time.Now().Add(timeout)
+	var lastScan string
+	for time.Now().Before(deadline) {
+		scanRes, _ := a.page.Eval(`(markerClass) => {
+			document.querySelectorAll('.' + markerClass).forEach(el => el.classList.remove(markerClass));
+			const visible = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			};
+			const clean = (el) => (el.textContent || '').replace(/\s+/g, '').trim();
+			let roots = Array.from(document.querySelectorAll(
+				'.upload-image-panel, .upload-handler-drag, .pgc-ic-image-tab-scope, .mp-ic-img-drawer, ' +
+				'.byte-drawer.primary-drawer, .byte-modal, .semi-modal, [role="dialog"], ' +
+				'[class*="modal"], [class*="dialog"], [class*="drawer"]'
+			))
+				.filter(visible)
+				.sort((a, b) => {
+					const za = Number(window.getComputedStyle(a).zIndex) || 0;
+					const zb = Number(window.getComputedStyle(b).zIndex) || 0;
+					if (za !== zb) return zb - za;
+					const ra = a.getBoundingClientRect();
+					const rb = b.getBoundingClientRect();
+					return (rb.width * rb.height) - (ra.width * ra.height);
+				});
+			if (!roots.length) {
+				const activePanel = document.querySelector(
+					'.byte-tabs-content-item-active .upload-image-panel, ' +
+					'.byte-tabs-content-item-active [data-e2e="image-upload"], ' +
+					'.btn-upload-scand[data-e2e="image-upload"]'
+				);
+				if (activePanel) roots = [activePanel];
 			}
-			if (trigger) {
-				trigger.classList.add(markerClass);
-				return true;
-			}
-		}
-		return false;
-	}`, markerClass)
+			const debug = [];
+			for (const root of roots) {
+				const controls = Array.from(root.querySelectorAll(
+					'button.upload-btn, .btns-wrapper button, [data-e2e="image-upload"] button, ' +
+					'button, [role="button"], label, .upload-handler, input[type="file"]'
+				))
+					.filter(el => visible(el) || el.matches('input[type="file"]'));
+				debug.push({
+					root: String(root.className || root.getAttribute('role') || root.tagName).slice(0, 100),
+					text: clean(root).slice(0, 60),
+					controls: controls.map(el => ({ tag: el.tagName, className: String(el.className || '').slice(0, 70), text: clean(el).slice(0, 30) })).slice(0, 8)
+				});
 
-	trigger, err := a.page.Timeout(timeout).Element("." + markerClass)
-	if err != nil {
-		return fmt.Errorf("未找到当前上传面板的“本地上传”触发按钮: %w", err)
+				// 必须命中真正的“本地上传”按钮。不能把包含两个上传按钮的
+				// .btn-upload-scand 大容器当作触发器，否则点击中心点会落在按钮间隙。
+				let trigger = controls.find(el =>
+					el.matches('button, [role="button"], label') && clean(el) === '本地上传'
+				);
+				if (!trigger) {
+					trigger = controls.find(el =>
+						el.matches('button, [role="button"], label') &&
+						clean(el).startsWith('本地上传') &&
+						!clean(el).includes('扫码上传')
+					);
+				}
+				if (!trigger) {
+					const inputs = Array.from(root.querySelectorAll('input[type="file"]'));
+					const localInput = inputs.find(input => {
+						const button = input.closest('button, label, [role="button"]');
+						return button && clean(button).startsWith('本地上传') && !clean(button).includes('扫码上传');
+					});
+					if (localInput) {
+						trigger = localInput.closest('button, label, [role="button"]');
+					}
+				}
+				if (trigger) {
+					trigger.classList.add(markerClass);
+					return JSON.stringify({
+						found: true,
+						trigger: {
+							tag: trigger.tagName,
+							className: String(trigger.className || '').slice(0, 100),
+							text: clean(trigger).slice(0, 50),
+							hasFileInput: Boolean(trigger.querySelector('input[type="file"]'))
+						},
+						debug
+					});
+				}
+			}
+			return JSON.stringify({ found: false, debug });
+		}`, markerClass)
+		if scanRes != nil {
+			lastScan = scanRes.Value.Str()
+		}
+
+		trigger, err := a.page.Timeout(250 * time.Millisecond).Element("." + markerClass)
+		if err == nil && trigger != nil {
+			trigger = trigger.CancelTimeout()
+			log.Infof("上传触发器扫描结果: %s", lastScan)
+			return a.clickElementLikeUser(trigger, "上传触发器")
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
-	trigger = trigger.CancelTimeout()
-	return a.clickElementLikeUser(trigger, "上传触发器")
+	return fmt.Errorf("未找到当前上传面板的“本地上传”触发按钮，最后扫描结果: %s", lastScan)
+}
+
+func (a *ArticlePublishAction) clickCurrentUploadFileInput(markerClass string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastScan string
+	for time.Now().Before(deadline) {
+		scanRes, _ := a.page.Eval(`(markerClass) => {
+			document.querySelectorAll('.' + markerClass).forEach(el => el.classList.remove(markerClass));
+			const visibleShape = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' &&
+					style.pointerEvents !== 'none' && rect.width > 0 && rect.height > 0;
+			};
+			const clean = (el) => (el.textContent || '').replace(/\s+/g, '').trim();
+			const roots = Array.from(document.querySelectorAll(
+				'.upload-image-panel, .upload-handler-drag, .pgc-ic-image-tab-scope, .mp-ic-img-drawer, ' +
+				'.byte-drawer.primary-drawer, .byte-modal, .semi-modal, [role="dialog"], ' +
+				'[class*="modal"], [class*="dialog"], [class*="drawer"]'
+			)).filter(visibleShape);
+			const debug = [];
+			for (const root of roots) {
+				const inputs = Array.from(root.querySelectorAll('input[type="file"]'));
+				for (const input of inputs) {
+					const owner = input.closest('button, label, [role="button"], .upload-handler');
+					const ownerButton = input.closest('button, label, [role="button"]');
+					const ownerText = clean(ownerButton || owner);
+					const rect = input.getBoundingClientRect();
+					debug.push({
+						ownerText: ownerText.slice(0, 40),
+						ownerClass: String((ownerButton || owner)?.className || '').slice(0, 100),
+						width: rect.width,
+						height: rect.height,
+						accept: input.getAttribute('accept') || ''
+					});
+					if (!visibleShape(input)) continue;
+					if (!ownerText.startsWith('本地上传')) continue;
+					input.classList.add(markerClass);
+					return JSON.stringify({
+						found: true,
+						input: {
+							ownerText: ownerText.slice(0, 40),
+							width: rect.width,
+							height: rect.height,
+							accept: input.getAttribute('accept') || ''
+						},
+						debug
+					});
+				}
+			}
+			return JSON.stringify({ found: false, debug });
+		}`, markerClass)
+		if scanRes != nil {
+			lastScan = scanRes.Value.Str()
+		}
+
+		input, err := a.page.Timeout(250 * time.Millisecond).Element("." + markerClass)
+		if err == nil && input != nil {
+			input = input.CancelTimeout()
+			log.Infof("真实 file input 扫描结果: %s", lastScan)
+			return a.clickElementLikeUser(input, "本地上传 file input")
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("未找到当前上传面板内可物理点击的本地上传 file input，最后扫描结果: %s", lastScan)
+}
+
+func (a *ArticlePublishAction) setCurrentUploadFileInput(localPath, markerClass string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastScan string
+	for time.Now().Before(deadline) {
+		scanRes, _ := a.page.Eval(`(markerClass) => {
+			document.querySelectorAll('.' + markerClass).forEach(el => el.classList.remove(markerClass));
+			const visible = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			};
+			const clean = (el) => (el && (el.textContent || el.getAttribute('title') || el.getAttribute('aria-label')) || '').replace(/\s+/g, '').trim();
+			let roots = Array.from(document.querySelectorAll(
+				'.upload-image-panel, .upload-handler-drag, .pgc-ic-image-tab-scope, .mp-ic-img-drawer, ' +
+				'.byte-drawer.primary-drawer, .byte-modal, .semi-modal, [role="dialog"], ' +
+				'[class*="modal"], [class*="dialog"], [class*="drawer"]'
+			))
+				.filter(visible)
+				.sort((a, b) => {
+					const za = Number(window.getComputedStyle(a).zIndex) || 0;
+					const zb = Number(window.getComputedStyle(b).zIndex) || 0;
+					if (za !== zb) return zb - za;
+					const ra = a.getBoundingClientRect();
+					const rb = b.getBoundingClientRect();
+					return (rb.width * rb.height) - (ra.width * ra.height);
+				});
+			if (!roots.length) {
+				const activePanel = document.querySelector(
+					'.byte-tabs-content-item-active .upload-image-panel, ' +
+					'.byte-tabs-content-item-active [data-e2e="image-upload"], ' +
+					'.btn-upload-scand[data-e2e="image-upload"]'
+				);
+				if (activePanel) roots = [activePanel];
+			}
+			const debug = [];
+			for (const root of roots) {
+				const inputs = Array.from(root.querySelectorAll('input[type="file"]'));
+				const ranked = inputs.map(input => {
+					const owner = input.closest('button, label, [role="button"], .upload-handler, [class*="upload" i]') || input.parentElement || input;
+					const ownerText = clean(owner);
+					const accept = input.getAttribute('accept') || '';
+					const rect = input.getBoundingClientRect();
+					let score = 0;
+					if (ownerText.includes('本地上传')) score += 50;
+					if (!ownerText.includes('扫码')) score += 20;
+					if (/image|png|jpg|jpeg|webp/i.test(accept)) score += 10;
+					if (rect.width > 0 || rect.height > 0) score += 5;
+					return {input, ownerText, accept, score, width: rect.width, height: rect.height};
+				}).sort((a, b) => b.score - a.score);
+				debug.push({
+					root: String(root.className || root.getAttribute('role') || root.tagName).slice(0, 100),
+					text: clean(root).slice(0, 60),
+					inputs: ranked.map(x => ({ ownerText: x.ownerText.slice(0, 40), accept: x.accept, score: x.score, width: x.width, height: x.height })).slice(0, 8)
+				});
+				const target = ranked.find(x => x.score >= 10) || ranked[0];
+				if (target && target.input) {
+					target.input.classList.add(markerClass);
+					return JSON.stringify({found:true, target:{ownerText:target.ownerText.slice(0, 50), accept:target.accept, score:target.score}, debug});
+				}
+			}
+			return JSON.stringify({found:false, debug});
+		}`, markerClass)
+		if scanRes != nil {
+			lastScan = scanRes.Value.Str()
+		}
+
+		input, err := a.page.Timeout(250 * time.Millisecond).Element("." + markerClass)
+		if err == nil && input != nil {
+			input = input.CancelTimeout()
+			log.Infof("直接 SetFiles file input 扫描结果: %s", lastScan)
+			if err := input.SetFiles([]string{localPath}); err != nil {
+				return fmt.Errorf("SetFiles 写入文件失败: %w，扫描结果: %s", err, lastScan)
+			}
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("未找到当前上传面板内 file input，最后扫描结果: %s", lastScan)
 }
 
 func (a *ArticlePublishAction) clickElementLikeUser(el *rod.Element, label string) error {
 	pt, err := el.Interactable()
 	if err == nil {
-		log.Infof("物理点击%s，坐标 (%f, %f)", label, pt.X, pt.Y)
+		hitInfo := ""
+		if res, evalErr := a.page.Eval(`(x, y) => {
+			const hit = document.elementFromPoint(x, y);
+			if (!hit) return '';
+			return JSON.stringify({
+				tag: hit.tagName,
+				className: String(hit.className || '').slice(0, 100),
+				type: hit.getAttribute('type') || '',
+				text: (hit.textContent || '').replace(/\s+/g, '').trim().slice(0, 40)
+			});
+		}`, pt.X, pt.Y); evalErr == nil && res != nil {
+			hitInfo = res.Value.Str()
+		}
+		log.Infof("物理点击%s，坐标 (%f, %f)，命中元素: %s", label, pt.X, pt.Y, hitInfo)
 		_ = a.page.Mouse.MoveTo(*pt)
 		_ = a.page.Mouse.Down(proto.InputMouseButtonLeft, 1)
 		_ = a.page.Mouse.Up(proto.InputMouseButtonLeft, 1)
@@ -1091,6 +1439,16 @@ func (a *ArticlePublishAction) hasVisibleUploadPanel() bool {
 		return Array.from(document.querySelectorAll('.upload-image-panel, .byte-modal, .semi-modal, [role="dialog"], [class*="modal"], [class*="dialog"], [class*="drawer"]')).some(visible);
 	}`)
 	return err == nil && res != nil && res.Value.Bool()
+}
+
+func hasPublishTime(publishTime interface{}) bool {
+	if publishTime == nil {
+		return false
+	}
+	if value, ok := publishTime.(string); ok {
+		return strings.TrimSpace(value) != ""
+	}
+	return true
 }
 
 func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover bool) error {
@@ -1338,6 +1696,40 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 	return nil
 }
 
+func (a *ArticlePublishAction) useInlineImagesAsCover(inlineImages []string) error {
+	mode := "单图"
+	required := 1
+	if len(inlineImages) >= 3 {
+		mode = "三图"
+		required = 3
+	}
+
+	if err := a.setCoverMode(mode); err != nil {
+		return fmt.Errorf("切换正文配图封面模式 %s 失败: %w", mode, err)
+	}
+
+	log.Infof("等待正文图片自动回填 %s 封面槽...", mode)
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		filled := 0
+		for i := 0; i < required; i++ {
+			hasImage, err := a.checkCoverSlotHasImage(i)
+			if err != nil {
+				break
+			}
+			if hasImage {
+				filled++
+			}
+		}
+		if filled >= required {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return fmt.Errorf("平台未在 8 秒内从正文提取出 %d 张封面图", required)
+}
+
 func (a *ArticlePublishAction) clearBlockingCoverWarning() error {
 	res, err := a.page.Eval(`() => {
 		const text = document.body ? document.body.innerText || '' : '';
@@ -1349,12 +1741,7 @@ func (a *ArticlePublishAction) clearBlockingCoverWarning() error {
 		return err
 	}
 
-	log.Warn("检测到封面重复/读者体验校验警告，自动切换为无封面以解除发布阻塞")
-	if err := a.setCoverMode("无封面"); err != nil {
-		return fmt.Errorf("切换无封面失败: %w", err)
-	}
-	time.Sleep(1 * time.Second)
-	return nil
+	return fmt.Errorf("检测到封面重复或读者体验校验警告")
 }
 
 // checkCoverSlotHasImage 检查第 i 个封面插槽中是否已经有已上传的图片
@@ -1816,26 +2203,6 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	// 在最终点击发布按钮之前，再次执行 Mock 注入，确保在发布校验阶段全局数据和 API 请求安全
 	_, _ = a.page.Eval(StarOrderMockJS)
 
-	if opts != nil && opts.PublishTime != nil {
-		clickedSchedule, scheduleInfo, errSchedule := clickVisiblePageButtonByText(
-			a.page,
-			[]string{"定时发布", "预览并定时发布"},
-			[]string{"预览并发布", "确认发布", "确认发表", "返回编辑", "取消"},
-			"initial scheduled publish button",
-		)
-		if errSchedule == nil && scheduleInfo != "" {
-			log.Infof("定时发布首选按钮点击结果: %s", scheduleInfo)
-		}
-		if errSchedule == nil && clickedSchedule {
-			time.Sleep(1500 * time.Millisecond)
-			screenshotPath := "./publish_after_first_click.png"
-			_ = a.page.MustScreenshot(screenshotPath)
-			log.Infof("Saved first-click screenshot to: %s", screenshotPath)
-			return a.clickScheduledPublishConfirm(opts.PublishTime)
-		}
-		log.Warnf("未能直接点击编辑页定时发布按钮，将回退到预览并发布流程: %v", errSchedule)
-	}
-
 	// 1. 先查找我们将要点击的发布按钮
 	el, sel, err := findElement(a.page, 3*time.Second, ArticlePublishButtonSelectors)
 	if err != nil {
@@ -1935,10 +2302,6 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	time.Sleep(1 * time.Second) // 稍微等一秒再截图，防止截到空白
 	_ = a.page.MustScreenshot(screenshotPath)
 	log.Infof("Saved first-click screenshot to: %s", screenshotPath)
-
-	if opts != nil && opts.PublishTime != nil {
-		return a.clickScheduledPublishConfirm(opts.PublishTime)
-	}
 
 	// 关键判定：
 	// 若点击的按钮本身即为“发布”字样（如修改文章时的直发底栏），
@@ -2075,129 +2438,6 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	time.Sleep(1 * time.Second)
 
 	// 等待并检测发布结果，最多等待 90 秒（包含跳转时间）
-	return waitForPublishResult(a.page, 90*time.Second)
-}
-
-func (a *ArticlePublishAction) clickScheduledPublishConfirm(publishTime interface{}) error {
-	log.Info("检测到定时发布参数，进入预览确认页后的定时发布流程...")
-	var lastResult string
-
-	for i := 0; i < 20; i++ {
-		info, errInfo := a.page.Info()
-		if errInfo == nil && info != nil && !strings.Contains(info.URL, "/graphic/publish") {
-			log.Infof("定时发布确认前页面已跳转（当前 URL: %s），判定流程已提交", info.URL)
-			return nil
-		}
-
-		if modalEl, errModal := findExistingTimingModal(a.page, "scheduled-confirm-loop"); errModal == nil && modalEl != nil {
-			if err := setPublishTime(a.page, publishTime); err != nil {
-				lastResult = err.Error()
-				log.Errorf("预览页定时弹窗设置失败，中断本次提交以避免默认时间误发: %v", err)
-				return fmt.Errorf("设置定时发布时间失败: %w", err)
-			} else {
-				if err := waitForPublishResult(a.page, 25*time.Second); err != nil {
-					log.Warnf("定时发布提交后未检测到跳转或成功提示，继续交由发布后列表校验确认: %v", err)
-				}
-				return nil
-			}
-		}
-
-		onPreviewPage := false
-		previewRes, previewErr := a.page.Eval(`() => {
-			const text = document.body ? (document.body.innerText || '').replace(/\s+/g, '') : '';
-			return text.includes('返回编辑') &&
-				(text.includes('确认发布') || text.includes('发布文章') || text.includes('定时发布') || text.includes('预览并定时发布'));
-		}`)
-		if previewErr == nil && previewRes != nil {
-			onPreviewPage = previewRes.Value.Bool()
-		}
-		if !onPreviewPage {
-			if i == 6 {
-				clickedPreview, previewInfo, errPreview := clickVisiblePageButtonByText(
-					a.page,
-					[]string{"预览并发布", "发布"},
-					[]string{"定时发布", "预览并定时发布", "确认发布", "返回编辑", "取消"},
-					"scheduled fallback preview publish button",
-				)
-				if errPreview == nil && previewInfo != "" {
-					lastResult = previewInfo
-					log.Warnf("定时发布按钮未触发弹窗或确认页，已改点预览并发布兜底: %s", previewInfo)
-				}
-				if errPreview == nil && clickedPreview {
-					time.Sleep(1500 * time.Millisecond)
-					continue
-				}
-				log.Warnf("点击发布主按钮后仍未进入预览确认页，跳过定时设置并等待页面发布结果。最后状态: %s", lastResult)
-				return waitForPublishResult(a.page, 45*time.Second)
-			}
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
-		clicked, infoClick, errClick := clickVisiblePageButtonByText(
-			a.page,
-			[]string{"预览并定时发布", "定时发布"},
-			[]string{"预览并发布", "确认发布", "确认发表", "立即发布", "返回编辑", "取消"},
-			"scheduled publish confirm page",
-		)
-		if errClick == nil && infoClick != "" {
-			lastResult = infoClick
-		}
-		if errClick == nil && clicked {
-			log.Infof("已点击预览确认页定时发布按钮: %s", infoClick)
-			time.Sleep(1500 * time.Millisecond)
-			if err := setPublishTime(a.page, publishTime); err != nil {
-				lastResult = err.Error()
-				log.Errorf("点击定时发布按钮后设置时间失败，中断本次提交以避免默认时间误发: %v", err)
-				return fmt.Errorf("设置定时发布时间失败: %w", err)
-			} else {
-				if err := waitForPublishResult(a.page, 25*time.Second); err != nil {
-					log.Warnf("定时发布提交后未检测到跳转或成功提示，继续交由发布后列表校验确认: %v", err)
-				}
-				return nil
-			}
-		}
-
-		clickedConfirm, confirmInfo, errConfirm := clickVisiblePageButtonByText(
-			a.page,
-			[]string{"确认发布", "确定发布", "发布文章", "发布"},
-			[]string{"预览并发布", "预览并定时发布", "返回编辑", "取消"},
-			"scheduled publish fallback confirm page",
-		)
-		if errConfirm == nil && confirmInfo != "" {
-			lastResult = confirmInfo
-		}
-		if errConfirm == nil && clickedConfirm {
-			log.Warnf("预览确认页未找到定时发布按钮，已降级点击确认发布: %s", confirmInfo)
-			return waitForPublishResult(a.page, 90*time.Second)
-		}
-
-		if i == 5 || i == 12 {
-			resRetry, errRetry := a.page.Eval(`() => {
-				const visible = (el) => {
-					if (!el) return false;
-					const style = window.getComputedStyle(el);
-					const rect = el.getBoundingClientRect();
-					return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-				};
-				const btn = Array.from(document.querySelectorAll('button, [role="button"], .byte-btn, .semi-button')).find(el => {
-					const text = (el.textContent || '').replace(/\s+/g, '').trim();
-					return visible(el) && (text === '预览并发布' || text === '预览并定时发布');
-				});
-				if (!btn) return JSON.stringify({ clicked: false });
-				btn.click();
-				return JSON.stringify({ clicked: true, text: (btn.textContent || '').trim() });
-			}`)
-			if errRetry == nil && resRetry != nil {
-				log.Infof("定时发布流程重试底部主按钮结果: %s", resRetry.Value.Str())
-				lastResult = resRetry.Value.Str()
-			}
-		}
-
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	log.Warnf("定时发布确认按钮未能完成点击或识别，最后结果: %s", lastResult)
 	return waitForPublishResult(a.page, 90*time.Second)
 }
 
@@ -2503,8 +2743,17 @@ func (a *ArticlePublishAction) Update(ctx context.Context, articleID string, tit
 		log.Info("检测到 SaveAsDraft 为 true，等待自动保存草稿并退出...")
 		time.Sleep(8 * time.Second)
 	} else {
-		if err := a.clickPublish(opts); err != nil {
-			return fmt.Errorf("failed to publish updated article: %w", err)
+		if opts != nil && hasPublishTime(opts.PublishTime) {
+			if err := setPublishTime(a.page, opts.PublishTime); err != nil {
+				return fmt.Errorf("failed to set updated article scheduled publish time: %w", err)
+			}
+			if err := waitForPublishResult(a.page, 90*time.Second); err != nil {
+				return fmt.Errorf("failed to confirm updated article scheduled publish result: %w", err)
+			}
+		} else {
+			if err := a.clickPublish(opts); err != nil {
+				return fmt.Errorf("failed to publish updated article: %w", err)
+			}
 		}
 	}
 

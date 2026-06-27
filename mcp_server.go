@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -79,6 +82,27 @@ type DeleteArticleArgs struct {
 // GetArticleStatsArgs 文章统计参数
 type GetArticleStatsArgs struct {
 	ArticleID string `json:"article_id" jsonschema_description:"文章ID"`
+}
+
+// GetCommentsArgs 获取评论列表参数
+type GetCommentsArgs struct {
+	ArticleID string `json:"article_id,omitempty" jsonschema_description:"可选。文章 ID，用于优先筛选指定文章下的评论"`
+	Keyword   string `json:"keyword,omitempty" jsonschema_description:"可选。评论内容关键词，用于缩小定位范围"`
+	PageSize  int    `json:"page_size,omitempty" jsonschema_description:"可选。最多返回条数，默认20"`
+}
+
+// ProbeCommentManageArgs 评论管理页诊断参数
+type ProbeCommentManageArgs struct {
+	ArticleID string `json:"article_id,omitempty" jsonschema_description:"可选。文章 ID / group_id，用于尝试带作品过滤的评论管理页"`
+	WaitMS    int    `json:"wait_ms,omitempty" jsonschema_description:"可选。额外等待毫秒数，最多25000"`
+}
+
+// ReplyCommentArgs 回复评论参数
+type ReplyCommentArgs struct {
+	ArticleID    string `json:"article_id,omitempty" jsonschema_description:"可选。文章 ID，用于缩小评论定位范围"`
+	CommentID    string `json:"comment_id,omitempty" jsonschema_description:"可选。评论 ID。comment_id 和 comment_text 至少提供一个"`
+	CommentText  string `json:"comment_text,omitempty" jsonschema_description:"可选。评论原文片段，用于没有 comment_id 时定位评论；和 comment_id 同时提供时作为二次约束"`
+	ReplyContent string `json:"reply_content" jsonschema_description:"要回复给用户的内容"`
 }
 
 // GenerateReportArgs 报告生成参数
@@ -302,6 +326,57 @@ func registerManageTools(server *mcp.Server, appServer *AppServer) {
 		}))
 
 	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_comments",
+		Description: "获取头条号评论列表，可按文章 ID 或评论关键词缩小范围。返回值可用于 reply_comment 的 comment_id/comment_text 参数。",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: true,
+		},
+	}, withPanicRecovery("get_comments",
+		func(ctx context.Context, req *mcp.CallToolRequest, args GetCommentsArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"article_id": args.ArticleID,
+				"keyword":    args.Keyword,
+				"page_size":  float64(args.PageSize),
+			}
+			result := appServer.handleGetComments(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "probe_comment_manage",
+		Description: "只读诊断头条号评论管理页是否真实挂载，返回页面状态、DOM计数和资源请求样本，用于排查评论页 shell/SPA 路由问题。",
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint: true,
+		},
+	}, withPanicRecovery("probe_comment_manage",
+		func(ctx context.Context, req *mcp.CallToolRequest, args ProbeCommentManageArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"article_id": args.ArticleID,
+				"wait_ms":    float64(args.WaitMS),
+			}
+			result := appServer.handleProbeCommentManage(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "reply_comment",
+		Description: "回复头条号用户评论。必须提供 reply_content，并用 comment_id 或 comment_text 定位目标评论；article_id 可用于缩小范围。",
+		Annotations: &mcp.ToolAnnotations{
+			DestructiveHint: boolPtr(true),
+		},
+	}, withPanicRecovery("reply_comment",
+		func(ctx context.Context, req *mcp.CallToolRequest, args ReplyCommentArgs) (*mcp.CallToolResult, any, error) {
+			argsMap := map[string]interface{}{
+				"article_id":    args.ArticleID,
+				"comment_id":    args.CommentID,
+				"comment_text":  args.CommentText,
+				"reply_content": args.ReplyContent,
+			}
+			result := appServer.handleReplyComment(ctx, argsMap)
+			return convertToMCPResult(result), nil, nil
+		}))
+
+	mcp.AddTool(server, &mcp.Tool{
 		Name:        "get_micro_posts",
 		Description: "获取微头条内容列表，支持按状态筛选（all/published/draft/review）",
 		Annotations: &mcp.ToolAnnotations{
@@ -396,6 +471,135 @@ func registerAnalyticsTools(server *mcp.Server, appServer *AppServer) {
 
 func boolPtr(b bool) *bool { return &b }
 
+const friendlyMCPProtocolVersion = "2024-11-05"
+
+type bufferedMCPResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newBufferedMCPResponseWriter() *bufferedMCPResponseWriter {
+	return &bufferedMCPResponseWriter{header: make(http.Header)}
+}
+
+func (w *bufferedMCPResponseWriter) Header() http.Header { return w.header }
+
+func (w *bufferedMCPResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *bufferedMCPResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(data)
+}
+
+func writeMCPJSONRPCError(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Mcp-Protocol-Version", friendlyMCPProtocolVersion)
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      nil,
+		"error": map[string]interface{}{
+			"code":    -32000,
+			"message": message,
+		},
+	})
+}
+
+func postRequiresMCPSession(r *http.Request) bool {
+	if r.Method != http.MethodPost || r.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return false
+	}
+
+	var payload interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	isInitialize := func(value interface{}) bool {
+		request, ok := value.(map[string]interface{})
+		return ok && request["method"] == "initialize"
+	}
+
+	switch value := payload.(type) {
+	case map[string]interface{}:
+		return !isInitialize(value)
+	case []interface{}:
+		if len(value) == 0 {
+			return false
+		}
+		for _, request := range value {
+			if !isInitialize(request) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func isMCPInitializeRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost || r.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	var request map[string]interface{}
+	return json.Unmarshal(body, &request) == nil && request["method"] == "initialize"
+}
+
+func injectMCPSessionID(body []byte, sessionID string) []byte {
+	if sessionID == "" || len(bytes.TrimSpace(body)) == 0 {
+		return body
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return body
+	}
+	if result, ok := response["result"].(map[string]interface{}); ok {
+		result["_session_id"] = sessionID
+	} else {
+		response["__session_id"] = sessionID
+	}
+	updated, err := json.Marshal(response)
+	if err != nil {
+		return body
+	}
+	return append(updated, '\n')
+}
+
+func flushBufferedMCPResponse(w http.ResponseWriter, response *bufferedMCPResponseWriter, body []byte) {
+	for key, values := range response.header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.Header().Del("Content-Length")
+	status := response.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
 // NewMCPHTTPHandler 创建 MCP HTTP Handler
 func NewMCPHTTPHandler(appServer *AppServer) http.Handler {
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
@@ -433,7 +637,35 @@ func NewMCPHTTPHandler(appServer *AppServer) http.Handler {
 			}
 		}
 
-		mcpHandler.ServeHTTP(w, r)
+		sessionID := r.Header.Get("Mcp-Session-Id")
+		initializeRequest := isMCPInitializeRequest(r)
+		if r.Method == http.MethodGet && sessionID == "" {
+			writeMCPJSONRPCError(w, "GET /mcp 需要 Mcp-Session-Id header，请先从 POST /mcp initialize 获取 session id")
+			return
+		}
+		if sessionID == "" && postRequiresMCPSession(r) {
+			writeMCPJSONRPCError(w, "需要 Mcp-Session-Id header，请先调用 initialize 获取")
+			return
+		}
+
+		// GET 是 SSE 长连接，必须直接透传。POST 使用缓冲响应以便将 initialize
+		// 返回头中的 session id 同步注入 JSON body，并改写 SDK 的生硬会话错误。
+		if r.Method != http.MethodPost {
+			mcpHandler.ServeHTTP(w, r)
+			return
+		}
+
+		response := newBufferedMCPResponseWriter()
+		mcpHandler.ServeHTTP(response, r)
+		responseBody := response.body.Bytes()
+		if response.status == http.StatusNotFound && strings.Contains(string(responseBody), "session not found") {
+			writeMCPJSONRPCError(w, "Mcp-Session-Id 无效或已过期，请先调用 initialize 获取新的 session id")
+			return
+		}
+		if initializeRequest {
+			responseBody = injectMCPSessionID(responseBody, response.header.Get("Mcp-Session-Id"))
+		}
+		flushBufferedMCPResponse(w, response, responseBody)
 	})
 }
 

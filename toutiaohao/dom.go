@@ -1277,7 +1277,7 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 			}`)
 			time.Sleep(800 * time.Millisecond)
 
-			clickRes, _ := page.Eval(`(targets) => {
+			clickRes, _ := page.Eval(`async (targets, kind) => {
 				const visible = (el) => {
 					if (!el) return false;
 					const style = window.getComputedStyle(el);
@@ -1286,22 +1286,60 @@ func setPublishTime(page *rod.Page, publishTime interface{}) error {
 				};
 				const clean = (el) => (el.textContent || '').replace(/\s+/g, '').trim();
 				const wanted = new Set(targets.map(t => String(t).replace(/\s+/g, '').trim()).filter(Boolean));
-				let options = Array.from(document.querySelectorAll('.byte-select-option, [class*="select-option"], [role="option"], li, div, span'))
+				const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+				const findOptions = () => {
+					let options = Array.from(document.querySelectorAll('.byte-select-option, [class*="select-option"], [role="option"], li, div, span'))
+						.filter(visible)
+						.filter(el => {
+							const text = clean(el);
+							if (!text || text.length > 12) return false;
+							return wanted.has(text);
+						});
+					return options.filter(el => !Array.from(el.children || []).some(child => wanted.has(clean(child))));
+				};
+				const clickOption = (opt) => {
+					opt.scrollIntoView({ block: 'center', inline: 'center' });
+					const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+					events.forEach(name => opt.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window })));
+				};
+				const scrollContainers = () => Array.from(document.querySelectorAll('.byte-select-dropdown, [class*="select-dropdown"], [class*="select-popup"], [class*="trigger"], [role="listbox"], ul, div'))
 					.filter(visible)
-					.filter(el => {
-						const text = clean(el);
-						if (!text || text.length > 12) return false;
-						return wanted.has(text);
-					});
-				options = options.filter(el => !Array.from(el.children || []).some(child => wanted.has(clean(child))));
-				const debug = options.map(el => ({ text: clean(el), className: String(el.className || '').slice(0, 80) })).slice(0, 10);
-				const opt = options[0];
-				if (!opt) return JSON.stringify({ clicked: false, targets, debug });
-				opt.scrollIntoView({ block: 'center', inline: 'center' });
-				const events = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
-				events.forEach(name => opt.dispatchEvent(new MouseEvent(name, { bubbles: true, cancelable: true, view: window })));
-				return JSON.stringify({ clicked: true, text: clean(opt), targets, debug });
-			}`, targets)
+					.filter(el => el.scrollHeight > el.clientHeight + 4);
+				const desiredNums = targets.map(t => parseInt(String(t), 10)).filter(n => !Number.isNaN(n));
+				const desiredNum = desiredNums.length ? Math.min(...desiredNums) : null;
+				const containers = scrollContainers();
+				const debugSteps = [];
+				const tryFindAndClick = (stage) => {
+					const options = findOptions();
+					const debug = options.map(el => ({ text: clean(el), className: String(el.className || '').slice(0, 80) })).slice(0, 10);
+					debugSteps.push({ stage, options: debug });
+					if (!options.length) return null;
+					clickOption(options[0]);
+					return { clicked: true, text: clean(options[0]), targets, debug: debugSteps };
+				};
+				let result = tryFindAndClick('initial');
+				if (result) return JSON.stringify(result);
+				for (const scroller of containers) {
+					const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+					let positions = [0, Math.floor(max * 0.25), Math.floor(max * 0.5), Math.floor(max * 0.75), max];
+					if (kind === 'minute' && desiredNum !== null) {
+						const ratio = Math.max(0, Math.min(59, desiredNum)) / 59;
+						positions = [Math.floor(max * ratio), 0, Math.floor(max * 0.25), Math.floor(max * 0.5), Math.floor(max * 0.75), max];
+					}
+					if (kind === 'hour' && desiredNum !== null) {
+						const ratio = Math.max(0, Math.min(23, desiredNum)) / 23;
+						positions = [Math.floor(max * ratio), 0, Math.floor(max * 0.5), max];
+					}
+					for (const pos of [...new Set(positions)]) {
+						scroller.scrollTop = pos;
+						scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+						await sleep(120);
+						result = tryFindAndClick('scroll:' + pos + '/' + max);
+						if (result) return JSON.stringify(result);
+					}
+				}
+				return JSON.stringify({ clicked: false, targets, debug: debugSteps.slice(-8) });
+			}`, targets, kind)
 			if clickRes != nil {
 				log.Infof("定时 %s 选项点击结果: %s", kind, clickRes.Value.Str())
 				if strings.Contains(clickRes.Value.Str(), `"clicked":true`) {

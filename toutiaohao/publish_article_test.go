@@ -34,6 +34,16 @@ func TestArticleValidation_TitleAtLimit(t *testing.T) {
 	}
 }
 
+func TestArticleValidation_TitleCountsUnicodeCharacters(t *testing.T) {
+	title := "国行iPhone用户等待AI功能"
+	if got := len([]rune(title)); got > 30 {
+		t.Fatalf("test title unexpectedly has %d characters", got)
+	}
+	if err := ValidateArticle(title, "content", nil); err != nil {
+		t.Fatalf("ValidateArticle() rejected a valid mixed Chinese/ASCII title: %v", err)
+	}
+}
+
 func TestArticleValidation_EmptyContent(t *testing.T) {
 	err := ValidateArticle("title", "", nil)
 	if err == nil {
@@ -155,5 +165,27 @@ func TestDecideArticleCoverPrioritizesCoverImage(t *testing.T) {
 	}
 	if len(decision.Covers) != 1 || decision.Covers[0] != "cover-image.png" {
 		t.Fatalf("covers = %#v, want cover_image priority", decision.Covers)
+	}
+}
+
+func TestHasPublishTime(t *testing.T) {
+	cases := []struct {
+		name  string
+		value interface{}
+		want  bool
+	}{
+		{name: "nil", value: nil, want: false},
+		{name: "empty string", value: "", want: false},
+		{name: "blank string", value: "  ", want: false},
+		{name: "formatted string", value: "2026-06-10 18:00", want: true},
+		{name: "unix timestamp", value: int64(1781085600), want: true},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasPublishTime(tt.value); got != tt.want {
+				t.Fatalf("hasPublishTime(%#v) = %v, want %v", tt.value, got, tt.want)
+			}
+		})
 	}
 }

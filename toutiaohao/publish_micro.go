@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -130,145 +131,247 @@ func (a *MicroPostAction) inputContent(content string) error {
 
 // uploadImages 上传图片
 func (a *MicroPostAction) uploadImages(images []string) error {
-	// 图片上传按钮选择器
-	uploadButtonSelectors := []string{
-		`//button[contains(@title, '图片')]`,
-		`//span[contains(text(), '图片')]/ancestor::button`,
-	}
-
-	// 1. 处理图片路径（将本地相对路径规范为绝对路径，或自动下载 HTTP/HTTPS 网络图片）
-	var localImages []string
-	var cleanups []func()
-	defer func() {
-		// 在全部上传动作完成后统一释放/清理临时下载的图片文件
-		for _, cleanup := range cleanups {
-			cleanup()
-		}
-	}()
-
-	for _, img := range images {
+	for idx, img := range images {
+		logMicroMemoryStats(fmt.Sprintf("准备上传微头条图片 %d/%d 前", idx+1, len(images)))
 		localPath, cleanup, err := downloadImageToTemp(img)
 		if err != nil {
 			return fmt.Errorf("准备图片失败 (%s): %w", img, err)
 		}
-		localImages = append(localImages, localPath)
-		cleanups = append(cleanups, cleanup)
+		if err := a.uploadSingleMicroImage(localPath, idx+1, len(images)); err != nil {
+			cleanup()
+			return err
+		}
+		cleanup()
+		logMicroMemoryStats(fmt.Sprintf("完成上传微头条图片 %d/%d 后", idx+1, len(images)))
 	}
 
-	// 2. 物理点击“图片”按钮以激活微头条图片上传弹窗
-	btnEl, sel, err := findElement(a.page, 3*time.Second, uploadButtonSelectors)
+	log.Info("微头条图片已全部成功插入")
+	return nil
+}
+
+func (a *MicroPostAction) uploadSingleMicroImage(localPath string, index, total int) error {
+	const chooserTimeout = 15 * time.Second
+	setFiles, err := a.page.HandleFileDialog()
 	if err != nil {
-		return fmt.Errorf("未找到图片上传按钮: %w", err)
+		return fmt.Errorf("初始化微头条 Chrome 文件选择器拦截失败: %w", err)
 	}
-	log.Infof("Found upload button using selector: %s", sel)
-	// 使用 JS 点击以防止 physical Click 导致的协程挂起阻塞
-	_, _ = btnEl.Eval(`() => this.click()`)
-	time.Sleep(2 * time.Second)
+	done := make(chan error, 1)
+	go func() {
+		done <- setFiles([]string{localPath})
+	}()
 
-	// 3. 寻找上传弹窗中激活的 file input（优先在按钮祖先节点范围内寻找，防范误抓全局其它隐藏的 file input）
-	var fileInput *rod.Element
-	curr := btnEl
-	for k := 0; k < 5; k++ {
-		parent, err := curr.Parent()
-		if err != nil || parent == nil {
-			break
+	if err := a.clickMicroImageUploadButton(5 * time.Second); err != nil {
+		_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+		return fmt.Errorf("点击微头条图片按钮失败: %w", err)
+	}
+
+	if completed, err := waitFileChooserDone(done, 2*time.Second); completed {
+		if err != nil {
+			return fmt.Errorf("Chrome 文件选择器写入微头条图片失败: %w", err)
 		}
-		curr = parent
-		el, err := curr.Element(`input[type='file']`)
-		if err == nil && el != nil {
-			fileInput = el
-			log.Infof("在上传按钮向上第 %d 层的祖先节点中匹配到了微头条专用的 file input", k+1)
-			break
+		log.Infof("Chrome 文件选择器已接收微头条图片 %d/%d: %s", index, total, localPath)
+	} else {
+		if err := a.clickMicroLocalUploadTrigger("mcp-micro-local-upload-trigger", 8*time.Second); err != nil {
+			_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+			return fmt.Errorf("未找到微头条上传面板的本地上传按钮: %w", err)
 		}
-	}
-
-	// 兜底：若局部未找到，再全局查找
-	if fileInput == nil {
-		log.Warn("在上传按钮局部区域内未找到 file input，尝试全局寻找...")
-		el, err := a.page.Timeout(3 * time.Second).Element(`input[type='file']`)
-		if err == nil && el != nil {
-			fileInput = el
-		}
-	}
-
-	if fileInput == nil {
-		return fmt.Errorf("点击上传按钮后未找到 file input 控件")
-	}
-	fileInput = fileInput.CancelTimeout()
-
-	_, _ = fileInput.Eval(`() => {
-		this.dataset.mcpOldStyle = this.getAttribute('style') || '';
-		this.style.display = 'block';
-		this.style.visibility = 'visible';
-		this.style.opacity = '1';
-		this.style.width = '100px';
-		this.style.height = '100px';
-		this.style.position = 'absolute';
-		this.style.top = '0';
-		this.style.left = '0';
-		this.style.zIndex = '99999';
-	}`)
-	log.Infof("正在向 file input 设置全部 %d 张图片...", len(localImages))
-	if err := fileInput.SetFiles(localImages); err != nil {
-		return fmt.Errorf("fileInput.SetFiles 失败: %w", err)
-	}
-	_, _ = fileInput.Eval(`() => {
-		this.dispatchEvent(new Event('input', { bubbles: true }));
-		this.dispatchEvent(new Event('change', { bubbles: true }));
-		if (this.dataset.mcpOldStyle !== undefined) {
-			this.setAttribute('style', this.dataset.mcpOldStyle);
-		}
-	}`)
-
-	// 5. 等待图片上传在弹窗中渲染完成
-	log.Info("等待图片上传并生成缩略图...")
-	time.Sleep(5 * time.Second)
-
-	// 6. 点击弹窗右下角的“确定”按钮以完成插入，循环检测直到弹窗成功关闭
-	log.Info("正在循环寻找并点击图片弹窗的“确定”按钮...")
-	confirmed := false
-	for k := 0; k < 10; k++ {
-		res, errEval := a.page.Eval(`() => {
-			// 精确寻找可见的“确定”或“确认”按钮
-			let elements = Array.from(document.querySelectorAll('button, span, div, a'));
-			let btn = elements.find(el => {
-				let text = el.textContent ? el.textContent.trim() : '';
-				let isBtnLike = el.tagName === 'BUTTON' || 
-				                el.classList.contains('byte-btn') || 
-				                el.classList.contains('semi-button') || 
-				                el.getAttribute('role') === 'button';
-				// 按钮必须可见，且文本为确切的“确定”或“确认”
-				return (text === '确定' || text === '确认') && isBtnLike && el.offsetWidth > 0;
-			});
-			if (btn) {
-				btn.click();
-				return true; // 找到并触发点击
+		select {
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("Chrome 文件选择器写入微头条图片失败: %w", err)
 			}
-			return false; // 未找到，可能弹窗已关闭
+			log.Infof("Chrome 文件选择器已接收微头条图片 %d/%d: %s", index, total, localPath)
+		case <-time.After(chooserTimeout):
+			_ = proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(a.page)
+			return fmt.Errorf("等待微头条 Chrome 文件选择器弹出超时（%s）", chooserTimeout)
+		}
+	}
+
+	if err := a.waitAndConfirmMicroImageUpload(index); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *MicroPostAction) clickMicroImageUploadButton(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastScan string
+	for time.Now().Before(deadline) {
+		res, _ := a.page.Eval(`() => {
+			document.querySelectorAll('.mcp-micro-upload-button').forEach(el => el.classList.remove('mcp-micro-upload-button'));
+			const visible = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			};
+			const clean = (el) => (el.textContent || el.getAttribute('title') || el.getAttribute('aria-label') || '').replace(/\s+/g, '').trim();
+			const candidates = Array.from(document.querySelectorAll('button, [role="button"], label, [title*="图片"], [aria-label*="图片"]')).filter(visible);
+			const debug = candidates.map(el => ({tag: el.tagName, className: String(el.className || '').slice(0, 80), text: clean(el).slice(0, 30)})).slice(0, 12);
+			let target = candidates.find(el => clean(el) === '图片' || clean(el) === '插入图片' || clean(el).includes('图片'));
+			if (!target) {
+				const span = Array.from(document.querySelectorAll('span')).filter(visible).find(el => clean(el).includes('图片'));
+				if (span) target = span.closest('button, [role="button"], label') || span;
+			}
+			if (target) {
+				target.scrollIntoView({ block: 'center', inline: 'center' });
+				target.classList.add('mcp-micro-upload-button');
+				return JSON.stringify({found:true, target:{tag:target.tagName, className:String(target.className || '').slice(0, 80), text:clean(target).slice(0, 40)}, debug});
+			}
+			return JSON.stringify({found:false, debug});
 		}`)
+		if res != nil {
+			lastScan = res.Value.Str()
+		}
+		if err := physicalClickMarkedElement(a.page, ".mcp-micro-upload-button"); err == nil {
+			log.Infof("微头条图片按钮点击成功，扫描结果: %s", lastScan)
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("未找到微头条图片上传按钮，最后扫描结果: %s", lastScan)
+}
 
+func (a *MicroPostAction) clickMicroLocalUploadTrigger(markerClass string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastScan string
+	for time.Now().Before(deadline) {
+		res, _ := a.page.Eval(`(markerClass) => {
+			document.querySelectorAll('.' + markerClass).forEach(el => el.classList.remove(markerClass));
+			const visible = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			};
+			const clean = (el) => (el.textContent || el.getAttribute('title') || el.getAttribute('aria-label') || '').replace(/\s+/g, '').trim();
+			const roots = Array.from(document.querySelectorAll(
+				'.upload-image-panel, .upload-handler-drag, .pgc-ic-image-tab-scope, .mp-ic-img-drawer, ' +
+				'.byte-drawer, .semi-drawer, .byte-modal, .semi-modal, [role="dialog"], ' +
+				'[class*="modal"], [class*="dialog"], [class*="drawer"]'
+			)).filter(visible);
+			const debug = [];
+			for (const root of roots) {
+				const controls = Array.from(root.querySelectorAll('button, [role="button"], label, .upload-handler, input[type="file"]'))
+					.filter(el => visible(el) || el.matches('input[type="file"]'));
+				debug.push({
+					root: String(root.className || root.getAttribute('role') || root.tagName).slice(0, 80),
+					text: clean(root).slice(0, 60),
+					controls: controls.map(el => ({tag: el.tagName, className: String(el.className || '').slice(0, 60), text: clean(el).slice(0, 30)})).slice(0, 8)
+				});
+				let trigger = controls.find(el => el.matches('button, [role="button"], label') && clean(el) === '本地上传');
+				if (!trigger) {
+					trigger = controls.find(el => el.matches('button, [role="button"], label') && clean(el).startsWith('本地上传') && !clean(el).includes('扫码上传'));
+				}
+				if (!trigger) {
+					const input = Array.from(root.querySelectorAll('input[type="file"]')).find(input => {
+						const owner = input.closest('button, label, [role="button"]');
+						return owner && clean(owner).startsWith('本地上传') && !clean(owner).includes('扫码上传');
+					});
+					if (input) trigger = input.closest('button, label, [role="button"]');
+				}
+				if (trigger) {
+					trigger.scrollIntoView({ block: 'center', inline: 'center' });
+					trigger.classList.add(markerClass);
+					return JSON.stringify({found:true, trigger:{tag:trigger.tagName, className:String(trigger.className || '').slice(0, 80), text:clean(trigger).slice(0, 40)}, debug});
+				}
+			}
+			return JSON.stringify({found:false, debug});
+		}`, markerClass)
+		if res != nil {
+			lastScan = res.Value.Str()
+		}
+		if err := physicalClickMarkedElement(a.page, "."+markerClass); err == nil {
+			log.Infof("微头条本地上传按钮点击成功，扫描结果: %s", lastScan)
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("未找到微头条本地上传触发按钮，最后扫描结果: %s", lastScan)
+}
+
+func (a *MicroPostAction) waitAndConfirmMicroImageUpload(index int) error {
+	log.Infof("等待微头条图片 %d 上传并生成缩略图...", index)
+	deadline := time.Now().Add(45 * time.Second)
+	confirmed := false
+	for time.Now().Before(deadline) {
+		result, errEval := a.page.Eval(`() => {
+			document.querySelectorAll('.mcp-micro-image-confirm').forEach(el => el.classList.remove('mcp-micro-image-confirm'));
+			const visible = (el) => {
+				if (!el) return false;
+				const style = window.getComputedStyle(el);
+				const rect = el.getBoundingClientRect();
+				return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+			};
+			const clean = (el) => (el.textContent || el.getAttribute('title') || el.getAttribute('aria-label') || '').replace(/\s+/g, '').trim();
+			const roots = Array.from(document.querySelectorAll(
+				'.upload-image-panel, .upload-handler-drag, .pgc-ic-image-tab-scope, .mp-ic-img-drawer, ' +
+				'.byte-drawer, .semi-drawer, .byte-modal, .semi-modal, [role="dialog"], ' +
+				'[class*="modal"], [class*="dialog"], [class*="drawer"]'
+			)).filter(visible);
+			if (!roots.length) {
+				return JSON.stringify({status:'closed'});
+			}
+			for (const root of roots) {
+				const busyText = clean(root);
+				if (busyText.includes('上传中') || busyText.includes('处理中') || busyText.includes('正在上传')) {
+					return JSON.stringify({status:'uploading', text:busyText.slice(0, 80)});
+				}
+				const buttons = Array.from(root.querySelectorAll('button, [role="button"], a')).filter(visible);
+				const btn = buttons.find(el => {
+					const text = clean(el);
+					return (text === '确定' || text === '确认' || text === '完成') && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+				});
+				if (btn) {
+					btn.scrollIntoView({ block: 'center', inline: 'center' });
+					btn.classList.add('mcp-micro-image-confirm');
+					return JSON.stringify({status:'marked', text:clean(btn)});
+				}
+			}
+			return JSON.stringify({status:'waiting', roots: roots.map(root => clean(root).slice(0, 60)).slice(0, 5)});
+		}`)
 		if errEval != nil {
-			log.Warnf("在图片弹窗中检测/点击确定按钮时发生 JS 错误: %v", errEval)
-		} else if res != nil {
-			if !res.Value.Bool() {
-				// 返回 false 代表页面已无可见的“确定”按钮，弹窗已成功关闭
-				log.Info("页面已无可见的图片确定按钮，确定弹窗成功关闭")
-				confirmed = true
-				break
-			} else {
-				log.Infof("已定位到确定按钮并触发点击 (尝试次数: %d/10)...", k+1)
+			log.Warnf("在微头条图片弹窗中检测确定按钮时发生 JS 错误: %v", errEval)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		status := ""
+		if result != nil {
+			var info struct {
+				Status string `json:"status"`
+				Text   string `json:"text"`
+			}
+			_ = json.Unmarshal([]byte(result.Value.Str()), &info)
+			status = info.Status
+			if info.Text != "" {
+				log.Infof("微头条图片上传弹窗状态: %s %s", info.Status, info.Text)
 			}
 		}
-		time.Sleep(1 * time.Second)
+		switch status {
+		case "closed":
+			log.Infof("微头条图片 %d 上传弹窗已关闭", index)
+			return nil
+		case "marked":
+			if err := physicalClickMarkedElement(a.page, ".mcp-micro-image-confirm"); err != nil {
+				return fmt.Errorf("点击微头条图片确定按钮失败: %w", err)
+			}
+			confirmed = true
+			time.Sleep(800 * time.Millisecond)
+		default:
+			time.Sleep(800 * time.Millisecond)
+		}
 	}
 
 	if !confirmed {
-		return fmt.Errorf("未能成功确认并关闭图片上传弹窗（确定按钮在 10 秒内未消失，可能是上传卡死或按钮无效）")
+		return fmt.Errorf("微头条图片上传弹窗在 45 秒内未出现可点击确定按钮")
 	}
+	return fmt.Errorf("微头条图片确定按钮已点击，但弹窗在 45 秒内未关闭")
+}
 
-	log.Info("图片已成功确认并插入微头条编辑框")
-	time.Sleep(2 * time.Second)
-	return nil
+func logMicroMemoryStats(stage string) {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	log.Infof("[微头条图片内存] %s: alloc=%dMB sys=%dMB heap=%dMB", stage, mem.Alloc/1024/1024, mem.Sys/1024/1024, mem.HeapAlloc/1024/1024)
 }
 
 // clickPublish 点击发布按钮

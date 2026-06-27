@@ -229,6 +229,62 @@ func (s *AppServer) handleDeleteArticle(ctx context.Context, args map[string]int
 	return NewTextResult(`{"success": true, "message": "Article deleted"}`)
 }
 
+// handleGetComments 处理评论列表查询
+func (s *AppServer) handleGetComments(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	params := toutiaohao.NewCommentListParams(args)
+	if err := toutiaohao.ValidateGetComments(params); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	result, err := s.toutiaoService.GetComments(ctx, params)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleProbeCommentManage 处理评论管理页诊断
+func (s *AppServer) handleProbeCommentManage(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	params := &toutiaohao.CommentProbeParams{}
+	if args != nil {
+		params.ArticleID, _ = args["article_id"].(string)
+		if wait, ok := args["wait_ms"].(int); ok {
+			params.WaitMS = wait
+		} else if wait, ok := args["wait_ms"].(float64); ok {
+			params.WaitMS = int(wait)
+		}
+	}
+
+	result, err := s.toutiaoService.ProbeCommentManage(ctx, params)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
+// handleReplyComment 处理评论回复
+func (s *AppServer) handleReplyComment(ctx context.Context, args map[string]interface{}) *MCPToolResult {
+	articleID, _ := args["article_id"].(string)
+	commentID, _ := args["comment_id"].(string)
+	commentText, _ := args["comment_text"].(string)
+	replyContent, _ := args["reply_content"].(string)
+	if err := toutiaohao.ValidateReplyComment(articleID, commentID, commentText, replyContent); err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	result, err := s.toutiaoService.ReplyComment(ctx, articleID, commentID, commentText, replyContent)
+	if err != nil {
+		return NewErrorResult(err.Error())
+	}
+
+	data, _ := json.Marshal(result)
+	return NewTextResult(string(data))
+}
+
 // handleGetAccountOverview 处理账户概览
 func (s *AppServer) handleGetAccountOverview(ctx context.Context, args map[string]interface{}) *MCPToolResult {
 	result, err := s.toutiaoService.GetAccountOverview(ctx)

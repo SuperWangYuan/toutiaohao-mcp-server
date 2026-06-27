@@ -109,6 +109,8 @@ go build -o toutiaohao-server .
 | **GET** | `/api/v1/articles` | 获取文章列表（支持 `published/draft/review` 状态筛选） |
 | **POST** | `/api/v1/articles/update` | 修改/更新已有图文文章 |
 | **POST** | `/api/v1/articles/delete` | 物理删除文章或删除草稿 |
+| **GET** | `/api/v1/comments` | 获取评论列表，可按 `article_id` 或 `keyword` 缩小范围 |
+| **POST** | `/api/v1/comments/reply` | 回复用户评论，需提供 `reply_content` 以及 `comment_id` 或 `comment_text` |
 | **GET** | `/api/v1/analytics/overview` | 账户整体运营数据（粉丝、阅读量、展现量指标） |
 | **GET** | `/api/v1/analytics/article` | 单篇文章阅读与交互明细统计 |
 | **GET** | `/api/v1/analytics/report` | 自动生成运营日报/周报/月报 |
@@ -144,6 +146,7 @@ toutiaohao-mcp-server/
     ├── publish_article.go  # 发图文（Markdown 解析、图片自动上传排版、虚构声明勾选）
     ├── publish_micro.go    # 发布微头条
     ├── draft_micro.go      # 保存微头条草稿
+    ├── comments.go         # 评论列表抓取与回复评论
     ├── article_list.go     # 内容列表拉取与管理
     └── analytics.go        # 创作者运营数据面板解析与抓取
 ```
@@ -227,6 +230,13 @@ go test -v -run "TestGetAccountTrendsManual|TestGetArticleDetailManual"
 - 草稿删除不依赖“更多”菜单或编辑页删除按钮；应勾选目标草稿行的真实复选框，再点击批量操作栏中的“删除”，最后处理确认弹窗。
 - 复选框、批量删除按钮和确认按钮都必须只点击真实可见的小按钮本体，不要点击 `.pgc-content` 等外层容器。点击前需滚入视口中心，并使用 rod 鼠标坐标物理点击。
 - 若仍失败，会保存 `screenshot_delete_draft_not_found.png`、`screenshot_delete_draft_checkbox_error.png`、`screenshot_delete_draft_batch_error.png` 或 `screenshot_delete_draft_confirm_error.png` 以便分析。
+
+### 评论回复实现约定
+
+- MCP 工具 `get_comments` 用于读取评论列表，可传 `article_id`、`keyword`、`page_size`；`reply_comment` 用于回复评论。
+- `reply_comment` 必须提供 `reply_content`，并且 `comment_id` 与 `comment_text` 至少提供一个。若两者都传，会共同约束目标评论，降低误回复风险。
+- 评论管理优先通过头条后台浏览器自动化完成，不依赖未公开且可能频繁变化的评论回复 HTTP 接口。
+- 回复失败时会保存 `screenshot_comment_page_error.png`、`screenshot_comment_reply_not_found.png`、`screenshot_comment_reply_fill_error.png` 或 `screenshot_comment_reply_submit_error.png` 辅助分析。
 
 ---
 

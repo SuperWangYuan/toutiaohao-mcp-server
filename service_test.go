@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/example/toutiaohao-mcp-server/toutiaohao"
@@ -39,5 +40,56 @@ func TestArticleStatusIsPublishedFalse(t *testing.T) {
 		if toutiaohao.ArticleStatusIsPublished(tc) {
 			t.Fatalf("expected %v not to be treated as published", tc)
 		}
+	}
+}
+
+func TestArticlePublishDedupeBlocksInFlightDuplicate(t *testing.T) {
+	resetArticlePublishDedupeForTest()
+	t.Cleanup(resetArticlePublishDedupeForTest)
+
+	key := articlePublishDedupeKey("标题", "正文", &toutiaohao.ArticleOptions{
+		Images: []string{"cover.png"},
+	})
+	finish, err := beginArticlePublishDedupe(key, "标题")
+	if err != nil {
+		t.Fatalf("beginArticlePublishDedupe() unexpected error: %v", err)
+	}
+	defer finish(false)
+
+	if _, err := beginArticlePublishDedupe(key, "标题"); err == nil || !strings.Contains(err.Error(), "正在发布中") {
+		t.Fatalf("duplicate in-flight publish was not blocked, err=%v", err)
+	}
+}
+
+func TestArticlePublishDedupeBlocksRecentCompletedDuplicate(t *testing.T) {
+	resetArticlePublishDedupeForTest()
+	t.Cleanup(resetArticlePublishDedupeForTest)
+
+	key := articlePublishDedupeKey("标题", "正文", &toutiaohao.ArticleOptions{
+		Images: []string{"cover.png"},
+	})
+	finish, err := beginArticlePublishDedupe(key, "标题")
+	if err != nil {
+		t.Fatalf("beginArticlePublishDedupe() unexpected error: %v", err)
+	}
+	finish(true)
+
+	if _, err := beginArticlePublishDedupe(key, "标题"); err == nil || !strings.Contains(err.Error(), "完成过发布") {
+		t.Fatalf("recent completed publish was not blocked, err=%v", err)
+	}
+}
+
+func TestArticlePublishDedupeKeyIncludesImages(t *testing.T) {
+	resetArticlePublishDedupeForTest()
+	t.Cleanup(resetArticlePublishDedupeForTest)
+
+	left := articlePublishDedupeKey("标题", "正文", &toutiaohao.ArticleOptions{
+		Images: []string{"cover-a.png"},
+	})
+	right := articlePublishDedupeKey("标题", "正文", &toutiaohao.ArticleOptions{
+		Images: []string{"cover-b.png"},
+	})
+	if left == right {
+		t.Fatal("dedupe key should include explicit images")
 	}
 }

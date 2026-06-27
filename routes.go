@@ -31,6 +31,8 @@ func setupRoutes(router *gin.Engine, appServer *AppServer) {
 		api.GET("/articles", appServer.apiGetArticleList)
 		api.POST("/articles/delete", appServer.apiDeleteArticle)
 		api.POST("/articles/update", appServer.apiUpdateArticle)
+		api.GET("/comments", appServer.apiGetComments)
+		api.POST("/comments/reply", appServer.apiReplyComment)
 
 		// 数据分析
 		api.GET("/analytics/overview", appServer.apiGetAccountOverview)

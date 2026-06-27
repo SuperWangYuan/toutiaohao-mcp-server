@@ -66,6 +66,8 @@ func mapErrorToStatusCode(err error) int {
 		strings.Contains(errMsg, "too long") ||
 		strings.Contains(errMsg, "格式") ||
 		strings.Contains(errMsg, "为空") ||
+		strings.Contains(errMsg, "至少需要") ||
+		strings.Contains(errMsg, "不能为负数") ||
 		strings.Contains(errMsg, "冲突") {
 		return http.StatusBadRequest
 	}
@@ -257,6 +259,41 @@ func (s *AppServer) apiUpdateArticle(c *gin.Context) {
 		return
 	}
 	respondSuccess(c, res)
+}
+
+// apiGetComments 获取评论列表 API
+func (s *AppServer) apiGetComments(c *gin.Context) {
+	params := toutiaohao.NewCommentListParams(map[string]interface{}{
+		"article_id": c.Query("article_id"),
+		"keyword":    c.Query("keyword"),
+		"page_size":  c.Query("page_size"),
+	})
+	result, err := s.toutiaoService.GetComments(c.Request.Context(), params)
+	if err != nil {
+		respondError(c, mapErrorToStatusCode(err), err.Error())
+		return
+	}
+	respondSuccess(c, result)
+}
+
+// apiReplyComment 回复评论 API
+func (s *AppServer) apiReplyComment(c *gin.Context) {
+	var req struct {
+		ArticleID    string `json:"article_id" form:"article_id"`
+		CommentID    string `json:"comment_id" form:"comment_id"`
+		CommentText  string `json:"comment_text" form:"comment_text"`
+		ReplyContent string `json:"reply_content" form:"reply_content"`
+	}
+	if err := c.ShouldBind(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	result, err := s.toutiaoService.ReplyComment(c.Request.Context(), req.ArticleID, req.CommentID, req.CommentText, req.ReplyContent)
+	if err != nil {
+		respondError(c, mapErrorToStatusCode(err), err.Error())
+		return
+	}
+	respondSuccess(c, result)
 }
 
 // apiGetAccountOverview 账户概览 API

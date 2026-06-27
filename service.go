@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/example/toutiaohao-mcp-server/browser"
@@ -20,6 +23,90 @@ import (
 // ToutiaoService 今日头条业务服务层
 type ToutiaoService struct {
 	cookieStore cookies.Cookier
+}
+
+type articlePublishDedupeRecord struct {
+	InFlight    bool
+	CompletedAt time.Time
+}
+
+const articlePublishDedupeTTL = 6 * time.Hour
+
+var (
+	articlePublishDedupeMu      sync.Mutex
+	articlePublishDedupeRecords = make(map[string]articlePublishDedupeRecord)
+)
+
+func articlePublishDedupeKey(title, content string, opts *toutiaohao.ArticleOptions) string {
+	payload := struct {
+		Title       string      `json:"title"`
+		Content     string      `json:"content"`
+		Images      []string    `json:"images,omitempty"`
+		Tags        []string    `json:"tags,omitempty"`
+		Category    string      `json:"category,omitempty"`
+		CoverImage  string      `json:"cover_image,omitempty"`
+		Original    bool        `json:"original,omitempty"`
+		Fiction     bool        `json:"fiction,omitempty"`
+		PublishTime interface{} `json:"publish_time,omitempty"`
+		SaveAsDraft bool        `json:"save_as_draft,omitempty"`
+	}{
+		Title:   strings.TrimSpace(title),
+		Content: strings.TrimSpace(content),
+	}
+	if opts != nil {
+		payload.Images = append([]string(nil), opts.Images...)
+		payload.Tags = append([]string(nil), opts.Tags...)
+		payload.Category = opts.Category
+		payload.CoverImage = opts.CoverImage
+		payload.Original = opts.Original
+		payload.Fiction = opts.Fiction
+		payload.PublishTime = opts.PublishTime
+		payload.SaveAsDraft = opts.SaveAsDraft
+	}
+	body, _ := json.Marshal(payload)
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+func beginArticlePublishDedupe(key, title string) (func(bool), error) {
+	now := time.Now()
+	articlePublishDedupeMu.Lock()
+	defer articlePublishDedupeMu.Unlock()
+
+	for existingKey, record := range articlePublishDedupeRecords {
+		if !record.InFlight && !record.CompletedAt.IsZero() && now.Sub(record.CompletedAt) > articlePublishDedupeTTL {
+			delete(articlePublishDedupeRecords, existingKey)
+		}
+	}
+
+	if record, ok := articlePublishDedupeRecords[key]; ok {
+		if record.InFlight {
+			return nil, fmt.Errorf("同一篇文章「%s」正在发布中，已拦截重复 publish_article 调用", title)
+		}
+		if !record.CompletedAt.IsZero() && now.Sub(record.CompletedAt) <= articlePublishDedupeTTL {
+			return nil, fmt.Errorf("同一篇文章「%s」已在最近 %s 内完成过发布，已拦截重复 publish_article 调用", title, articlePublishDedupeTTL)
+		}
+	}
+
+	articlePublishDedupeRecords[key] = articlePublishDedupeRecord{InFlight: true}
+	var once sync.Once
+	return func(completed bool) {
+		once.Do(func() {
+			articlePublishDedupeMu.Lock()
+			defer articlePublishDedupeMu.Unlock()
+			if completed {
+				articlePublishDedupeRecords[key] = articlePublishDedupeRecord{CompletedAt: time.Now()}
+				return
+			}
+			delete(articlePublishDedupeRecords, key)
+		})
+	}, nil
+}
+
+func resetArticlePublishDedupeForTest() {
+	articlePublishDedupeMu.Lock()
+	defer articlePublishDedupeMu.Unlock()
+	articlePublishDedupeRecords = make(map[string]articlePublishDedupeRecord)
 }
 
 // NewToutiaoService 创建服务实例
@@ -72,24 +159,63 @@ func (s *ToutiaoService) SaveMicroPostDraft(ctx context.Context, content string,
 	if err := toutiaohao.ValidateMicroPost(content, images, topic); err != nil {
 		return err
 	}
-	return toutiaohao.SaveMicroDraft(ctx, content, nil, s.cookieStore)
+	fullContent := content
+	if topic != "" {
+		if !strings.HasPrefix(topic, "#") {
+			topic = "#" + topic + "#"
+		}
+		fullContent = topic + " " + content
+	}
+	return toutiaohao.SaveMicroDraftWithImagePaths(ctx, fullContent, images, s.cookieStore)
 }
 
 // CheckArticleExists 检查最新文章中是否已存在该标题的文章
 func (s *ToutiaoService) CheckArticleExists(ctx context.Context, title string) (bool, error) {
 	params := &toutiaohao.ArticleListParams{
 		Page:     1,
-		PageSize: 10,
-		Status:   "all",
+		PageSize: 20,
+		Status:   "published",
 	}
 	resp, err := s.GetArticleList(ctx, params)
 	if err != nil {
 		return false, fmt.Errorf("check article exists failed to get article list: %w", err)
 	}
 	for _, art := range resp.Articles {
-		if art.Title == title {
+		if art.Title == title && toutiaohao.ArticleStatusIsPublished(art.Status) {
 			return true, nil
 		}
+	}
+	return false, nil
+}
+
+func (s *ToutiaoService) cleanupDraftByTitleAfterPublishFailure(ctx context.Context, title string) (bool, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return false, nil
+	}
+	resp, err := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 50, Status: "draft"})
+	if err != nil {
+		return false, fmt.Errorf("获取草稿列表失败: %w", err)
+	}
+	if resp == nil {
+		return false, nil
+	}
+	for _, art := range resp.Articles {
+		if strings.TrimSpace(art.Title) != title || !toutiaohao.ArticleStatusIsDraft(art.Status) {
+			continue
+		}
+		articleID := strings.TrimSpace(art.ArticleID)
+		if articleID == "" {
+			articleID = strings.TrimSpace(art.ID)
+		}
+		if articleID == "" {
+			return false, fmt.Errorf("找到同名草稿但缺少 article_id: title=%s status=%v", art.Title, art.Status)
+		}
+		log.Warnf("发布失败后检测到同名草稿，准备自动删除: article_id=%s title=%s", articleID, art.Title)
+		if err := s.DeleteArticle(ctx, articleID); err != nil {
+			return false, fmt.Errorf("删除发布失败后生成的同名草稿失败 article_id=%s title=%s: %w", articleID, art.Title, err)
+		}
+		return true, nil
 	}
 	return false, nil
 }
@@ -102,6 +228,16 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 		log.Errorf("[Step 1/7] 参数校验失败: %v", err)
 		return nil, err
 	}
+	dedupeKey := articlePublishDedupeKey(title, content, opts)
+	finishDedupe, err := beginArticlePublishDedupe(dedupeKey, title)
+	if err != nil {
+		log.Errorf("[Step 1/7] 幂等拦截: %v", err)
+		return nil, err
+	}
+	publishSubmitted := false
+	defer func() {
+		finishDedupe(publishSubmitted)
+	}()
 
 	// 0. 发文前登录态快速校验（通过轻量级 HTTP 请求校验本地 Cookie，耗时 ~100ms）
 	log.Info("[Step 2/7] 正在快速自检本地 Cookie 登录态...")
@@ -144,8 +280,20 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 	err = action.Publish(ctx, title, content, opts)
 	if err != nil {
 		log.Errorf("[Step 5/7] 物理执行文章内容键入与发布失败: %v", err)
+		shouldCleanupDraft := opts == nil || !opts.SaveAsDraft
+		if !shouldCleanupDraft {
+			return nil, err
+		}
+		if cleaned, cleanupErr := s.cleanupDraftByTitleAfterPublishFailure(ctx, title); cleanupErr != nil {
+			log.Warnf("[Step 5/7] 发布失败后尝试清理同名草稿失败: %v", cleanupErr)
+			return nil, fmt.Errorf("%w；发布失败后尝试清理同名草稿失败: %v", err, cleanupErr)
+		} else if cleaned {
+			log.Warnf("[Step 5/7] 发布失败后已自动清理同名草稿: %s", title)
+			return nil, fmt.Errorf("%w；已自动清理发布失败后生成的同名草稿", err)
+		}
 		return nil, err
 	}
+	publishSubmitted = true
 
 	if opts != nil && opts.SaveAsDraft {
 		log.Info("[Step 6/7] 文章已按请求保存为草稿，跳过发布状态校验。")
@@ -349,6 +497,48 @@ func (s *ToutiaoService) findArticleTitleForDelete(ctx context.Context, articleI
 	}
 	log.Warnf("删除回退未能从列表定位文章标题，仅使用 ID 删除: %s", articleID)
 	return ""
+}
+
+// GetComments 获取评论列表
+func (s *ToutiaoService) GetComments(ctx context.Context, params *toutiaohao.CommentListParams) (*toutiaohao.CommentListResponse, error) {
+	if err := toutiaohao.ValidateGetComments(params); err != nil {
+		return nil, err
+	}
+	b := browser.NewBrowser(false)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	action := toutiaohao.NewCommentAction(page, s.cookieStore)
+	return action.GetComments(ctx, params)
+}
+
+// ProbeCommentManage 诊断评论管理页挂载状态
+func (s *ToutiaoService) ProbeCommentManage(ctx context.Context, params *toutiaohao.CommentProbeParams) (*toutiaohao.CommentProbeResponse, error) {
+	b := browser.NewBrowser(false)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	action := toutiaohao.NewCommentAction(page, s.cookieStore)
+	return action.ProbeCommentManage(ctx, params)
+}
+
+// ReplyComment 回复用户评论
+func (s *ToutiaoService) ReplyComment(ctx context.Context, articleID, commentID, commentText, replyContent string) (*toutiaohao.ReplyCommentResult, error) {
+	if err := toutiaohao.ValidateReplyComment(articleID, commentID, commentText, replyContent); err != nil {
+		return nil, err
+	}
+	b := browser.NewBrowser(false)
+	defer b.Close()
+
+	page := b.NewPage()
+	defer page.Close()
+
+	action := toutiaohao.NewCommentAction(page, s.cookieStore)
+	return action.ReplyComment(ctx, articleID, commentID, commentText, replyContent)
 }
 
 // GetAccountOverview 获取账户概览（通过浏览器自动化）
