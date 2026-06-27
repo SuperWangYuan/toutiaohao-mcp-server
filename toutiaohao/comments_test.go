@@ -44,3 +44,51 @@ func TestNewCommentListParams(t *testing.T) {
 		t.Fatalf("PageSize = %d, want 12", params.PageSize)
 	}
 }
+
+func TestCommentItemFromAPI(t *testing.T) {
+	apiItem := commentAPIItem{
+		IDStr:      "7655725926924206911",
+		Text:       "这是一条真实评论",
+		CreateTime: 1782488353,
+		ReplyCount: 2,
+	}
+	apiItem.User.Name = "测试用户"
+	apiItem.ArticleInfo.GroupIDStr = "7655556701420061184"
+	apiItem.ArticleInfo.Title = "测试文章"
+
+	item := commentItemFromAPI(apiItem)
+	if item.CommentID != "7655725926924206911" {
+		t.Fatalf("CommentID = %q", item.CommentID)
+	}
+	if item.ArticleID != "7655556701420061184" {
+		t.Fatalf("ArticleID = %q", item.ArticleID)
+	}
+	if item.UserName != "测试用户" {
+		t.Fatalf("UserName = %q", item.UserName)
+	}
+	if item.Content != "这是一条真实评论" {
+		t.Fatalf("Content = %q", item.Content)
+	}
+	if item.ReplyCount != 2 {
+		t.Fatalf("ReplyCount = %d", item.ReplyCount)
+	}
+	if item.CreateTime == "" {
+		t.Fatal("CreateTime should be formatted")
+	}
+	if item.RawText != "测试文章 | 这是一条真实评论" {
+		t.Fatalf("RawText = %q", item.RawText)
+	}
+}
+
+func TestCommentItemFromAPINumericIDFallback(t *testing.T) {
+	apiItem := commentAPIItem{ID: 1234567890123, Text: "评论"}
+	apiItem.ArticleInfo.GroupID = 7655556701420061184
+
+	item := commentItemFromAPI(apiItem)
+	if item.CommentID != "1234567890123" {
+		t.Fatalf("CommentID = %q", item.CommentID)
+	}
+	if item.ArticleID != "7655556701420061184" {
+		t.Fatalf("ArticleID = %q", item.ArticleID)
+	}
+}
