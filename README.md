@@ -222,6 +222,12 @@ go test -v -run "TestGetAccountTrendsManual|TestGetArticleDetailManual"
 - `/spice/image`、`upload_source=` 和 `multipart/form-data` 图片上传请求必须绕过 `HijackRequests` 的 `LoadResponse` 代理，直接 `ContinueRequest` 原样放行。
 - 如果图片确认弹窗没有关闭，应保存错误截图并返回错误，避免缺图内容继续发布。
 
+### 标题校验与失败草稿保护
+
+- 图文标题最多 30 字。标题超限时服务会直接返回可读错误，要求调用方重新生成或缩短标题，不会再自动截断破坏语义。
+- 发布过程中若正文、插图、封面或最终提交失败，服务会保留头条后台可能已经自动保存的草稿，并在错误信息中提示前往草稿箱检查。
+- 普通发布失败不会自动调用删除接口。只有用户显式调用删除功能，或集成测试清理其自身创建的临时数据时，才会删除草稿。
+
 ### 草稿删除实现约定
 
 - 删除接口会先调用头条 HTTP 删除 API，但不信任仅返回 success 的结果；必须重新查询列表确认文章消失。

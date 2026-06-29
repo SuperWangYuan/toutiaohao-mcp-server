@@ -1,6 +1,9 @@
 package toutiaohao
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestArticleValidation_EmptyTitle(t *testing.T) {
 	err := ValidateArticle("", "content", nil)
@@ -20,6 +23,9 @@ func TestArticleValidation_TitleTooLong(t *testing.T) {
 	err := ValidateArticle(string(title), "content", nil)
 	if err == nil {
 		t.Error("expected error for title too long")
+	}
+	if !strings.Contains(err.Error(), "系统不会自动截断") {
+		t.Fatalf("error should require caller regeneration instead of truncation: %v", err)
 	}
 }
 

@@ -188,42 +188,16 @@ func (s *ToutiaoService) CheckArticleExists(ctx context.Context, title string) (
 	return false, nil
 }
 
-func (s *ToutiaoService) cleanupDraftByTitleAfterPublishFailure(ctx context.Context, title string) (bool, error) {
-	title = strings.TrimSpace(title)
-	if title == "" {
-		return false, nil
-	}
-	resp, err := s.GetArticleList(ctx, &toutiaohao.ArticleListParams{Page: 1, PageSize: 50, Status: "draft"})
-	if err != nil {
-		return false, fmt.Errorf("获取草稿列表失败: %w", err)
-	}
-	if resp == nil {
-		return false, nil
-	}
-	for _, art := range resp.Articles {
-		if strings.TrimSpace(art.Title) != title || !toutiaohao.ArticleStatusIsDraft(art.Status) {
-			continue
-		}
-		articleID := strings.TrimSpace(art.ArticleID)
-		if articleID == "" {
-			articleID = strings.TrimSpace(art.ID)
-		}
-		if articleID == "" {
-			return false, fmt.Errorf("找到同名草稿但缺少 article_id: title=%s status=%v", art.Title, art.Status)
-		}
-		log.Warnf("发布失败后检测到同名草稿，准备自动删除: article_id=%s title=%s", articleID, art.Title)
-		if err := s.DeleteArticle(ctx, articleID); err != nil {
-			return false, fmt.Errorf("删除发布失败后生成的同名草稿失败 article_id=%s title=%s: %w", articleID, art.Title, err)
-		}
-		return true, nil
-	}
-	return false, nil
+func publishFailureKeepingDraftError(err error) error {
+	return fmt.Errorf(
+		"%w；发布失败后未自动删除草稿，头条后台若已自动保存内容，请在草稿箱检查后决定重发或删除",
+		err,
+	)
 }
 
 // PublishArticle 发布文章
 func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content string, opts *toutiaohao.ArticleOptions) (*toutiaohao.PublishResult, error) {
 	log.Infof("[Step 1/7] 开始发布文章校验，标题: %s", title)
-	title = truncateTitleForPublish(title)
 	if err := toutiaohao.ValidateArticle(title, content, opts); err != nil {
 		log.Errorf("[Step 1/7] 参数校验失败: %v", err)
 		return nil, err
@@ -280,18 +254,8 @@ func (s *ToutiaoService) PublishArticle(ctx context.Context, title, content stri
 	err = action.Publish(ctx, title, content, opts)
 	if err != nil {
 		log.Errorf("[Step 5/7] 物理执行文章内容键入与发布失败: %v", err)
-		shouldCleanupDraft := opts == nil || !opts.SaveAsDraft
-		if !shouldCleanupDraft {
-			return nil, err
-		}
-		if cleaned, cleanupErr := s.cleanupDraftByTitleAfterPublishFailure(ctx, title); cleanupErr != nil {
-			log.Warnf("[Step 5/7] 发布失败后尝试清理同名草稿失败: %v", cleanupErr)
-			return nil, fmt.Errorf("%w；发布失败后尝试清理同名草稿失败: %v", err, cleanupErr)
-		} else if cleaned {
-			log.Warnf("[Step 5/7] 发布失败后已自动清理同名草稿: %s", title)
-			return nil, fmt.Errorf("%w；已自动清理发布失败后生成的同名草稿", err)
-		}
-		return nil, err
+		log.Warnf("[Step 5/7] 发布失败后不会自动删除草稿；头条后台若已自动保存，请在草稿箱检查并决定后续处理: %s", title)
+		return nil, publishFailureKeepingDraftError(err)
 	}
 	publishSubmitted = true
 

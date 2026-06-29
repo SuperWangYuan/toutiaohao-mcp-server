@@ -59,11 +59,8 @@ type ArticleOptions struct {
 
 // ValidateArticle 校验文章参数
 func ValidateArticle(title, content string, opts *ArticleOptions) error {
-	if strings.TrimSpace(title) == "" {
-		return fmt.Errorf("title is required")
-	}
-	if utf8.RuneCountInString(title) > configs.MaxTitleLength {
-		return fmt.Errorf("title exceeds %d characters limit", configs.MaxTitleLength)
+	if err := ValidateArticleTitle(title); err != nil {
+		return err
 	}
 	if strings.TrimSpace(content) == "" {
 		return fmt.Errorf("content is required")
@@ -74,13 +71,31 @@ func ValidateArticle(title, content string, opts *ArticleOptions) error {
 	return nil
 }
 
+// ValidateArticleTitle 校验标题，不允许静默截断破坏语义。
+func ValidateArticleTitle(title string) error {
+	if strings.TrimSpace(title) == "" {
+		return fmt.Errorf("title is required")
+	}
+	length := utf8.RuneCountInString(title)
+	if length > configs.MaxTitleLength {
+		return fmt.Errorf(
+			"标题共 %d 字，超过今日头条 %d 字上限，请重新生成或缩短标题；系统不会自动截断",
+			length,
+			configs.MaxTitleLength,
+		)
+	}
+	return nil
+}
+
 // ValidateUpdateArticle 校验修改文章参数
 func ValidateUpdateArticle(articleID, title, content string, opts *ArticleOptions) error {
 	if strings.TrimSpace(articleID) == "" {
 		return fmt.Errorf("article_id is required")
 	}
-	if title != "" && utf8.RuneCountInString(title) > configs.MaxTitleLength {
-		return fmt.Errorf("title exceeds %d characters limit", configs.MaxTitleLength)
+	if title != "" {
+		if err := ValidateArticleTitle(title); err != nil {
+			return err
+		}
 	}
 	if content != "" && utf8.RuneCountInString(content) > configs.MaxContentLength {
 		return fmt.Errorf("content exceeds %d characters limit", configs.MaxContentLength)
@@ -278,18 +293,14 @@ func (a *ArticlePublishAction) Publish(ctx context.Context, title, content strin
 }
 
 func (a *ArticlePublishAction) inputTitle(title string) error {
+	if err := ValidateArticleTitle(title); err != nil {
+		return err
+	}
 	el, sel, err := findElement(a.page, 3*time.Second, ArticleTitleSelectors)
 	if err != nil {
 		return fmt.Errorf("title input not found: %w", err)
 	}
 	log.Infof("Found title input using selector: %s", sel)
-
-	// 如果标题超出了头条 30 字的限制，自动进行截断以防止被前端表单验证拦截导致发布按钮锁死
-	if utf8.RuneCountInString(title) > 30 {
-		runes := []rune(title)
-		title = string(runes[:30])
-		log.Warnf("【标题限制】文章标题超出了今日头条 30 字上限，已自动截断为: %s", title)
-	}
 
 	return inputTextWithFallback(el, title)
 }

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -91,5 +93,16 @@ func TestArticlePublishDedupeKeyIncludesImages(t *testing.T) {
 	})
 	if left == right {
 		t.Fatal("dedupe key should include explicit images")
+	}
+}
+
+func TestPublishFailureKeepingDraftError(t *testing.T) {
+	baseErr := fmt.Errorf("封面上传失败")
+	err := publishFailureKeepingDraftError(baseErr)
+	if !errors.Is(err, baseErr) {
+		t.Fatalf("wrapped error does not preserve cause: %v", err)
+	}
+	if !strings.Contains(err.Error(), "未自动删除草稿") {
+		t.Fatalf("error does not explain draft preservation: %v", err)
 	}
 }
