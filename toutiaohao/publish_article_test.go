@@ -1,6 +1,7 @@
 package toutiaohao
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -88,6 +89,18 @@ func TestArticleValidation_WithAllOptional(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestShouldAcceptFilledCoverSlot(t *testing.T) {
+	if !shouldAcceptFilledCoverSlot(true, nil) {
+		t.Fatal("filled cover slot without detection error should be accepted")
+	}
+	if shouldAcceptFilledCoverSlot(false, nil) {
+		t.Fatal("empty cover slot must not be accepted")
+	}
+	if shouldAcceptFilledCoverSlot(true, errors.New("DOM detection failed")) {
+		t.Fatal("cover slot must not be accepted when its state cannot be verified")
 	}
 }
 

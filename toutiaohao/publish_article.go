@@ -1477,8 +1477,8 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 
 	for i, path := range coverPaths {
 		// 头条会从正文图片自动同步封面槽。若槽位已有图，继续点“编辑/替换”很容易进入错误的弹层或触发重复封面校验。
-		hasImg, errCheck := a.checkCoverSlotHasImage(i)
-		if errCheck == nil && hasImg {
+		hasImg, errCheck := a.waitForCoverSlotImage(i, 2*time.Second)
+		if shouldAcceptFilledCoverSlot(hasImg, errCheck) {
 			modeNote := "显式封面"
 			if isAutoCover {
 				modeNote = "自适应封面"
@@ -1551,8 +1551,19 @@ func (a *ArticlePublishAction) uploadCovers(coverPaths []string, isAutoCover boo
 			_, _ = a.page.Eval(`() => {
 				document.querySelectorAll('.mcp-target-to-click').forEach(el => el.classList.remove('mcp-target-to-click'));
 			}`)
+			// 头条可能已从正文图片异步回填封面槽，此时不会再打开上传面板。
+			// 上传触发器失败不能直接等同于封面失败，必须重新读取真实槽位状态。
+			hasImgAfterError, verifyErr := a.waitForCoverSlotImage(i, 4*time.Second)
+			if shouldAcceptFilledCoverSlot(hasImgAfterError, verifyErr) {
+				log.Warnf("封面图片 %d 未打开上传面板，但检测到封面槽已存在真实图片，按平台自动同步结果继续发布；原错误: %v", i+1, err)
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
 			safeScreenshot(a.page, "screenshot_upload_error.png")
 			log.Warnf("Upload error screenshot saved to screenshot_upload_error.png")
+			if verifyErr != nil {
+				return fmt.Errorf("cover image %d Chrome 文件选择上传失败: %w；封面槽复核失败: %v", i+1, err, verifyErr)
+			}
 			return fmt.Errorf("cover image %d Chrome 文件选择上传失败: %w", i+1, err)
 		}
 		_, _ = a.page.Eval(`() => {
@@ -1776,36 +1787,38 @@ func (a *ArticlePublishAction) checkCoverSlotHasImage(index int) (bool, error) {
 			container = document.body;
 		}
 
-		let slots = Array.from(container.querySelectorAll('.article-cover-add, .article-cover-card, .article-cover-preview, [class*="cover-add"], [class*="cover-card"], [class*="cover-preview"], [class*="cover-item"]'));
+		// 头条当前真实槽位：空槽是 article-cover-add，已有图片是
+		// article-cover-img-wrap。article-cover-preview 只是“预览”按钮，不能算槽位。
+		let slots = Array.from(container.querySelectorAll(
+			'.article-cover-images .article-cover-img-wrap, .article-cover-images .article-cover-add, ' +
+			'.article-cover-images-wrap .article-cover-img-wrap, .article-cover-images-wrap .article-cover-add'
+		));
 		if (slots.length === 0) {
 			slots = Array.from(container.querySelectorAll('div, label')).filter(el => {
 				let className = el.className;
 				if (typeof className !== 'string') return false;
-				return (className.includes('cover') && (className.includes('item') || className.includes('card') || className.includes('add') || className.includes('img') || className.includes('preview')));
+				if (className.includes('cover-preview')) return false;
+				return className.includes('cover') &&
+					(className.includes('item') || className.includes('card') || className.includes('add') || className.includes('img-wrap'));
 			});
 		}
 
 		if (slots.length > i) {
 			let slot = slots[i];
+			let className = typeof slot.className === 'string' ? slot.className : '';
 			// 机制一：检测 img 元素及 src
 			let img = slot.querySelector('img');
-			if (img && img.src && img.src.trim() !== '') {
+			if (img && img.src && img.src.trim() !== '' && !img.src.startsWith('data:image/svg')) {
 				return true;
 			}
-			if (slot.tagName === 'IMG' && slot.src && slot.src.trim() !== '') {
+			if (slot.tagName === 'IMG' && slot.src && slot.src.trim() !== '' && !slot.src.startsWith('data:image/svg')) {
 				return true;
 			}
 
-			// 机制二：检测 background-image 样式
-			let style = slot.style.backgroundImage || slot.style.background || '';
-			if (style.includes('url(')) {
-				return true;
-			}
-			let hasBg = Array.from(slot.querySelectorAll('*')).some(el => {
-				let s = el.style.backgroundImage || el.style.background || '';
-				return s.includes('url(');
-			});
-			if (hasBg) {
+			// 机制二：已填充封面槽自身的 background-image。
+			// 空槽的 add-icon 也有 data URL 背景，不能扫描所有后代，否则会误判。
+			let style = getComputedStyle(slot);
+			if (!className.includes('article-cover-add') && style.backgroundImage && style.backgroundImage !== 'none') {
 				return true;
 			}
 
@@ -1825,6 +1838,28 @@ func (a *ArticlePublishAction) checkCoverSlotHasImage(index int) (bool, error) {
 		return res.Value.Bool(), nil
 	}
 	return false, nil
+}
+
+func (a *ArticlePublishAction) waitForCoverSlotImage(index int, timeout time.Duration) (bool, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		hasImage, err := a.checkCoverSlotHasImage(index)
+		if err == nil && hasImage {
+			return true, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return false, lastErr
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func shouldAcceptFilledCoverSlot(hasImage bool, checkErr error) bool {
+	return hasImage && checkErr == nil
 }
 
 func (a *ArticlePublishAction) setCoverMode(mode string) error {

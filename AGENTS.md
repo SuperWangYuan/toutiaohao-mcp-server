@@ -145,6 +145,7 @@ AI 助手在此项目中编写代码或执行自动化修改时，必须严格�
     - 上传触发器必须限定在当前可见的 `.upload-image-panel` / `.byte-modal` / `.semi-modal` / `[role="dialog"]` 等上传弹窗中，严禁抓取页面底层或历史遗留的全局 file input。
     - `/spice/image`、`upload_source=` 以及 `multipart/form-data` 上传请求必须绕过 `HijackRequests` 的 `LoadResponse` 代理，只能 `ContinueRequest` 原样放行；否则 multipart 文件体会被破坏并触发约 210 字节的“无效图片数据”请求。
     - 图片上传确认弹窗若未正常关闭，不允许“优雅降级继续发文”；必须保存错误截图并返回明确错误，防止正文或封面实际缺图却继续提交。
+    - **封面自动同步状态优先**：头条可能已从正文插图异步回填 `.article-cover-img-wrap`，此时点击封面槽不会再打开上传面板。封面上传触发失败后必须重新轮询目标槽位；若目标槽存在真实非 SVG 图片、有效背景图或“编辑/替换/裁剪”操作，则按平台自动同步成功处理。`.article-cover-preview` 只是“预览”按钮，空槽 `.article-cover-add` 内的 data URL 加号图标也不是封面，严禁据此误判成功。
     - **封面来源优先级**：`cover_image` 是最高优先级显式封面；其次只要图文文章调用方明确传入 `images`，就必须优先使用 `images` 作为封面候选（1 张为单图，3 张及以上为三图）。只有在 `cover_image` 和 `images` 都未传入时，才允许从正文 Markdown 内嵌图中自适应提取封面。
 
 15. **微头条全量历史抓取与统计合并机制（硬性数据规则）**：
