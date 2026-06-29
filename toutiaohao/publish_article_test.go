@@ -51,6 +51,38 @@ func TestArticleValidation_TitleCountsUnicodeCharacters(t *testing.T) {
 	}
 }
 
+func TestToutiaoTitleLengthWeightedRule(t *testing.T) {
+	title := "5000元iPhone vs 安卓！2026年6月实测对比"
+	if got := ToutiaoTitleLength(title); got != 18.5 {
+		t.Fatalf("ToutiaoTitleLength() = %g, want 18.5", got)
+	}
+	if err := ValidateArticleTitle(title); err != nil {
+		t.Fatalf("weighted title should be accepted: %v", err)
+	}
+}
+
+func TestToutiaoTitleLengthASCIIBoundary(t *testing.T) {
+	if err := ValidateArticleTitle(strings.Repeat("a", 60)); err != nil {
+		t.Fatalf("60 ASCII letters should count as 30: %v", err)
+	}
+	err := ValidateArticleTitle(strings.Repeat("a", 61))
+	if err == nil || !strings.Contains(err.Error(), "30.5") {
+		t.Fatalf("61 ASCII letters should count as 30.5 and be rejected: %v", err)
+	}
+}
+
+func TestIsPublishSuccessURLDoesNotAcceptPreview(t *testing.T) {
+	if isPublishSuccessURL("https://mp.toutiao.com/profile_v4/graphic/publish/preview") {
+		t.Fatal("preview page must not be treated as publish success")
+	}
+	if isPublishSuccessURL("https://mp.toutiao.com/profile_v4/graphic/preview") {
+		t.Fatal("generic preview page must not be treated as publish success")
+	}
+	if !isPublishSuccessURL("https://mp.toutiao.com/profile_v4/graphic/manage") {
+		t.Fatal("graphic manage page should be treated as publish success")
+	}
+}
+
 func TestArticleValidation_EmptyContent(t *testing.T) {
 	err := ValidateArticle("title", "", nil)
 	if err == nil {

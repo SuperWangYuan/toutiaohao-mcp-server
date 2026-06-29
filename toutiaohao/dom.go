@@ -694,6 +694,15 @@ var publishSuccessURLFragments = []string{
 	"article/manage",
 }
 
+func isPublishSuccessURL(rawURL string) bool {
+	for _, fragment := range publishSuccessURLFragments {
+		if strings.Contains(rawURL, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 // 发布失败时页面可能出现的提示文本
 var publishErrorTexts = []string{
 	"发布失败",
@@ -756,22 +765,16 @@ func waitForPublishResult(page *rod.Page, timeout time.Duration) error {
 		if err == nil && info != nil {
 			currentURL := info.URL
 
-			// 检查 URL 是否已跳转到成功页面
-			for _, fragment := range publishSuccessURLFragments {
-				if strings.Contains(currentURL, fragment) {
-					log.Infof("发布成功，页面已跳转到: %s", currentURL)
-					return nil
-				}
+			// 检查 URL 是否已跳转到明确的成功页面
+			if isPublishSuccessURL(currentURL) {
+				log.Infof("发布成功，页面已跳转到: %s", currentURL)
+				return nil
 			}
 
-			// URL 变化了但不在成功列表中，可能是其他跳转
+			// URL 变化但未进入明确成功页时，可能只是预览/确认页面。
 			if currentURL != initialURL && initialURL != "" {
 				log.Infof("页面 URL 已变化: %s -> %s", initialURL, currentURL)
-				// 如果跳转到了非发布页，大概率是成功了
-				if !strings.Contains(currentURL, "publish") {
-					log.Info("发布后页面离开了发布页，判断为发布成功")
-					return nil
-				}
+				log.Info("当前 URL 不属于明确的发布成功页面，继续等待最终发布动作或成功提示")
 			}
 		}
 

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/example/toutiaohao-mcp-server/configs"
@@ -76,15 +77,32 @@ func ValidateArticleTitle(title string) error {
 	if strings.TrimSpace(title) == "" {
 		return fmt.Errorf("title is required")
 	}
-	length := utf8.RuneCountInString(title)
+	length := ToutiaoTitleLength(title)
 	if length > configs.MaxTitleLength {
 		return fmt.Errorf(
-			"标题共 %d 字，超过今日头条 %d 字上限，请重新生成或缩短标题；系统不会自动截断",
+			"标题按头条规则计为 %g 字，超过今日头条 %d 字上限，请重新生成或缩短标题；系统不会自动截断",
 			length,
 			configs.MaxTitleLength,
 		)
 	}
 	return nil
+}
+
+// ToutiaoTitleLength 按头条编辑器规则计算标题长度。
+// ASCII 字母和数字计 0.5，空白不计，其余字符（含中文和标点）计 1。
+func ToutiaoTitleLength(title string) float64 {
+	halfUnits := 0
+	for _, r := range title {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		if r <= unicode.MaxASCII && (unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			halfUnits++
+			continue
+		}
+		halfUnits += 2
+	}
+	return float64(halfUnits) / 2
 }
 
 // ValidateUpdateArticle 校验修改文章参数
@@ -2358,11 +2376,16 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 		for i := 0; i < 10; i++ {
 			time.Sleep(500 * time.Millisecond)
 
-			// 检测是否已跳转（说明不需要二次确认，直接成功了）
+			// 只有明确进入管理页才算成功；预览页仍需继续点击最终发布按钮。
 			infoChk, errChk := a.page.Info()
-			if errChk == nil && infoChk != nil && !strings.Contains(infoChk.URL, "/graphic/publish") {
-				log.Infof("点击'发布'后页面已跳转（URL: %s），判定发布成功", infoChk.URL)
-				return nil
+			if errChk == nil && infoChk != nil {
+				if isPublishSuccessURL(infoChk.URL) {
+					log.Infof("点击'发布'后页面已跳转到明确成功页（URL: %s）", infoChk.URL)
+					return nil
+				}
+				if !strings.Contains(infoChk.URL, "/graphic/publish") {
+					log.Infof("点击'发布'后进入中间预览/确认页面（URL: %s），继续寻找最终发布按钮", infoChk.URL)
+				}
 			}
 
 			// 在特定间隔清理遮罩并重试触发点击以保证动作被执行
@@ -2423,13 +2446,16 @@ func (a *ArticlePublishAction) clickPublish(opts *ArticleOptions) error {
 	var clickedConfirm bool
 	var lastJSResult string
 	for i := 0; i < 20; i++ {
-		// 优先检测是否已经成功跳转，如果已经跳转，直接代表发布完成！
+		// 只认可明确的管理页为成功；离开编辑页可能只是进入预览确认页。
 		info, errInfo := a.page.Info()
 		if errInfo == nil && info != nil {
-			if !strings.Contains(info.URL, "/graphic/publish") {
-				log.Infof("检测到页面已完成跳转（当前 URL: %s），直接判定发布成功，跳过二次确认", info.URL)
+			if isPublishSuccessURL(info.URL) {
+				log.Infof("检测到页面已跳转到明确的发布成功页面（当前 URL: %s）", info.URL)
 				clickedConfirm = true
 				break
+			}
+			if !strings.Contains(info.URL, "/graphic/publish") {
+				log.Infof("当前处于预览/发布确认页（URL: %s），继续检测并点击最终发布按钮", info.URL)
 			}
 		}
 
